@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "crypto-arbitrage-bot"
 version = "0.2.0"
 description = "CLI/Telegram-first crypto arbitrage bot (triangular + transfer)"
-requires-python = ">=3.12"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
@@ -40,7 +40,7 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 src = ["app", "tests"]
 
 [tool.ruff.lint]
