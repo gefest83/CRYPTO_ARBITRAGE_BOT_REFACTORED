@@ -170,6 +170,13 @@ class ExchangeSettings(_Section):
     breaker_failure_threshold: int = Field(default=5, ge=1)
     breaker_cooldown_seconds: float = Field(default=60.0, ge=0)
 
+    @field_validator("enabled", "quote_currencies", mode="before")
+    @classmethod
+    def _split_comma_separated(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
     @field_validator("enabled", mode="after")
     @classmethod
     def _normalise_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -243,6 +250,13 @@ class ArbitrageSettings(_Section):
     #: Require fresh data for scanning.
     require_fresh_data: bool = True
 
+    @field_validator("triangle_assets", mode="before")
+    @classmethod
+    def _split_triangle_assets(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
     @field_validator("triangle_assets", mode="after")
     @classmethod
     def _normalise_assets(cls, values: tuple[str, ...]) -> tuple[str, ...]:
@@ -268,6 +282,13 @@ class TransferSettings(_Section):
     poll_interval_seconds: float = Field(default=30.0, ge=1)
     #: PAPER/DEMO: simulated blockchain confirmation delay (seconds).
     simulated_transfer_seconds: float = Field(default=30.0, ge=0)
+
+    @field_validator("assets", mode="before")
+    @classmethod
+    def _split_assets(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
 
     @field_validator("assets", mode="after")
     @classmethod
@@ -303,6 +324,16 @@ class TelegramSettings(_Section):
     #: (fail-closed: a public bot must never accept strangers).
     allowed_chat_ids: tuple[int, ...] = ()
     poll_timeout_seconds: int = Field(default=30, ge=1, le=120)
+
+    @field_validator("allowed_chat_ids", mode="before")
+    @classmethod
+    def _parse_allowed_chat_ids(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return []
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
 
     @property
     def is_configured(self) -> bool:

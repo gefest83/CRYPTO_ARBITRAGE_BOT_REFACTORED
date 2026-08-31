@@ -40,7 +40,7 @@ def _book(venue: str, symbol: Symbol, bid: str, ask: str, depth: int = 10) -> Or
 
 
 def _scanner(clock: FixedClock | None = None) -> TriangularScanner:
-    settings = Settings()
+    settings = Settings(_env_file=None)
     return TriangularScanner(
         store=MarketDataStore(stale_after_ms=10_000, clock=clock or FixedClock()),
         venues=lambda: ("binance",),
@@ -143,7 +143,7 @@ async def test_fee_calculation_uses_provider():
     from app.strategies.triangular.fees import StaticFeeProvider
 
     async def scan_with_fees(taker_bps: Decimal):
-        settings = Settings()
+        settings = Settings(_env_file=None)
         scanner = TriangularScanner(
             store=MarketDataStore(stale_after_ms=10_000),
             venues=lambda: ("binance",),

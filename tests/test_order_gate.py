@@ -57,14 +57,14 @@ def test_live_mode_requires_triple_opt_in():
         # 1. allow_live missing -> configuration refused
         os.environ["CAT_TRADING__MODE"] = "LIVE"
         with pytest.raises(ValidationError):
-            Settings()
+            Settings(_env_file=None)
         # 2. allow_live without confirmation -> refused
         os.environ["CAT_TRADING__ALLOW_LIVE"] = "true"
         with pytest.raises(ValidationError):
-            Settings()
+            Settings(_env_file=None)
         # 3. all three flags -> accepted
         os.environ["CAT_TRADING__LIVE_CONFIRMATION"] = "I UNDERSTAND THE RISK"
-        settings = Settings()
+        settings = Settings(_env_file=None)
         assert settings.mode.value == "LIVE"
     finally:
         for key, value in saved.items():
@@ -82,7 +82,7 @@ def test_allow_live_without_live_mode_is_refused():
     try:
         os.environ[key] = "true"
         with pytest.raises(ValidationError):
-            Settings()
+            Settings(_env_file=None)
     finally:
         if saved is None:
             os.environ.pop(key, None)
@@ -91,7 +91,7 @@ def test_allow_live_without_live_mode_is_refused():
 
 
 def test_paper_mode_is_the_default():
-    assert Settings().mode.value == "PAPER"
+    assert Settings(_env_file=None).mode.value == "PAPER"
 
 
 def test_unknown_venue_is_refused():

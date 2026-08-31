@@ -16,7 +16,9 @@ __all__ = ["Fill", "Order", "OrderRequest"]
 
 
 def _new_id(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+    # OKX clOrdId allows only [A-Za-z0-9] 1-32 chars; hyphen breaks OKX DEMO
+    # Use alphanumeric only (prefix + hex) to stay compatible with Binance/Bybit/OKX
+    return f"{prefix}{uuid.uuid4().hex[:12]}"
 
 
 class OrderRequest(DomainModel):

@@ -43,6 +43,7 @@ from app.models.balance import Balance, BalanceSnapshot
 from app.models.base import DEC0, utc_now
 from app.models.enums import (
     ExchangeStatus,
+    MarketType,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -145,6 +146,13 @@ _ORDER_STATUSES: Mapping[str, OrderStatus] = {
     "cancelled": OrderStatus.CANCELED,
     "expired": OrderStatus.EXPIRED,
     "rejected": OrderStatus.REJECTED,
+    # Bybit DEMO raw statuses (CCXT may return these before normalization)
+    "new": OrderStatus.OPEN,
+    "created": OrderStatus.OPEN,
+    "pending": OrderStatus.PENDING,
+    "partiallyfilled": OrderStatus.PARTIALLY_FILLED,
+    "partially_filled": OrderStatus.PARTIALLY_FILLED,
+    "filled": OrderStatus.FILLED,
 }
 
 
@@ -260,11 +268,19 @@ class CCXTAdapter(BaseExchangeAdapter):
           separate testnet account system where demo keys are invalid).
         * ``demo_replaces_sandbox`` (binance): the demo environment uses
           completely separate endpoints; ``set_sandbox_mode`` is *not* used.
+        * ``demo_headers`` only (okx): demo is header-only on production
+          (``x-simulated-trading: 1``) — ``set_sandbox_mode`` must NOT be
+          called (it would route to testnet where demo keys are invalid).
+          ``AdapterOptions.sandbox`` stays True so the order gate remains active.
         * everyone else: plain ``set_sandbox_mode(True)`` plus optional
-          header overrides (okx demo header).
+          header overrides.
         """
         profile = self.profile
         if profile.demo_private_only or profile.demo_replaces_sandbox:
+            self._apply_demo_routing(client)
+            return
+        # OKX demo: header-only on production — never use set_sandbox_mode
+        if profile.demo_headers:
             self._apply_demo_routing(client)
             return
         self._enable_sandbox(client)
@@ -359,6 +375,13 @@ class CCXTAdapter(BaseExchangeAdapter):
                         exchange_id=self.id,
                     )
         if profile.demo_headers:
+            # OKX DEMO: public market data must not require private currencies endpoint.
+            # CCXT OKX load_markets -> fetch_currencies is private and DEMO rejects it
+            # with 50038 "unavailable in demo trading". Disable the capability
+            # DEMO-only via the existing has flag — normal OKX keeps it.
+            has_map = getattr(client, "has", None)
+            if isinstance(has_map, dict):
+                has_map["fetchCurrencies"] = False
             headers = getattr(client, "headers", None)
             if not isinstance(headers, dict):
                 headers = {}
@@ -492,10 +515,13 @@ class CCXTAdapter(BaseExchangeAdapter):
 
     # ---------------------------------------------------------------- routing
     def _native_symbol(self, symbol: Symbol) -> str:
-        """Venue-native id from ``load_markets`` metadata when available."""
-        for market in self._markets:
-            if market.symbol == symbol:
-                return market.native_symbol or symbol.name
+        """Unified CCXT symbol for REST/WS calls (e.g. BTC/USDT).
+
+        CCXT expects unified symbols (``BTC/USDT``), not exchange-native ids
+        (``BTCUSDT``).  The native id is kept in ``Market.native_symbol`` only
+        for diagnostics; the unified name is passed to every CCXT method to
+        avoid ``BadSymbol`` on Binance/OKX/Bybit.
+        """
         return symbol.name
 
     def _secret_values(self) -> tuple[str, ...]:
@@ -584,9 +610,24 @@ class CCXTAdapter(BaseExchangeAdapter):
         cost_limits = limits.get("cost") or {}
         price_limits = limits.get("price") or {}
         precision = payload.get("precision") or {}
+        price_tick = _dec(precision.get("price"))
+        amount_step = _dec(precision.get("amount"))
+        price_decimals = None
+        amount_decimals = None
+        if price_tick is not None and 0 < price_tick < 1:
+            pass
+        elif price_tick is not None:
+            price_decimals = _int(price_tick)
+            price_tick = None
+        if amount_step is not None and 0 < amount_step < 1:
+            pass
+        elif amount_step is not None:
+            amount_decimals = _int(amount_step)
+            amount_step = None
         return Market(
             exchange_id=self.id,
             symbol=Symbol(base=str(base), quote=str(quote)),
+            market_type=MarketType.SPOT,
             native_symbol=str(payload.get("id") or symbol_text),
             active=bool(payload.get("active", True)),
             fees=MarketFees(
@@ -602,7 +643,10 @@ class CCXTAdapter(BaseExchangeAdapter):
                 max_price=_dec(price_limits.get("max")),
             ),
             precision=MarketPrecision(
-                price=_int(precision.get("price")), amount=_int(precision.get("amount"))
+                price=price_decimals,
+                amount=amount_decimals,
+                price_tick=price_tick,
+                amount_step=amount_step,
             ),
         )
 
@@ -644,12 +688,15 @@ class CCXTAdapter(BaseExchangeAdapter):
 
     async def fetch_trading_fees(self, symbol: Symbol) -> MarketFees:
         if self._capabilities.fetch_trading_fees:
-            raw = await self._call("fetch_trading_fee", self._native_symbol(symbol))
-            return MarketFees(
-                maker_bps=(_dec(raw.get("maker"), DEC0) or DEC0) * 10000,
-                taker_bps=(_dec(raw.get("taker"), DEC0) or DEC0) * 10000,
-                is_account_specific=True,
-            )
+            try:
+                raw = await self._call("fetch_trading_fee", self._native_symbol(symbol))
+                return MarketFees(
+                    maker_bps=(_dec(raw.get("maker"), DEC0) or DEC0) * 10000,
+                    taker_bps=(_dec(raw.get("taker"), DEC0) or DEC0) * 10000,
+                    is_account_specific=True,
+                )
+            except (CapabilityNotSupportedError, ExchangeError):
+                pass
         market = next((m for m in self._markets if m.symbol == symbol), None)
         if market is None:
             raise self._unsupported("fetch_trading_fees")
@@ -704,7 +751,25 @@ class CCXTAdapter(BaseExchangeAdapter):
         return self._to_order(raw, symbol)
 
     async def fetch_order(self, order_id: str, *, symbol: Symbol) -> Order:
-        raw = await self._call("fetch_order", order_id, self._native_symbol(symbol))
+        # Bybit DEMO: fetchOrder for closed orders requires params["acknowledged"]=True
+        # (CCXT raises ArgumentsRequired if not set). Try normal first, then retry
+        # with acknowledged for Bybit, without breaking other venues.
+        try:
+            raw = await self._call("fetch_order", order_id, self._native_symbol(symbol))
+        except ExchangeError as exc:
+            # Check both wrapper and cause for Bybit acknowledged hint
+            msg = str(exc).lower()
+            cause_msg = str(exc.__cause__).lower() if exc.__cause__ else ""
+            combined = f"{msg} {cause_msg}"
+            if self.id == "bybit" and ("acknowledged" in combined or "fetchorder" in combined or "last 500" in combined):
+                try:
+                    raw = await self._call(
+                        "fetch_order", order_id, self._native_symbol(symbol), {"acknowledged": True}
+                    )
+                except Exception:
+                    raise exc from None
+            else:
+                raise
         return self._to_order(raw, symbol)
 
     async def fetch_open_orders(self, *, symbol: Symbol | None = None) -> tuple[Order, ...]:

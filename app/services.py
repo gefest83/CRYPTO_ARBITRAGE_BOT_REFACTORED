@@ -412,10 +412,13 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     )
     recovery = ExecutionRecovery()
 
+    fee_provider = await _build_fee_provider(manager, settings)
+
     scanner = TriangularScanner(
         store=store,
         venues=lambda: (v for v in manager.enabled_ids() if not manager.is_breaker_open(v)),
         settings=settings.arbitrage,
+        fees=fee_provider,
     )
 
     # Paper wallets: deterministic seed balances per simulated venue.
@@ -479,6 +482,15 @@ async def build_app(settings: Settings | None = None) -> AppServices:
 async def start_app(services: AppServices) -> None:
     """Open adapters, prime market data, restore runtime flags and transfers."""
     await services.manager.open_all()
+    # DEMO preflight: verify credentials/balances/fees/market data per venue
+    # before any trading — fail-closed per venue, never crash the app.
+    if services.settings.mode is TradingMode.DEMO:
+        try:
+            from app.exchanges.preflight import run_demo_preflight
+
+            await run_demo_preflight(services.manager, services.settings, services.store)
+        except Exception as exc:  # noqa: BLE001 - preflight must never block startup
+            logger.warning("demo_preflight_failed", extra={"error": str(exc)[:300]})
     await _init_paper_wallets(services)
     await _init_watchlist(services)
 
@@ -543,15 +555,177 @@ async def _init_watchlist(services: AppServices) -> None:
 
 async def _build_precision(manager) -> StaticPrecisionProvider:
     """Instrument filters from every venue's load_markets (best effort)."""
+    from app.exchanges.profiles import resolve_profile
+
     by_venue: dict[tuple[str, str], InstrumentFilters] = {}
     by_symbol: dict[str, InstrumentFilters] = {}
     for venue in manager.enabled_ids():
+        markets = None
         try:
             markets = await manager.adapter(venue).load_markets()
-        except Exception:  # noqa: BLE001 - precision is best-effort
-            continue
-        for market in markets:
+        except Exception as exc:  # noqa: BLE001 - precision is best-effort
+            # Binance DEMO: load_markets on demo host may timeout — fallback only
+            # for precision metadata, trading stays DEMO-only.
+            profile = None
+            try:
+                profile = resolve_profile(venue)
+            except Exception:
+                pass
+            if profile is not None and profile.demo_no_load_markets:
+                logger.info(
+                    "precision_demo_load_failed_fallback_to_prod",
+                    extra={"exchange_id": venue, "error": str(exc)[:160]},
+                )
+                markets = await _load_production_markets_for_precision(venue)
+            else:
+                logger.debug(
+                    "precision_load_failed", extra={"exchange_id": venue, "error": str(exc)[:160]}
+                )
+                continue
+        if not markets:
+            # Still nothing — static simulated fallback for core symbols
+            markets = _simulated_markets_for_precision(venue, manager)
+            if markets:
+                logger.warning(
+                    "precision_fallback_to_simulated",
+                    extra={"exchange_id": venue, "symbols": len(markets)},
+                )
+        for market in markets or ():
             filters = InstrumentFilters.from_market(market.precision, market.limits)
             by_venue[(venue, market.symbol.name)] = filters
             by_symbol.setdefault(market.symbol.name, filters)
     return StaticPrecisionProvider(by_venue=by_venue, by_symbol=by_symbol)
+
+
+async def _load_production_markets_for_precision(venue: str):
+    """Load production markets for precision only (no trading, no credentials)."""
+    try:
+        from app.exchanges.base import AdapterOptions
+        from app.exchanges.ccxt_adapter import CCXTAdapter
+        from app.exchanges.profiles import resolve_profile
+        from app.models.exchange import Exchange
+
+        profile = resolve_profile(venue)
+        exchange = Exchange(id=profile.id, name=profile.display_name, adapter="ccxt")
+        options = AdapterOptions(sandbox=False, enable_rate_limit=True)
+        adapter = CCXTAdapter(exchange, credentials=None, options=options, order_gate=None)
+        await adapter.open()
+        try:
+            markets = await adapter.load_markets()
+            return markets
+        finally:
+            await adapter.close()
+    except Exception as exc:  # noqa: BLE001 - fallback to simulated
+        logger.debug(
+            "production_precision_load_failed",
+            extra={"exchange_id": venue, "error": str(exc)[:160]},
+        )
+        return None
+
+
+def _simulated_markets_for_precision(venue: str, manager):
+    """Static fallback using simulated magnitude-appropriate precision.
+
+    Uses the deterministic simulated adapter's precision_for to generate
+    filters for the core watchlist symbols when real market metadata is
+    unavailable (e.g. Binance DEMO).  This is clearly a fallback, not real
+    venue data, but prevents orders being rejected for missing filters.
+    """
+    try:
+        from app.exchanges.simulated import SimulatedExchangeAdapter
+        from app.models.market import Market
+        from app.models.enums import MarketType
+        from app.models.symbol import Symbol
+
+        # Core symbols that must have filters for triangular
+        base_currency = "USDT"
+        try:
+            base_currency = manager._settings.trading.base_currency  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        assets = set()
+        try:
+            assets.update(manager._settings.arbitrage.triangle_assets)  # type: ignore[attr-defined]
+            assets.update(manager._settings.transfer.assets)  # type: ignore[attr-defined]
+        except Exception:
+            assets.update(["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK", "AVAX", "TRX"])
+        symbols = [Symbol(base=a, quote=base_currency) for a in sorted(assets)]
+        # Add cross pairs that exist in simulation
+        markets = []
+        for sym in symbols:
+            prec = SimulatedExchangeAdapter.precision_for(sym)
+            # Use conservative limits similar to simulation
+            from app.models.market import MarketLimits
+
+            markets.append(
+                Market(
+                    exchange_id=venue,
+                    symbol=sym,
+                    market_type=MarketType.SPOT,
+                    native_symbol=sym.name,
+                    active=True,
+                    precision=prec,
+                    limits=MarketLimits(min_amount=None, min_cost=None),
+                )
+            )
+        return tuple(markets)
+    except Exception:
+        return None
+
+
+async def _build_fee_provider(manager, settings):
+    """Build fee provider for triangular scanner.
+
+    PAPER: static 10 bps fallback (simulated venues).
+    DEMO: try real venue fees via ``fetch_trading_fees``; if unavailable
+    use market-fee fallback from ``load_markets``; if still unavailable log
+    fallback and assume 10 bps. Never hardcode a new fee — use real data
+    when possible, otherwise clearly log fallback.
+    """
+    from app.strategies.triangular.fees import StaticFeeProvider
+    from app.models.symbol import Symbol
+
+    if settings.mode is not TradingMode.DEMO:
+        return StaticFeeProvider()
+    overrides: dict[str, object] = {}
+    probe = Symbol(base="BTC", quote=settings.trading.base_currency)
+    for venue in manager.enabled_ids():
+        fee = None
+        try:
+            adapter = manager.adapter(venue)
+            fee = await adapter.fetch_trading_fees(probe)
+            logger.info(
+                "demo_fee_real",
+                extra={"exchange_id": venue, "taker_bps": str(fee.taker_bps), "maker_bps": str(fee.maker_bps), "account": fee.is_account_specific},
+            )
+        except Exception as exc:  # noqa: BLE001 - try market fallback
+            try:
+                adapter = manager.adapter(venue)
+                markets = await adapter.load_markets()
+                for m in markets:
+                    if m.symbol == probe:
+                        fee = m.fees
+                        break
+                if fee is None and markets:
+                    fee = markets[0].fees
+                if fee is not None:
+                    logger.info(
+                        "demo_fee_from_markets",
+                        extra={"exchange_id": venue, "taker_bps": str(fee.taker_bps)},
+                    )
+                else:
+                    logger.warning(
+                        "demo_fee_fallback",
+                        extra={"exchange_id": venue, "error": str(exc)[:160], "fallback_bps": "10"},
+                    )
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning(
+                    "demo_fee_fallback",
+                    extra={"exchange_id": venue, "error": str(exc2)[:160], "fallback_bps": "10"},
+                )
+        if fee is not None:
+            overrides[venue.lower()] = fee  # type: ignore[assignment]
+    if overrides:
+        return StaticFeeProvider(overrides=overrides)  # type: ignore[arg-type]
+    logger.warning("demo_fee_all_fallback", extra={"fallback_bps": "10"})
+    return StaticFeeProvider()

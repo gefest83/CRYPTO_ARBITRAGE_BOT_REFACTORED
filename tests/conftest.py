@@ -12,7 +12,7 @@ from app.services import AppServices, build_app, shutdown_app, start_app
 
 
 def make_settings(tmp: pathlib.Path, **overrides) -> Settings:
-    base = Settings()
+    base = Settings(_env_file=None)
     return base.model_copy(
         update={
             "database": base.database.model_copy(

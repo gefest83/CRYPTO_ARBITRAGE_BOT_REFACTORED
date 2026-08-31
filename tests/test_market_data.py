@@ -84,7 +84,7 @@ def test_books_sorted_correctly():
 
 
 async def test_service_refresh_isolates_venue_failures(tmp_path):
-    settings = Settings()
+    settings = Settings(_env_file=None)
     mgr = ExchangeManager(settings)
     await mgr.open_all()
     try:
@@ -100,7 +100,7 @@ async def test_service_refresh_isolates_venue_failures(tmp_path):
 
 
 async def test_service_skips_breaker_open_venues(tmp_path):
-    settings = Settings()
+    settings = Settings(_env_file=None)
     mgr = ExchangeManager(settings)
     await mgr.open_all()
     try:

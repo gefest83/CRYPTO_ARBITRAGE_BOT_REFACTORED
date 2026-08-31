@@ -44,7 +44,7 @@ def test_min_profit_rejection():
     # Directly exercise evaluate() logic via a real settings-backed planner
     from app.config.settings import Settings
 
-    planner = TransferPlanner(Settings())
+    planner = TransferPlanner(Settings(_env_file=None))
     # ~46.9 bps net: above the default 30 bps floor
     assert planner.evaluate(_plan()) is not None
     # Barely profitable plan below the floor -> rejected
@@ -56,7 +56,7 @@ def test_min_profit_rejection():
 def test_nonsense_inputs_never_produce_opportunities():
     from app.config.settings import Settings
 
-    planner = TransferPlanner(Settings())
+    planner = TransferPlanner(Settings(_env_file=None))
     assert planner.evaluate(_plan(amount=D("0"))) is None
     assert planner.evaluate(_plan(buy_price=D("0"))) is None
     assert planner.evaluate(_plan(sell_price=D("0"))) is None
@@ -78,7 +78,7 @@ def test_spread_bps():
 def test_executable_amount_honours_constraints():
     from app.config.settings import Settings
 
-    planner = TransferPlanner(Settings())
+    planner = TransferPlanner(Settings(_env_file=None))
     # withdrawal minimum dominates
     assert planner.executable_amount(
         requested_amount=D("0.5"),
