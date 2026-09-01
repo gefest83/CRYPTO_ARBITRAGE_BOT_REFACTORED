@@ -33,8 +33,14 @@ def make_settings(tmp: pathlib.Path, **overrides) -> Settings:
                 }
             ),
             "market_data": base.market_data.model_copy(update={"streams_enabled": False}),
-            # telegram tests chat id (also proves the allow-list wiring)
-            "telegram": base.telegram.model_copy(update={"allowed_chat_ids": (12345,)}),
+            # telegram tests: chat id (legacy) AND user id (new) are both
+            # allow-listed to prove the authorization wiring.
+            "telegram": base.telegram.model_copy(
+                update={
+                    "allowed_chat_ids": (12345,),
+                    "allowed_user_ids": (11111,),
+                }
+            ),
             **overrides,
         }
     )

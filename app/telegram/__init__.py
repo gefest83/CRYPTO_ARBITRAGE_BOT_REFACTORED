@@ -1,6 +1,14 @@
 """Telegram interface: control and monitoring over the Bot API."""
+from app.telegram.bot import COMMANDS, HELP_TEXT, TelegramBot, run_telegram
+from app.telegram.client import TelegramClient, TelegramTransportError
+from app.telegram.runner import TelegramRunner
 
-from app.telegram.bot import TelegramBot, run_telegram
-from app.telegram.client import TelegramClient
-
-__all__ = ["TelegramBot", "TelegramClient", "run_telegram"]
+__all__ = [
+    "COMMANDS",
+    "HELP_TEXT",
+    "TelegramBot",
+    "TelegramClient",
+    "TelegramRunner",
+    "TelegramTransportError",
+    "run_telegram",
+]

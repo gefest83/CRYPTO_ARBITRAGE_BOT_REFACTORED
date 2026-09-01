@@ -84,6 +84,8 @@ class AppServices:
     paper_wallets: dict[str, PaperWallet] = field(default_factory=dict)
     watch_symbols: tuple[Symbol, ...] = ()
     started_at: float = field(default_factory=time.monotonic)
+    #: Background Telegram runner (None when disabled / not configured).
+    telegram_runner: Any = None
     _cached_exchange_exposure: dict = field(default_factory=dict)
     _cached_asset_exposure: dict = field(default_factory=dict)
     #: Serialises transfer starts (H-6): together with an in-lock exposure
@@ -533,9 +535,15 @@ async def start_app(services: AppServices) -> None:
     await services.refresh_risk_exposure()
     await services.audit.log("APP_STARTED", str(services.settings.mode))
 
+    # Telegram operator interface: optional, fail-safe.  A startup failure
+    # never blocks the bot (auto trading is unaffected) and never enables it.
+    await _start_telegram(services)
+
 
 async def shutdown_app(services: AppServices) -> None:
     """Stop streams, close adapters, dispose the database."""
+    # Telegram first: stop accepting new commands before tearing down state.
+    await _stop_telegram(services)
     await services.market.stop_streams()
     await services.manager.close()
     await services.db.dispose()
@@ -754,3 +762,50 @@ async def _build_fee_provider(manager, settings):
         return StaticFeeProvider(overrides=overrides)  # type: ignore[arg-type]
     logger.warning("demo_fee_all_fallback", extra={"fallback_bps": "10"})
     return StaticFeeProvider()
+
+
+# ---------------------------------------------------------------------------
+# Telegram lifecycle (read-only / safe-control operator interface).
+# ---------------------------------------------------------------------------
+
+async def _start_telegram(services: AppServices) -> None:
+    """Optionally start the Telegram bot as a background task.
+
+    Fail-safe by construction:
+    * missing / unconfigured bot  -> no-op (Telegram is optional);
+    * empty operator allow-list   -> no-op (fail-closed);
+    * startup failure (no network, bad token, httpx missing, ...) -> logged
+      and swallowed: trading is NEVER enabled by Telegram failures.
+    """
+    from app.telegram.runner import TelegramRunner
+
+    if not services.settings.telegram.is_configured:
+        return
+    if not services.settings.telegram.has_any_operator:
+        logger.info("telegram_allow_list_empty_skipping_startup")
+        return
+    runner = TelegramRunner(services)
+    services.telegram_runner = runner
+    try:
+        await runner.start()
+    except Exception as exc:  # noqa: BLE001 - Telegram is optional, never fatal
+        logger.warning(
+            "telegram_start_failed",
+            extra={"error": str(exc)[:200]},
+        )
+        services.telegram_runner = None
+
+
+async def _stop_telegram(services: AppServices) -> None:
+    """Stop the Telegram bot if it was started; idempotent and quiet."""
+    runner = services.telegram_runner
+    services.telegram_runner = None
+    if runner is None:
+        return
+    try:
+        await runner.stop()
+    except Exception as exc:  # noqa: BLE001 - shutdown must stay quiet
+        logger.warning(
+            "telegram_stop_failed",
+            extra={"error": str(exc)[:200]},
+        )

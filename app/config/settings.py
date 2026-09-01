@@ -320,14 +320,18 @@ class TelegramSettings(_Section):
 
     #: Bot token from @BotFather; empty disables the Telegram interface.
     bot_token: SecretStr = SecretStr("")
-    #: Chats allowed to control the bot. Empty list = bot refuses all commands
-    #: (fail-closed: a public bot must never accept strangers).
+    #: Telegram user IDs allowed to control the bot. Empty list = bot refuses
+    #: every command (fail-closed: a public bot must never accept strangers).
+    allowed_user_ids: tuple[int, ...] = ()
+    #: Legacy chat-id allow-list, retained for back-compat. The bot accepts
+    #: commands from any of these chats OR any of the user IDs in
+    #: :attr:`allowed_user_ids`.
     allowed_chat_ids: tuple[int, ...] = ()
     poll_timeout_seconds: int = Field(default=30, ge=1, le=120)
 
-    @field_validator("allowed_chat_ids", mode="before")
+    @field_validator("allowed_user_ids", "allowed_chat_ids", mode="before")
     @classmethod
-    def _parse_allowed_chat_ids(cls, value: object) -> object:
+    def _parse_allowed_ids(cls, value: object) -> object:
         if isinstance(value, str):
             value = value.strip()
             if not value:
@@ -338,6 +342,11 @@ class TelegramSettings(_Section):
     @property
     def is_configured(self) -> bool:
         return bool(self.bot_token.get_secret_value().strip())
+
+    @property
+    def has_any_operator(self) -> bool:
+        """True when at least one user ID or chat ID may command the bot."""
+        return bool(self.allowed_user_ids or self.allowed_chat_ids)
 
 
 class LoggingSettings(_Section):

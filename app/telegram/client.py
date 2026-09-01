@@ -72,12 +72,15 @@ class TelegramClient:
         result = await self._call("getUpdates", payload)
         return list(result or [])
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def send_message(self, chat_id: int, text: str, *, parse_mode: str = "") -> None:
         if len(text) <= MAX_MESSAGE_LENGTH:
             body = text
         else:
             body = text[: MAX_MESSAGE_LENGTH - 20] + "... (truncated)"
-        await self._call("sendMessage", {"chat_id": chat_id, "text": body, "parse_mode": "HTML"})
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": body}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        await self._call("sendMessage", payload)
 
     async def get_me(self) -> dict[str, Any]:
         return await self._call("getMe")

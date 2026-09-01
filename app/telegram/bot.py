@@ -1,117 +1,185 @@
-"""Telegram bot: secondary control and monitoring interface.
+"""Telegram operator interface: read-only / safe-control only.
 
-The handlers are a thin layer over :class:`app.services.AppServices` — the
-same services the CLI uses.  No trading logic lives here.
+This module is a thin layer over :class:`app.services.AppServices` — the same
+services the CLI uses.  No trading logic lives here.
 
-Security (fail-closed):
+Scope (deliberately restricted)
+-------------------------------
 
-* only chats listed in ``CAT_TELEGRAM__ALLOWED_CHAT_IDS`` may command the bot;
-* an empty allow-list disables all commands (a public bot must never accept
-  strangers);
-* the bot token is a secret and never appears in logs or replies.
+The Telegram bot is a **secondary control interface**.  Every command it
+exposes is either read-only, a reconciliation query, or a safe state change
+(persistent kill switch + auto-trading flag).  It must NOT be able to:
+
+* place exchange orders (no ``/triangle``, no ``/transfer`` execution, no
+  ``/start_auto`` / ``/stop_auto`` toggling of the background loop);
+* initiate withdrawals;
+* expose configuration, credentials, exchange API keys, the database URL or
+  raw exception tracebacks to the operator.
+
+The kill-switch + auto-trading flag toggles (commands ``/pause`` / ``/resume``)
+go through the existing :class:`app.execution.guard.ExecutionGuard`, which
+itself is persisted in :class:`app.storage.repositories.BotStateRepository`
+and survives restart.  They do NOT bypass the LIVE confirmation, mode policy
+or risk engine — ``/resume`` only restores a flag that the rest of the bot
+already enforces.
+
+Security (fail-closed)
+----------------------
+
+* only Telegram user IDs in ``CAT_TELEGRAM__ALLOWED_USER_IDS`` (and, for
+  back-compat, chats in ``CAT_TELEGRAM__ALLOWED_CHAT_IDS``) may command the
+  bot;
+* an empty allow-list disables every command;
+* the bot token is a :class:`~pydantic.SecretStr` and never appears in logs
+  or replies;
+* error replies are short, generic and pass through
+  :func:`app.exchanges.sanitize.redact_secrets` before being sent.
 """
 
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from app.auto import AutoTrader
 from app.config.logging_config import get_logger
+from app.exchanges.sanitize import redact_secrets
 from app.services import AppServices
 
 from .client import TelegramClient, poll_forever
 
-__all__ = ["TelegramBot", "run_telegram"]
+__all__ = ["COMMANDS", "HELP_TEXT", "TelegramBot", "run_telegram"]
 
 logger = get_logger("telegram.bot")
 
-COMMANDS = (
+
+COMMANDS: tuple[str, ...] = (
+    "/start",
+    "/help",
     "/status",
-    "/balances",
+    "/reconcile",
     "/opportunities",
-    "/triangle",
-    "/transfer",
-    "/trades",
-    "/start_auto",
-    "/stop_auto",
+    "/pause",
+    "/resume",
 )
 
-_HELP = (
-    "crypto-arbitrage-bot commands:\n"
-    "/status - bot status (mode, exchanges, risk, transfers)\n"
-    "/balances - balances per venue\n"
-    "/opportunities - scan triangles + transfer plans\n"
-    "/triangle - execute the best triangle cycle\n"
-    "/transfer [ASSET AMOUNT] - transfer plans; with args executes the best plan\n"
-    "/trades - recent trades\n"
-    "/start_auto - enable auto trading (runs in this process)\n"
-    "/stop_auto - stop auto trading"
+HELP_TEXT = (
+    "crypto-arbitrage-bot — operator commands:\n"
+    "/start        - welcome / help\n"
+    "/help         - this message\n"
+    "/status       - mode, kill switch, exchanges, transfers, recent trades\n"
+    "/reconcile    - list MANUAL_REVIEW transfers (read-only)\n"
+    "/opportunities - scan triangles (no execution)\n"
+    "/pause        - engage the persistent kill switch (safe)\n"
+    "/resume       - release the kill switch (safe)\n"
+    "\n"
+    "Order placement, transfers and withdrawals are NOT exposed here — "
+    "use the CLI for any execution that moves funds."
 )
+
+
+# Maximum number of MANUAL_REVIEW records shown by /reconcile.
+_RECONCILE_LIMIT = 20
+
+# Maximum number of triangle / transfer opportunities shown by /opportunities.
+_OPPORTUNITY_LIMIT = 5
+
+# Safe message sent to unauthorized chats / users.  Identical wording regardless
+# of which command they tried, so an attacker cannot probe the command set.
+_DENIED_MESSAGE = "unauthorized"
+
+# Safe message sent on internal errors.  Identical wording regardless of cause.
+_INTERNAL_ERROR_MESSAGE = "internal error"
+
+# Maximum reply length — leaves headroom under Telegram's 4096 char limit.
+_MAX_REPLY_LENGTH = 3500
 
 
 class TelegramBot:
+    """Stateless command dispatcher backed by :class:`AppServices`.
+
+    The bot holds NO execution state: every command is delegated to
+    :class:`AppServices`.  This makes startup/shutdown trivial and means a
+    crashed bot can be replaced at any time without losing trading context.
+    """
+
     def __init__(self, services: AppServices, client: TelegramClient) -> None:
         self._services = services
         self._client = client
         self._auto_task: asyncio.Task | None = None
-        self._auto_trader: AutoTrader | None = None
 
     # ---------------------------------------------------------------- dispatch
     async def handle_update(self, update: dict[str, Any]) -> None:
         message = update.get("message") or {}
-        chat_id = message.get("chat", {}).get("id")
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        user = message.get("from") or {}
+        user_id = user.get("id")
         text = str(message.get("text") or "").strip()
         if chat_id is None or not text:
             return
-        if not self._authorized(chat_id):
-            await self._client.send_message(
-                chat_id, "unauthorized: this chat is not in CAT_TELEGRAM__ALLOWED_CHAT_IDS"
-            )
+        if not self._authorized(user_id, chat_id):
+            # Never reveal whether the chat or the user id was the problem.
+            await self._safe_send(chat_id, _DENIED_MESSAGE)
             return
-        command, _, rest = text.partition(" ")
+        command, _, _rest = text.partition(" ")
         command = command.split("@")[0].lower()
-        handler = {
-            "/start": self._cmd_help,
-            "/help": self._cmd_help,
-            "/status": self._cmd_status,
-            "/balances": self._cmd_balances,
-            "/opportunities": self._cmd_opportunities,
-            "/triangle": self._cmd_triangle,
-            "/transfer": self._cmd_transfer,
-            "/trades": self._cmd_trades,
-            "/start_auto": self._cmd_start_auto,
-            "/stop_auto": self._cmd_stop_auto,
-        }.get(command)
+        handler = self._dispatch(command)
         if handler is None:
-            await self._client.send_message(chat_id, f"unknown command\n\n{_HELP}")
+            await self._safe_send(chat_id, f"unknown command\n\n{HELP_TEXT}")
             return
         try:
-            reply = await handler(rest.strip())
-        except Exception as exc:  # noqa: BLE001 - report, never crash the bot
-            logger.error("telegram_command_failed", extra={"command": command, "error": str(exc)})
-            reply = f"command failed: {type(exc).__name__}: {exc}"
-        if reply:
-            await self._client.send_message(chat_id, reply)
+            reply = await handler()
+        except Exception as exc:  # noqa: BLE001 - one bad command stops nothing
+            logger.error(
+                "telegram_command_failed",
+                extra={
+                    "command": command,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "error": redact_secrets(str(exc))[:300],
+                },
+            )
+            reply = _INTERNAL_ERROR_MESSAGE
+        await self._safe_send(chat_id, reply or "")
 
-    def _authorized(self, chat_id: int) -> bool:
-        allowed = self._services.settings.telegram.allowed_chat_ids
-        return chat_id in allowed
+    def _dispatch(self, command: str) -> Callable[[], Awaitable[str]] | None:
+        method = _DISPATCH.get(command)
+        if method is None:
+            return None
+        # Bind the method to this bot so the dispatch can call it as ``handler()``.
+        bound = method.__get__(self, type(self))
+        return bound
+
+    def _authorized(self, user_id: int | None, chat_id: int | None) -> bool:
+        """Authorisation is by Telegram user ID alone.
+
+        Per the operator-interface spec, only configured user IDs may command
+        the bot.  The legacy ``CAT_TELEGRAM__ALLOWED_CHAT_IDS`` list is no
+        longer consulted; operators must configure ``CAT_TELEGRAM__ALLOWED_USER_IDS``.
+        """
+        cfg = self._services.settings.telegram
+        return user_id is not None and user_id in cfg.allowed_user_ids
 
     # ---------------------------------------------------------------- commands
-    async def _cmd_help(self, rest: str) -> str:
-        return _HELP
+    async def _cmd_start(self) -> str:
+        return HELP_TEXT
 
-    async def _cmd_status(self, rest: str) -> str:
+    async def _cmd_help(self) -> str:
+        return HELP_TEXT
+
+    async def _cmd_status(self) -> str:
         status = await self._services.status()
         guard = status["guard"]
-        lines = [
+        lines: list[str] = [
             f"mode: {status['mode']}",
             f"uptime: {status['uptime_seconds']}s",
             f"trading enabled: {guard['trading_enabled']}",
             "kill switch: "
-            + (f"ENGAGED ({guard['halt_reason']})" if guard["halted"] == "true" else "released"),
+            + (
+                f"ENGAGED ({guard['halt_reason']})"
+                if guard["halted"] == "true"
+                else "released"
+            ),
             f"auto trading: {'on' if status['auto_trading'] else 'off'}",
             "exchanges:",
         ]
@@ -125,153 +193,160 @@ class TelegramBot:
         risk = status["risk"]
         lines.append(f"daily pnl: {risk['daily_pnl']}")
         lines.append(f"open transfers: {risk['open_transfers']}")
-        for transfer in status["transfers_open"]:
+        if status["transfers_open"]:
+            lines.append("open transfers:")
+            for transfer in status["transfers_open"]:
+                lines.append(
+                    f"  {transfer['route']} {transfer['asset']} "
+                    f"{transfer['amount']}: {transfer['state']}"
+                )
+        if status["recent_trades"]:
+            lines.append("recent trades:")
+            for trade in status["recent_trades"]:
+                lines.append(
+                    f"  {trade['strategy']} {trade['route']} "
+                    f"{trade['status']} net {trade['net_profit']}"
+                )
+        return "\n".join(lines)
+
+    async def _cmd_reconcile(self) -> str:
+        from app.models.enums import TransferState
+
+        records = await self._services.transfers.list_by_state(
+            TransferState.MANUAL_REVIEW.value
+        )
+        if not records:
+            return "no transfers require manual review"
+        lines = [f"{len(records)} transfer(s) require manual review:"]
+        for record in records[:_RECONCILE_LIMIT]:
+            lines.append("")
+            lines.append(f"  id        : {record.id}")
+            lines.append(f"  state     : {record.state.value}")
             lines.append(
-                f"  {transfer['route']} {transfer['asset']} "
-                f"{transfer['amount']}: {transfer['state']}"
+                f"  route     : {record.source_exchange} -> {record.dest_exchange}"
+            )
+            lines.append(
+                f"  asset     : {record.asset} (planned {record.amount})"
+            )
+            if record.buy_filled_amount and record.buy_filled_amount > 0:
+                lines.append(
+                    f"  held      : {record.buy_filled_amount} {record.asset} "
+                    f"on {record.source_exchange}"
+                )
+            withdrawal_bits = []
+            if record.withdrawal_id:
+                withdrawal_bits.append(f"id={record.withdrawal_id}")
+            if record.withdrawal_txid:
+                withdrawal_bits.append(f"txid={record.withdrawal_txid}")
+            if record.withdrawal_amount and record.withdrawal_amount > 0:
+                lines.append(
+                    f"  withdrawal: {record.withdrawal_amount} {record.asset} "
+                    f"on {record.source_exchange} "
+                    + ("(" + ", ".join(withdrawal_bits) + ")" if withdrawal_bits else "")
+                )
+            lines.append(f"  created   : {record.created_at.isoformat()}")
+            lines.append(f"  updated   : {record.updated_at.isoformat()}")
+            if record.error:
+                lines.append(f"  reason    : {record.error}")
+        if len(records) > _RECONCILE_LIMIT:
+            lines.append("")
+            lines.append(
+                f"... and {len(records) - _RECONCILE_LIMIT} more (CLI has the full list)"
             )
         return "\n".join(lines)
 
-    async def _cmd_balances(self, rest: str) -> str:
-        snapshots = await self._services.balances()
-        if not snapshots:
-            return "no balances available"
-        lines = []
-        for venue, snapshot in sorted(snapshots.items()):
-            lines.append(f"{venue}:")
-            shown = 0
-            for balance in sorted(snapshot.balances, key=lambda b: b.asset):
-                if balance.total <= 0:
-                    continue
-                lines.append(f"  {balance.asset} free {balance.free} used {balance.used}")
-                shown += 1
-                if shown >= 8:
-                    lines.append("  …")
-                    break
-        return "\n".join(lines)
-
-    async def _cmd_opportunities(self, rest: str) -> str:
+    async def _cmd_opportunities(self) -> str:
         opportunities = await self._services.scan_triangles()
         plans = await self._services.plan_transfers()
-        lines = [f"triangles: {len(opportunities)}"]
-        for opportunity in opportunities[:5]:
-            lines.append(f"  {opportunity.direction} net {opportunity.net_profit_bps} bps")
-        lines.append(f"transfers: {len(plans)}")
-        for plan in plans[:5]:
-            lines.append(
-                f"  {plan.source_exchange}->{plan.dest_exchange} {plan.asset} "
-                f"{plan.amount} via {plan.network}: net {plan.net_profit_bps:.1f} bps"
-            )
+        lines = [
+            f"triangle opportunities: {len(opportunities)}",
+        ]
+        if opportunities:
+            for opp in opportunities[:_OPPORTUNITY_LIMIT]:
+                lines.append(
+                    f"  {opp.direction} net {opp.net_profit_bps} bps "
+                    f"notional {opp.size_notional_quote}"
+                )
+        else:
+            lines.append("  (none above configured minimum)")
+        lines.append(f"transfer plans: {len(plans)}")
+        if plans:
+            for plan in plans[:_OPPORTUNITY_LIMIT]:
+                lines.append(
+                    f"  {plan.source_exchange}->{plan.dest_exchange} {plan.asset} "
+                    f"{plan.amount} via {plan.network}: net {plan.net_profit_bps:.1f} bps"
+                )
+        else:
+            lines.append("  (none above configured minimum)")
+        lines.append("\n(no execution — view-only)")
         return "\n".join(lines)
 
-    async def _cmd_triangle(self, rest: str) -> str:
-        opportunities = await self._services.scan_triangles()
-        if not opportunities:
-            return "no triangle opportunities above the configured minimum"
-        best = opportunities[0]
-        trade, assessment = await self._services.execute_triangle(best)
-        if assessment is not None and not assessment.approved:
-            reasons = "\n".join(f"  - {reason}" for reason in assessment.reasons)
-            return f"REJECTED by risk validation:\n{reasons}"
-        return (
-            f"trade {trade.id}: {trade.status.value}\n"
-            f"route: {trade.route}\n"
-            f"in {trade.input_amount} -> out {trade.output_amount}\n"
-            f"net {trade.net_profit} ({trade.net_profit_bps} bps)"
-            + (f"\nnote: {trade.error}" if trade.error else "")
-        )
-
-    async def _cmd_transfer(self, rest: str) -> str:
-        asset: str | None = None
-        amount: Decimal | None = None
-        parts = rest.split()
-        if len(parts) >= 1:
-            asset = parts[0]
-        if len(parts) >= 2:
-            try:
-                amount = Decimal(parts[1])
-            except ArithmeticError:
-                return f"invalid amount: {parts[1]}"
-        plans = await self._services.plan_transfers(asset=asset, amount=amount)
-        if not plans:
-            return "no transfer plans above the configured minimum"
-        lines = []
-        for plan in plans[:5]:
-            lines.append(
-                f"{plan.source_exchange}->{plan.dest_exchange} {plan.asset} {plan.amount} "
-                f"via {plan.network}: net {plan.net_profit_bps:.1f} bps"
-            )
-        if not asset or not amount:
-            lines.append("\nuse /transfer ASSET AMOUNT to execute the best plan")
-            return "\n".join(lines)
-        plan = plans[0]
-        record = await self._services.start_transfer(plan)
-        return (
-            f"transfer {record.id} started: {record.state.value}\n"
-            f"{plan.source_exchange}->{plan.dest_exchange} {plan.asset} {plan.amount} "
-            f"via {plan.network}\n"
-            "the lifecycle advances in this process and via /status"
-        )
-
-    async def _cmd_trades(self, rest: str) -> str:
-        trades = await self._services.trades.list_recent(limit=10)
-        if not trades:
-            return "no trades yet"
-        lines = []
-        for trade in trades:
-            lines.append(
-                f"{trade.created_at:%m-%d %H:%M} {trade.strategy.value} "
-                f"{trade.route} {trade.status.value} net {trade.net_profit}"
-            )
-        return "\n".join(lines)
-
-    async def _cmd_start_auto(self, rest: str) -> str:
+    async def _cmd_pause(self) -> str:
+        """Engage the persistent kill switch (safe)."""
         if self._services.guard.is_halted:
             return (
-                f"kill switch ENGAGED ({self._services.guard.halt_reason}); "
-                "release it from the CLI before starting auto trading"
+                f"kill switch already engaged: {self._services.guard.halt_reason}"
             )
-        if self._auto_task is not None and not self._auto_task.done():
-            return "auto trading is already running"
-        self._services.guard.enable_trading(enabled=True)
-        await self._services.set_auto_trading(True)
-        self._auto_trader = AutoTrader(self._services)
-        self._auto_task = asyncio.create_task(self._auto_trader.run_forever())
-        return f"auto trading enabled (mode {self._services.settings.mode.value})"
-
-    async def _cmd_stop_auto(self, rest: str) -> str:
+        await self._services.engage_kill_switch("telegram /pause")
+        # engage_kill_switch also disables auto trading; mirror the state for
+        # operators watching /status.
         await self._services.set_auto_trading(False)
-        if self._auto_trader is not None:
-            self._auto_trader.stop()
-        if self._auto_task is not None:
-            self._auto_task.cancel()
-            self._auto_task = None
-        return "auto trading disabled"
+        return "kill switch engaged (persisted across restart)"
 
-    # ---------------------------------------------------------------- lifecycle
-    async def background_maintenance(self) -> None:
-        """Drive transfer workflows while the bot polls for commands."""
-        while True:
-            try:
-                await self._services.tick_transfers()
-            except Exception as exc:  # noqa: BLE001 - keep the maintenance alive
-                logger.warning("telegram_tick_failed", extra={"error": str(exc)[:200]})
-            await asyncio.sleep(self._services.settings.transfer.poll_interval_seconds)
+    async def _cmd_resume(self) -> str:
+        """Release the persistent kill switch (safe)."""
+        if not self._services.guard.is_halted:
+            return "kill switch already released"
+        # The guard is the single source of truth for "may we trade?".  This
+        # command restores it but does NOT enable auto trading — operators
+        # must do that explicitly through the CLI.
+        await self._services.release_kill_switch()
+        return (
+            "kill switch released — auto trading is still OFF; "
+            "start it from the CLI when ready"
+        )
+
+    # ---------------------------------------------------------------- send
+    async def _safe_send(self, chat_id: int, text: str) -> None:
+        """Send ``text`` after redacting secrets and truncating to Telegram limits."""
+        cleaned = redact_secrets(text)
+        if len(cleaned) > _MAX_REPLY_LENGTH:
+            cleaned = cleaned[: _MAX_REPLY_LENGTH - 20] + "... (truncated)"
+        try:
+            await self._client.send_message(chat_id, cleaned)
+        except Exception as exc:  # noqa: BLE001 - send errors must not crash the bot
+            logger.warning(
+                "telegram_send_failed",
+                extra={
+                    "chat_id": chat_id,
+                    "error": redact_secrets(str(exc))[:200],
+                },
+            )
+
+
+_DISPATCH: dict[str, Callable[[TelegramBot], Awaitable[str]]] = {
+    "/start": TelegramBot._cmd_start,
+    "/help": TelegramBot._cmd_help,
+    "/status": TelegramBot._cmd_status,
+    "/reconcile": TelegramBot._cmd_reconcile,
+    "/opportunities": TelegramBot._cmd_opportunities,
+    "/pause": TelegramBot._cmd_pause,
+    "/resume": TelegramBot._cmd_resume,
+}
 
 
 async def run_telegram(services: AppServices) -> int:
     """Run the Telegram bot (blocking until cancelled)."""
     settings = services.settings.telegram
     if not settings.is_configured:
-        print(
-            "Telegram is not configured: set CAT_TELEGRAM__BOT_TOKEN "
-            "(and CAT_TELEGRAM__ALLOWED_CHAT_IDS) in .env"
-        )
+        logger.info("telegram_not_configured")
         return 1
-    if not settings.allowed_chat_ids:
-        print(
-            "Telegram allow-list is empty: no chat could command the bot. "
-            "Set CAT_TELEGRAM__ALLOWED_CHAT_IDS (comma-separated) in .env"
+    if not settings.has_any_operator:
+        logger.info(
+            "telegram_allow_list_empty",
+            extra={
+                "hint": "set CAT_TELEGRAM__ALLOWED_USER_IDS in .env",
+            },
         )
         return 1
 
@@ -281,17 +356,12 @@ async def run_telegram(services: AppServices) -> int:
     )
     bot = TelegramBot(services, client)
     me = await client.get_me()
-    logger.info("telegram_bot_started", extra={"username": me.get("username")})
-    print(f"Telegram bot @{me.get('username')} polling (Ctrl+C to stop)")
-
-    maintenance = asyncio.create_task(bot.background_maintenance())
+    username = me.get("username") if isinstance(me, dict) else None
+    logger.info("telegram_bot_started", extra={"username": username})
     try:
         await poll_forever(client, bot.handle_update)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        maintenance.cancel()
-        if bot._auto_task is not None:
-            bot._auto_task.cancel()
         await client.close()
     return 0
