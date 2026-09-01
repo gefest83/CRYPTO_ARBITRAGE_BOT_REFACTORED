@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import inspect
+from sqlalchemy import func, inspect, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -78,6 +78,11 @@ class Database:
         missing columns the metadata requires — typically a database from an
         older checkout), it is renamed to ``*.bak`` and a fresh schema is
         created instead of failing mid-query at runtime.
+
+        H-14 fail-closed: the rename never happens while the file still
+        carries open lifecycle state (open transfers or trades interrupted
+        mid-execution) — destroying their recovery history would silently
+        abandon in-flight funds.  Startup refuses instead.
         """
         from app.storage import tables  # noqa: F401  (import registers the mappers)
         from app.storage.base import Base
@@ -86,11 +91,69 @@ class Database:
         if self._config.is_sqlite and self._sqlite_path() is not None:
             drift = await self._detect_sqlite_drift(engine)
             if drift:
+                open_rows = await self._count_open_lifecycle_rows(engine)
+                if open_rows > 0:
+                    raise ConfigurationError(
+                        f"refusing to rebuild drifted SQLite database "
+                        f"'{self._sqlite_path()}': {open_rows} open transfer/trade "
+                        "record(s) would lose their recovery history — close or "
+                        "resolve them (or migrate the file manually) before "
+                        "restarting"
+                    )
                 await self._rebuild_drifted_file(engine, drift)
                 engine = self.start()
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         logger.info("database_schema_ready", extra={"tables": len(Base.metadata.tables)})
+
+    async def _count_open_lifecycle_rows(self, engine: AsyncEngine) -> int:
+        """Open transfer workflows + trades interrupted mid-execution.
+
+        These rows are the only record of in-flight funds; a drifted file
+        containing any of them must not be rotated away (H-14).
+        """
+        from app.models.enums import TradeStatus, TransferState
+        from app.storage.tables import TradeRow, TransferRow
+
+        open_states = tuple(state.value for state in TransferState if state.is_open)
+
+        def _count(sync_connection: Connection) -> int:
+            inspector = inspect(sync_connection)
+            total = 0
+            if inspector.has_table(TransferRow.__tablename__):
+                columns = {
+                    column["name"] for column in inspector.get_columns(TransferRow.__tablename__)
+                }
+                if "state" in columns:
+                    total += sync_connection.execute(
+                        select(func.count())
+                        .select_from(TransferRow)
+                        .where(TransferRow.state.in_(open_states))
+                    ).scalar_one()
+                else:
+                    # Cannot read the lifecycle column: if the table holds any
+                    # rows we cannot establish that none are open — fail closed.
+                    total += sync_connection.execute(
+                        select(func.count()).select_from(TransferRow)
+                    ).scalar_one()
+            if inspector.has_table(TradeRow.__tablename__):
+                columns = {
+                    column["name"] for column in inspector.get_columns(TradeRow.__tablename__)
+                }
+                if "status" in columns:
+                    total += sync_connection.execute(
+                        select(func.count())
+                        .select_from(TradeRow)
+                        .where(TradeRow.status == TradeStatus.EXECUTING.value)
+                    ).scalar_one()
+                elif sync_connection.execute(
+                    select(func.count()).select_from(TradeRow)
+                ).scalar_one():
+                    total += 1
+            return int(total)
+
+        async with engine.connect() as connection:
+            return await connection.run_sync(_count)
 
     async def _detect_sqlite_drift(self, engine: AsyncEngine) -> dict[str, set[str]]:
         """Existing tables whose columns do not satisfy the current metadata."""

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, time
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 
 from app.config.logging_config import get_logger
 from app.models.balance import Balance, BalanceSnapshot
@@ -93,6 +93,16 @@ class TradeRepository:
             )
             return [self._to_record(row) for row in result.scalars()]
 
+    async def list_executing(self) -> list[TradeRecord]:
+        """Trades interrupted mid-cycle (crash-recovery candidates)."""
+        async with self._db.session() as session:
+            result = await session.execute(
+                select(TradeRow)
+                .where(TradeRow.status == TradeStatus.EXECUTING.value)
+                .order_by(TradeRow.created_at)
+            )
+            return [self._to_record(row) for row in result.scalars()]
+
     async def realized_pnl_since(self, since: datetime) -> Decimal:
         """Net profit of completed trades since ``since`` (UTC)."""
         async with self._db.session() as session:
@@ -134,6 +144,21 @@ class TradeRepository:
 
 
 class TransferRepository:
+    """Persistence of transfer lifecycle records.
+
+    H-1 note (write amplification): every state transition commits in its
+    own session by design.  Each save is a durability point the orchestrator
+    depends on — "persist the state BEFORE the next side effect" is what
+    makes a mid-transfer crash recoverable (see the H-2 idempotency guards:
+    a pre-submission intent that was never committed cannot prevent a
+    duplicate order/withdrawal).  Batching transitions into a shared
+    transaction would reopen exactly the crash windows those guards close,
+    and merging audit-log writes into the same transaction would let a
+    failing audit insert roll back a lifecycle transition (auditing must
+    never break trading).  The write volume — one commit per lifecycle step,
+    ~8 per transfer — is the deliberate price of crash safety.
+    """
+
     def __init__(self, db: Database) -> None:
         self._db = db
 
@@ -199,6 +224,122 @@ class TransferRepository:
                 select(TransferRow).order_by(TransferRow.created_at.desc()).limit(limit)
             )
             return [self._to_record(row) for row in result.scalars()]
+
+    async def list_by_state(self, state: str) -> list[TransferRecord]:
+        """All transfers in the given state, oldest first (read-only).
+
+        Used by the read-only ``reconcile`` CLI command to surface every
+        transfer stuck in ``MANUAL_REVIEW`` for operator reconciliation.
+        No mutation: this is a SELECT, no session writes occur.
+        """
+        async with self._db.session() as session:
+            result = await session.execute(
+                select(TransferRow)
+                .where(TransferRow.state == state)
+                .order_by(TransferRow.created_at)
+            )
+            return [self._to_record(row) for row in result.scalars()]
+
+    async def try_claim_new_open_slot(
+        self,
+        record: TransferRecord,
+        max_open: int,
+    ) -> bool:
+        """Atomically count open transfers and insert ``record`` if there
+        is room.  Returns True if the slot was claimed, False if the open
+        count was already at ``max_open``.
+
+        Cross-process safety (TEST GAP #7): the count and the insert run
+        inside a single SQLite ``BEGIN IMMEDIATE`` transaction, which
+        acquires the database write lock for the duration.  Two
+        independent processes racing on the same database file are
+        serialised by the lock, so at most one of them can observe
+        ``count < max_open`` and insert a new open row.  This makes the
+        ``MAX_OPEN_TRANSFERS`` cap a real database-level invariant rather
+        than an in-process Python ``asyncio.Lock`` that does not span
+        processes.
+        """
+        if max_open < 0:
+            raise ValueError("max_open must be >= 0")
+        row = TransferRow(
+            id=record.id,
+            source_exchange=record.source_exchange,
+            dest_exchange=record.dest_exchange,
+            asset=record.asset,
+            network=record.network,
+            amount=record.amount,
+            state=record.state.value,
+            plan=_dump_json(record.plan),
+            buy_order=record.buy_order,
+            buy_filled_amount=record.buy_filled_amount,
+            withdrawal_id=record.withdrawal_id,
+            withdrawal_txid=record.withdrawal_txid,
+            withdrawal_amount=record.withdrawal_amount,
+            deposit_address=record.deposit_address,
+            deposit_txid=record.deposit_txid,
+            deposit_amount=record.deposit_amount,
+            sell_order=record.sell_order,
+            sell_filled_amount=record.sell_filled_amount,
+            sell_proceeds_quote=record.sell_proceeds_quote,
+            fees_quote=record.fees_quote,
+            realized_profit_quote=record.realized_profit_quote,
+            error=record.error,
+            mode=record.mode,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+        # Raw connection with BEGIN IMMEDIATE: acquires the SQLite write
+        # lock now, serialising concurrent writers across processes.
+        async with self._db.engine.connect() as connection:
+            try:
+                await connection.execute(text("BEGIN IMMEDIATE"))
+                result = await connection.execute(
+                    select(func.count())
+                    .select_from(TransferRow)
+                    .where(TransferRow.state.in_(_OPEN_TRANSFER_STATES))
+                )
+                open_count = int(result.scalar_one())
+                if open_count >= max_open:
+                    await connection.rollback()
+                    return False
+                await connection.execute(
+                    TransferRow.__table__.insert().prefix_with("OR REPLACE"),
+                    {
+                        "id": row.id,
+                        "source_exchange": row.source_exchange,
+                        "dest_exchange": row.dest_exchange,
+                        "asset": row.asset,
+                        "network": row.network,
+                        "amount": row.amount,
+                        "state": row.state,
+                        "plan": row.plan,
+                        "buy_order": row.buy_order,
+                        "buy_filled_amount": row.buy_filled_amount,
+                        "withdrawal_id": row.withdrawal_id,
+                        "withdrawal_txid": row.withdrawal_txid,
+                        "withdrawal_amount": row.withdrawal_amount,
+                        "deposit_address": row.deposit_address,
+                        "deposit_txid": row.deposit_txid,
+                        "deposit_amount": row.deposit_amount,
+                        "sell_order": row.sell_order,
+                        "sell_filled_amount": row.sell_filled_amount,
+                        "sell_proceeds_quote": row.sell_proceeds_quote,
+                        "fees_quote": row.fees_quote,
+                        "realized_profit_quote": row.realized_profit_quote,
+                        "error": row.error,
+                        "mode": row.mode,
+                        "created_at": row.created_at,
+                        "updated_at": row.updated_at,
+                    },
+                )
+                await connection.commit()
+                return True
+            except Exception:
+                try:
+                    await connection.rollback()
+                except Exception:
+                    pass
+                raise
 
     @staticmethod
     def _to_record(row: TransferRow) -> TransferRecord:

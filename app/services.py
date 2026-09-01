@@ -14,6 +14,7 @@ No trading logic lives in the CLI or Telegram layers; they are interfaces.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -85,6 +86,10 @@ class AppServices:
     started_at: float = field(default_factory=time.monotonic)
     _cached_exchange_exposure: dict = field(default_factory=dict)
     _cached_asset_exposure: dict = field(default_factory=dict)
+    #: Serialises transfer starts (H-6): together with an in-lock exposure
+    #: refresh this guarantees the MaxOpenTransfersRule always sees the true
+    #: open-transfer count, so concurrent starts cannot race past the cap.
+    _transfer_start_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):
@@ -126,7 +131,10 @@ class AppServices:
             notional_quote=plan.buy_cost_quote,
             net_profit_bps=plan.net_profit_bps,
             slippage_bps=plan.estimated_slippage_bps,
-            data_age_ms=0.0,  # plans are built from fresh books or rejected
+            # H-7: the real age of the pricing data the plan was built from
+            # (measured at planning time) — a stale plan now fails closed
+            # through MaxDataAgeRule instead of bypassing it with 0.0.
+            data_age_ms=plan.data_age_ms,
             daily_pnl=environment.daily_pnl,
             open_transfers=environment.open_transfers,
             exchange_exposure=environment.exchange_exposure,
@@ -199,8 +207,17 @@ class AppServices:
         return await self.orchestrator.plan(asset=asset, amount=amount, source=source, dest=dest)
 
     async def start_transfer(self, plan: TransferPlan) -> TransferRecord:
-        record = await self.orchestrator.start(plan)
-        await self.refresh_risk_exposure()
+        """Start one transfer workflow.
+
+        H-6: starts are serialised and the open-transfer counter is refreshed
+        from storage inside the lock, so the risk check inside
+        ``orchestrator.start`` always sees the true count — concurrent starts
+        cannot both pass MaxOpenTransfersRule on a stale in-memory snapshot.
+        """
+        async with self._transfer_start_lock:
+            await self.refresh_risk_exposure()
+            record = await self.orchestrator.start(plan)
+            await self.refresh_risk_exposure()
         return record
 
     async def tick_transfers(self) -> list[TransferRecord]:
@@ -505,6 +522,14 @@ async def start_app(services: AppServices) -> None:
         logger.info("auto_trading_restored")
 
     await services.orchestrator.resume()
+    # H-3/H-4: resolve trades interrupted mid-cycle (queries only; incomplete
+    # cycles fail closed into MANUAL_REVIEW, never auto-continued).
+    resumed_trades = await services.executor.resume_open_trades()
+    if resumed_trades:
+        logger.info(
+            "triangle_trades_resumed",
+            extra={"count": len(resumed_trades)},
+        )
     await services.refresh_risk_exposure()
     await services.audit.log("APP_STARTED", str(services.settings.mode))
 

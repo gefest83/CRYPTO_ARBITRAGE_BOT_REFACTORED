@@ -34,6 +34,15 @@ def test_clean_context_approves():
     assert assessment.violations == ()
 
 
+def test_infinite_data_age_is_a_proper_violation():
+    """H-9: a materially future timestamp yields an infinite age — the rule
+    must report a max_data_age violation (fail closed), not crash."""
+    assessment = _engine().evaluate(_context(data_age_ms=float("inf")))
+    assert not assessment.approved
+    violation = next(v for v in assessment.violations if v.rule == "max_data_age")
+    assert violation.actual is None  # inf cannot be quantised; still violated
+
+
 def test_kill_switch_blocks_everything():
     engine = _engine()
     assessment = engine.evaluate(_context(kill_switch_engaged=True))

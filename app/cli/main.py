@@ -8,6 +8,7 @@ Commands (``python -m app <command>``):
     balances      show balances per venue
     trades        show recent trades
     status        show bot status (mode, exchanges, risk, transfers)
+    reconcile     list transfers stuck in MANUAL_REVIEW (read-only)
     start_auto    run the auto-trading loop (Ctrl+C to stop)
     stop_auto     stop auto trading (``--kill`` engages the kill switch)
     telegram      run the Telegram bot (same services as the CLI)
@@ -27,6 +28,7 @@ from typing import Any
 from app.auto import AutoTrader
 from app.config.logging_config import get_logger
 from app.errors import TerminalError
+from app.models.enums import TransferState
 from app.services import AppServices, build_app, shutdown_app, start_app
 
 __all__ = ["main"]
@@ -40,6 +42,7 @@ COMMANDS = (
     "balances",
     "trades",
     "status",
+    "reconcile",
     "start_auto",
     "stop_auto",
     "telegram",
@@ -61,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait", action="store_true", help="transfer: drive the lifecycle until terminal state"
     )
     parser.add_argument("--limit", type=int, default=20, help="listing limit")
+    parser.add_argument(
+        "--reconcile-limit",
+        type=int,
+        default=100,
+        help="reconcile: max number of MANUAL_REVIEW transfers to display",
+    )
     parser.add_argument("--kill", action="store_true", help="stop_auto: engage the kill switch")
     parser.add_argument("--reason", default="engaged from CLI", help="stop_auto --kill: reason")
     parser.add_argument(
@@ -113,6 +122,44 @@ def _print_transfers(records) -> None:
         if record.error:
             line += f"  [{record.error[:80]}]"
         print(line)
+
+
+def _print_manual_review_record(record) -> None:
+    """One MANUAL_REVIEW reconciliation block.
+
+    The block answers the operator's six questions at a glance:
+
+      1. which transfer is stuck      -> record.id + state
+      2. asset and quantity           -> asset + amount / buy_filled_amount
+      3. which exchange holds it      -> source / dest
+      4. withdrawal ID / TXID         -> withdrawal_id / withdrawal_txid
+      5. why did the bot stop         -> error
+      6. when did it happen           -> created_at / updated_at
+    """
+    print(f"  transfer_id : {record.id}")
+    print(f"  state       : {record.state.value}")
+    print(f"  route       : {record.source_exchange} -> {record.dest_exchange}")
+    print(f"  asset       : {record.asset}  (planned {record.amount})")
+    if record.buy_filled_amount and record.buy_filled_amount > 0:
+        print(
+            f"  held        : {record.buy_filled_amount} {record.asset} "
+            f"on {record.source_exchange}"
+        )
+    if record.withdrawal_amount and record.withdrawal_amount > 0:
+        print(
+            f"  withdrawal  : {record.withdrawal_amount} {record.asset} "
+            f"on {record.source_exchange} (id={record.withdrawal_id or '-'}"
+        )
+    if record.withdrawal_txid:
+        print(f"                 txid={record.withdrawal_txid})")
+    elif record.withdrawal_id and not record.withdrawal_txid:
+        print(")")
+    if record.deposit_address:
+        print(f"  deposit addr: {record.deposit_address}")
+    print(f"  created_at  : {record.created_at.isoformat()}")
+    print(f"  updated_at  : {record.updated_at.isoformat()}")
+    if record.error:
+        print(f"  reason      : {record.error}")
 
 
 # ---------------------------------------------------------------- commands
@@ -268,6 +315,33 @@ async def cmd_status(services: AppServices, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_reconcile(services: AppServices, args: argparse.Namespace) -> int:
+    """List every transfer currently in MANUAL_REVIEW (read-only).
+
+    Pure SELECT against the transfers table.  Does NOT call any exchange
+    adapter, does NOT tick the orchestrator, does NOT mutate any record,
+    does NOT acquire a trading lock, does NOT engage the kill switch.
+    An operator can run this safely while the bot is live.
+    """
+    print(f"=== MANUAL RECONCILIATION (mode {services.settings.mode.value}) ===")
+    limit = max(1, int(getattr(args, "reconcile_limit", 100) or 100))
+    records = await services.transfers.list_by_state(TransferState.MANUAL_REVIEW.value)
+    if not records:
+        print("No transfers require manual review.")
+        return 0
+    print(f"{len(records)} transfer(s) require manual review:\n")
+    shown = 0
+    for record in records:
+        if shown >= limit:
+            remaining = len(records) - shown
+            print(f"... and {remaining} more (use --reconcile-limit to show more)")
+            break
+        _print_manual_review_record(record)
+        print()
+        shown += 1
+    return 0
+
+
 async def cmd_start_auto(services: AppServices, args: argparse.Namespace) -> int:
     print(f"=== AUTO TRADING (mode {services.settings.mode.value}) ===")
     if services.guard.is_halted:
@@ -315,6 +389,7 @@ _HANDLERS = {
     "balances": cmd_balances,
     "trades": cmd_trades,
     "status": cmd_status,
+    "reconcile": cmd_reconcile,
     "start_auto": cmd_start_auto,
     "stop_auto": cmd_stop_auto,
     "telegram": cmd_telegram,

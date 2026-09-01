@@ -81,6 +81,10 @@ class OrderStatus(StrEnum):
     #: The outcome could not be classified (adapter raised something
     #: unexpected).  Recovery must query the exchange before believing it.
     UNKNOWN = "unknown"
+    #: Recovery could not establish the order's final state on the venue.
+    #: The order MUST NOT be treated as rejected (it may have filled) and
+    #: MUST NOT be retried — a human resolves it.  Fail-closed status.
+    MANUAL_REVIEW = "manual_review"
 
     @property
     def is_terminal(self) -> bool:
@@ -189,6 +193,32 @@ _TERMINAL_ORDER_STATUSES = frozenset(
         OrderStatus.REJECTED,
         OrderStatus.EXPIRED,
         OrderStatus.TIMEOUT,
+        # No further automated action is taken on a MANUAL_REVIEW order.
+        OrderStatus.MANUAL_REVIEW,
+    }
+)
+
+#: Statuses that make a venue-reported ``filled_amount`` real fill evidence
+#: (an order the venue itself terminated — the amount will not grow).
+_CONFIRMED_FILL_STATUSES = frozenset(
+    {
+        OrderStatus.FILLED,
+        OrderStatus.CANCELED,
+        OrderStatus.EXPIRED,
+        OrderStatus.REJECTED,
+    }
+)
+
+#: Statuses whose final outcome could NOT be established.  Such orders must
+#: never be retried and never treated as rejected — they may have filled.
+_UNCONFIRMED_OUTCOME_STATUSES = frozenset(
+    {
+        OrderStatus.PENDING,
+        OrderStatus.OPEN,
+        OrderStatus.PARTIALLY_FILLED,
+        OrderStatus.TIMEOUT,
+        OrderStatus.UNKNOWN,
+        OrderStatus.MANUAL_REVIEW,
     }
 )
 

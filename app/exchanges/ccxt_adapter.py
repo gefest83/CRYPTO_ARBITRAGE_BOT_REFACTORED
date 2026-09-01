@@ -59,7 +59,7 @@ from app.models.transfer import DepositAddress, TransferTx, WithdrawalNetwork
 from .base import AdapterOptions, BaseExchangeAdapter, OrderGate
 from .credentials import ExchangeCredentials
 from .profiles import VenueProfile, ccxt_candidate_ids, resolve_profile
-from .sanitize import redact_secrets
+from .sanitize import REDACTED, redact_secrets
 
 __all__ = [
     "CCXTAdapter",
@@ -216,6 +216,37 @@ def _ts(value: Any) -> datetime:
     if isinstance(value, int | float) and value > 0:
         return datetime.fromtimestamp(float(value) / 1000.0, tz=UTC)
     return utc_now()
+
+
+#: Configuration keys whose values are credentials (H-11).  The config dict
+#: handed to the ccxt constructor is a plain dict as far as ccxt is
+#: concerned, but its ``repr``/``str`` never expose the secret values.
+_SECRET_CONFIG_KEYS = ("apiKey", "secret", "password", "uid")
+
+
+class _SecretConfig(dict):
+    """A dict whose textual forms redact credential values (H-11).
+
+    ccxt consumes the config through the normal dict API (``deep_extend``
+    copies the real values into the client), so authentication behaviour is
+    unchanged — but accidentally logging / repr'ing / formatting the config
+    structure can no longer leak the secrets it carries.
+    """
+
+    def _redacted_items(self):
+        return [
+            (key, REDACTED if key in _SECRET_CONFIG_KEYS else value)
+            for key, value in self.items()
+        ]
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._redacted_items()!r})"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+    def __format__(self, format_spec: str) -> str:
+        return format(repr(self), format_spec)
 
 
 class CCXTAdapter(BaseExchangeAdapter):
@@ -411,10 +442,15 @@ class CCXTAdapter(BaseExchangeAdapter):
             logger.warning("ccxt_close_failed", extra={"exchange_id": self.id, "error": str(exc)})
 
     def _base_config(self) -> dict[str, Any]:
-        config: dict[str, Any] = {
-            "enableRateLimit": self._options.enable_rate_limit,
-            "timeout": int(self._options.timeout_seconds * 1000),
-        }
+        # H-11: a redacting dict — ccxt reads the real values through the
+        # normal dict API, but the structure itself can never leak them via
+        # str()/repr()/logging.
+        config: dict[str, Any] = _SecretConfig(
+            {
+                "enableRateLimit": self._options.enable_rate_limit,
+                "timeout": int(self._options.timeout_seconds * 1000),
+            }
+        )
         if self._credentials is not None and not self._credentials.is_empty:
             config["apiKey"] = self._credentials.api_key
             config["secret"] = self._credentials.secret

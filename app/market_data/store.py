@@ -16,6 +16,12 @@ from app.models.symbol import Symbol
 
 __all__ = ["MarketDataStore", "QuoteKey"]
 
+#: A snapshot timestamped materially in the future (beyond this tolerance)
+#: is treated as stale: clock skew of a few seconds between a venue and the
+#: local clock is normal, but a far-future timestamp (replay, tampering or a
+#: broken venue clock) must never pass freshness validation (H-9).
+_FUTURE_TOLERANCE_MS = 10_000.0
+
 
 @dataclass(frozen=True, slots=True)
 class QuoteKey:
@@ -44,7 +50,15 @@ class MarketDataStore:
         self._tickers[QuoteKey.of(ticker.exchange_id, ticker.symbol, ticker.market_type)] = ticker
 
     def put_order_book(self, book: OrderBook) -> None:
-        self._books[QuoteKey.of(book.exchange_id, book.symbol, book.market_type)] = book
+        """Cache a book snapshot; H-10: an older snapshot never replaces a
+        newer one (out-of-order websocket replays / reconnect duplicates are
+        dropped).  Equal timestamps are allowed (same snapshot, refreshed
+        content)."""
+        key = QuoteKey.of(book.exchange_id, book.symbol, book.market_type)
+        existing = self._books.get(key)
+        if existing is not None and book.timestamp < existing.timestamp:
+            return
+        self._books[key] = book
 
     def clear(self, *, exchange_id: str | None = None) -> None:
         if exchange_id is None:
@@ -127,8 +141,16 @@ class MarketDataStore:
         return self._stale_after_ms
 
     def _age_ms(self, quote: Ticker | OrderBook) -> float:
-        """Snapshot age relative to the injected clock."""
-        return max(0.0, (self._clock.now() - quote.timestamp).total_seconds() * 1000.0)
+        """Snapshot age relative to the injected clock.
+
+        H-9: a timestamp materially in the future is reported as infinitely
+        old (stale) instead of clamping to a fresh age of 0 — a future
+        timestamp must not bypass freshness validation.
+        """
+        raw = (self._clock.now() - quote.timestamp).total_seconds() * 1000.0
+        if raw < -_FUTURE_TOLERANCE_MS:
+            return float("inf")
+        return max(0.0, raw)
 
     def age_ms(self, quote: Ticker | OrderBook) -> float:
         """Public snapshot age (used by scanners that iterate cached books)."""

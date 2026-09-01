@@ -20,6 +20,12 @@ For an unknown result the protocol is:
 4. persist the outcome and return it;
 5. escalate to ``MANUAL_REVIEW`` when safe recovery is impossible (order not
    found anywhere, venue disagrees, or repeated query failures).
+
+Fail-closed contract: ``REJECTED`` is only ever returned when the *venue*
+established the order was not filled (a terminal zero-fill status fetched
+from the exchange).  When the final state cannot be established the order is
+returned as ``MANUAL_REVIEW`` — never falsely rejected (an unconfirmed order
+may have filled) and never retried automatically.
 """
 
 from __future__ import annotations
@@ -62,12 +68,21 @@ class ExecutionRecovery:
 
         The returned order carries the exchange's own view of the fill.  When
         the truth cannot be established the order is marked
-        ``MANUAL_REVIEW``-pending (status stays as-is, disposition says so) —
-        never silently "fixed".
+        ``MANUAL_REVIEW`` — never silently "fixed" and never falsely
+        ``REJECTED`` (an order whose state is unconfirmed may have filled).
         """
         if order.status is OrderStatus.REJECTED:
             return order
-        if order.status is OrderStatus.TIMEOUT or order.status is OrderStatus.UNKNOWN:
+        if order.status in (
+            OrderStatus.TIMEOUT,
+            OrderStatus.UNKNOWN,
+            # PENDING/OPEN orders appear when a pre-submission intent was
+            # persisted and the process crashed before the venue answered:
+            # the order MAY exist on the venue, so it is resolved the same
+            # way as an unknown outcome.
+            OrderStatus.PENDING,
+            OrderStatus.OPEN,
+        ):
             return await self._resolve_unknown(order, adapter)
         if order.status is OrderStatus.PARTIALLY_FILLED:
             return await self._refresh_partial(order, adapter)
@@ -112,22 +127,29 @@ class ExecutionRecovery:
                         },
                     )
                     return resolved
-                # 3. Not open: it either filled or never existed.  A filled
-                #    market order disappears from the open list — treat "not
-                #    found" as NOT FOUND (never as filled): the truth lives
-                #    in the venue's history which the operator can check.
+                # 3. Not open: it either filled immediately or never
+                #    existed.  A filled market order disappears from the
+                #    open list — "not found" does NOT prove the order was
+                #    never filled, so this is UNCONFIRMED, not REJECTED.
+                #    Only venue-confirmed terminal statuses (fetched by id,
+                #    or matched above with a terminal state) establish
+                #    CONFIRMED_NOT_FILLED.  Fail closed to MANUAL_REVIEW:
+                #    the truth lives in the venue's order/trade history
+                #    which an operator can check.
                 logger.warning(
                     "recovery_order_not_found",
                     extra={
                         "exchange_id": order.exchange_id,
                         "client_order_id": order.client_order_id,
-                        "note": "order not found on venue; escalating to manual review",
+                        "note": "order not found on venue; unconfirmed outcome "
+                        "— escalating to manual review (never auto-rejected)",
                     },
                 )
                 return order.with_status(
-                    OrderStatus.REJECTED,
-                    error="recovery: order not found on venue (never placed or "
-                    "purged from history) — manual review",
+                    OrderStatus.MANUAL_REVIEW,
+                    error="recovery: order not found on venue (either never "
+                    "placed or filled and left the open list) — manual review "
+                    "required",
                 )
             except Exception as exc:  # noqa: BLE001 - retry, then escalate
                 last_error = str(exc)
@@ -140,9 +162,9 @@ class ExecutionRecovery:
                     },
                 )
         return order.with_status(
-            OrderStatus.REJECTED,
+            OrderStatus.MANUAL_REVIEW,
             error=f"recovery: exchange unreachable after {_MAX_QUERY_ATTEMPTS} "
-            f"attempts ({last_error}) — manual review",
+            f"attempts ({last_error}) — manual review required",
         )
 
     async def _refresh_partial(self, order: Order, adapter) -> Order:
@@ -179,12 +201,18 @@ class ExecutionRecovery:
         filled = fetched.filled_amount
         if filled > local.amount:
             filled = local.amount  # venue sanity bound: never trust overfills
-        if DEC0 < filled < local.amount:
-            status = OrderStatus.PARTIALLY_FILLED
-        elif filled >= local.amount:
+        if filled >= local.amount:
             status = OrderStatus.FILLED
+        elif fetched.status.is_terminal:
+            # The venue's own terminal status is authoritative (a canceled
+            # order with a partial fill keeps both the status and amount).
+            status = fetched.status
+        elif DEC0 < filled < local.amount:
+            status = OrderStatus.PARTIALLY_FILLED
         else:
-            status = fetched.status if fetched.status.is_terminal else OrderStatus.REJECTED
+            # Zero fill but the venue still shows the order live: it may
+            # still fill — the outcome is UNCONFIRMED, never "rejected".
+            status = OrderStatus.MANUAL_REVIEW
         return local.model_copy(
             update={
                 "status": status,

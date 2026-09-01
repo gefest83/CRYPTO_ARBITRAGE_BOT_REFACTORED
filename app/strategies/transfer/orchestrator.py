@@ -29,7 +29,7 @@ past the deposit timeout, sell leg unrecoverable) escalate to MANUAL_REVIEW.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
 
 from app.config.logging_config import get_logger
@@ -58,6 +58,35 @@ __all__ = ["TransferOrchestrator"]
 logger = get_logger("strategies.transfer.orchestrator")
 
 _QUANTUM = Decimal("0.00000001")
+
+#: Prefix of a persisted withdrawal submission intent (H-2).  A restart that
+#: finds this id knows a withdrawal was ATTEMPTED but its acceptance could
+#: not be confirmed — it fails closed instead of resubmitting.
+_WITHDRAWAL_INTENT_PREFIX = "wd-intent-"
+
+#: Assets whose on-chain transfers always require a destination tag / memo.
+#: Withdrawals to an address on these networks WITHOUT the tag are sent to an
+#: uncredited address and the funds are lost (the venue credits them, but
+#: they cannot be routed to a user account).  The set is intentionally
+#: conservative: it covers the well-known tag-required assets the bot may
+#: encounter.  When in doubt, fail closed.
+_MEMO_REQUIRED_ASSETS: frozenset[str] = frozenset(
+    {
+        "XRP",
+        "XLM",
+        "EOS",
+        "HBAR",
+        "XIN",
+        "RVN",
+        "ATOM",
+        "BNB",
+        "LUNA",
+        "LUNC",
+        "KAVA",
+        "CRO",
+        "BTS",
+    }
+)
 
 
 class TransferOrchestrator:
@@ -192,11 +221,30 @@ class TransferOrchestrator:
             sell_fee_bps=sell_fees,
             withdrawal_fee=route.withdrawal_fee,
         )
+        # H-7: carry the real age of the pricing data into risk validation
+        # (the freshest of the two books that priced the plan).
+        plan = plan.model_copy(
+            update={
+                "data_age_ms": max(
+                    self._store.age_ms(buy_book),
+                    self._store.age_ms(sell_book),
+                )
+            }
+        )
         return self._planner.evaluate(plan)
 
     # ---------------------------------------------------------------- start
     async def start(self, plan: TransferPlan) -> TransferRecord:
-        """Validate and start a transfer workflow: buy leg + withdrawal."""
+        """Validate and start a transfer workflow: buy leg + withdrawal.
+
+        Cross-process safety (TEST GAP #7): the open-transfer count and
+        the initial insert are wrapped in a single atomic claim at the
+        database level (``BEGIN IMMEDIATE``), so independent OS processes
+        racing on the same database file are serialised by the SQLite
+        write lock.  At most one of them can observe ``count < max_open``
+        and insert a new open row, making ``MAX_OPEN_TRANSFERS`` a real
+        database-level invariant rather than an in-process Python lock.
+        """
         self._guard.ensure_can_trade()
         if self._risk_check is not None:
             assessment = self._risk_check(plan)
@@ -216,7 +264,23 @@ class TransferOrchestrator:
             plan=plan,
             mode=str(self._mode),
         )
-        await self._transfers.save(record)
+        # Atomic claim: the open-transfer count and the insert happen
+        # inside one BEGIN IMMEDIATE transaction, so two concurrent
+        # processes cannot both observe count < max_open and both
+        # insert.  The MaxOpenTransfersRule above already enforced the
+        # limit at validation time, but that check is in-process; the
+        # atomic claim is the database-level guarantee.
+        max_open = int(self._settings.risk.max_open_transfers)
+        claimed = await self._transfers.try_claim_new_open_slot(
+            record, max_open=max_open
+        )
+        if not claimed:
+            raise ExecutionDisabledError(
+                f"transfer rejected by risk validation: "
+                f"max_open_transfers: {max_open} open transfers already "
+                f"in flight (cross-process slot full)",
+                mode=str(self._mode),
+            )
         await self._audit.log(
             "TRANSFER_STARTED",
             f"{plan.source_exchange} -> {plan.dest_exchange} {plan.asset} "
@@ -281,20 +345,59 @@ class TransferOrchestrator:
 
     # ---------------------------------------------------------------- steps
     async def _execute_buy(self, record: TransferRecord) -> TransferRecord:
-        """BUY leg on the source venue.  CREATED/BUY_SUBMITTED -> BUY_FILLED|FAILED."""
+        """BUY leg on the source venue.  CREATED/BUY_SUBMITTED -> BUY_FILLED|FAILED.
+
+        H-2 idempotency: if a previous attempt already persisted a buy order
+        (or a pre-submission intent), it is resolved against the venue — a
+        second BUY order is never created merely because the process
+        restarted.
+        """
         self._guard.ensure_can_trade()
         plan = record.plan
         symbol = Symbol(base=plan.asset, quote=self._settings.trading.base_currency)
+        if record.buy_order is not None:
+            return await self._resolve_existing_buy(record, symbol)
+
+        async def _note(request: OrderRequest) -> None:
+            nonlocal record
+            # Persist the submission intent (client_order_id) BEFORE the
+            # order exists on the venue: a crash between submission and the
+            # outcome save is then recoverable by client-id lookup.
+            placeholder = Order(
+                exchange_id=request.exchange_id,
+                symbol=request.symbol,
+                side=request.side,
+                order_type=request.order_type,
+                amount=request.amount,
+                client_order_id=request.client_order_id,
+                status=OrderStatus.PENDING,
+            )
+            record = record.with_state(
+                TransferState.BUY_SUBMITTED,
+                buy_order=_order_to_json(placeholder),
+            )
+            await self._transfers.save(record)
+
         try:
             fill, order = await self._fill(
                 plan.source_exchange,
                 symbol,
                 OrderSide.BUY,
                 quote_amount=plan.buy_cost_quote,
+                on_submit=_note,
             )
         except ExecutionDisabledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            if record.buy_order is not None:
+                # The submission intent was persisted, so an order may exist
+                # on the venue — never fail as a plain rejection.
+                return await self._fail(
+                    record,
+                    f"buy leg error after submission attempt: {exc} — order may "
+                    "exist on venue; manual review required",
+                    state=TransferState.MANUAL_REVIEW,
+                )
             return await self._fail(record, f"buy leg error: {exc}")
         record = record.with_state(
             TransferState.BUY_SUBMITTED,
@@ -302,15 +405,17 @@ class TransferOrchestrator:
             buy_filled_amount=order.filled_amount,
         )
         await self._transfers.save(record)
-        if order.status is OrderStatus.REJECTED or order.filled_amount <= DEC0:
+        if order.confirmed_not_filled:
             return await self._fail(record, f"buy leg rejected: {order.error or 'no fill'}")
-        if fill is None and order.status is OrderStatus.PARTIALLY_FILLED:
+        if order.outcome_unconfirmed:
             return await self._fail(
                 record,
-                "buy leg partially filled and unresolved — manual review",
+                f"buy leg outcome unconfirmed ({order.status.value}"
+                f"{f': {order.error}' if order.error else ''}) — order may have "
+                "filled; manual review required",
                 state=TransferState.MANUAL_REVIEW,
             )
-        # Paper fills resolve synchronously; exchange orders above resolved
+        # Paper fills resolve synchronously; venue orders above resolved
         # through recovery already.
         filled = order.filled_amount
         if filled <= DEC0 and fill is not None:
@@ -324,12 +429,92 @@ class TransferOrchestrator:
         await self._transfers.save(record)
         return record
 
+    async def _resolve_existing_buy(
+        self, record: TransferRecord, symbol: Symbol
+    ) -> TransferRecord:
+        """Resolve a buy order (or intent) persisted by a previous attempt."""
+        order = _order_from_json(record.buy_order)
+        if order is None:
+            return await self._fail(
+                record,
+                "persisted buy order could not be parsed — manual review required",
+                state=TransferState.MANUAL_REVIEW,
+            )
+        if order.is_confirmed_fill:
+            # Idempotent replay: the previous attempt already bought the asset.
+            record = record.with_state(
+                TransferState.BUY_FILLED,
+                buy_filled_amount=order.filled_amount.quantize(_QUANTUM),
+            )
+            await self._transfers.save(record)
+            return record
+        if order.confirmed_not_filled:
+            # The venue established the order will not fill — no asset was
+            # bought, so failing closed here loses nothing.
+            return await self._fail(
+                record,
+                f"buy leg confirmed not filled ({order.status.value}) on a "
+                "previous attempt",
+            )
+        # Unresolved (pre-submission intent, timeout, still open, ...): query
+        # the venue through recovery — never place a second order.
+        adapter = self._manager.adapter(record.plan.source_exchange)
+        recovered = await self._recovery.recover(order, adapter)
+        record = record.with_state(
+            TransferState.BUY_SUBMITTED,
+            buy_order=_order_to_json(recovered),
+            buy_filled_amount=recovered.filled_amount,
+        )
+        await self._transfers.save(record)
+        if recovered.is_confirmed_fill:
+            record = record.with_state(
+                TransferState.BUY_FILLED,
+                buy_filled_amount=recovered.filled_amount.quantize(_QUANTUM),
+            )
+            await self._transfers.save(record)
+            return record
+        if recovered.confirmed_not_filled:
+            return await self._fail(
+                record,
+                f"buy leg confirmed not filled after recovery "
+                f"({recovered.status.value})",
+            )
+        return await self._fail(
+            record,
+            f"buy order state could not be established ({recovered.status.value}) "
+            "— a second buy would risk duplication; manual review required",
+            state=TransferState.MANUAL_REVIEW,
+        )
+
     async def _submit_withdrawal(self, record: TransferRecord) -> TransferRecord:
-        """Withdraw the bought asset to the destination venue's address."""
+        """Withdraw the bought asset to the destination venue's address.
+
+        H-2 idempotency: a withdrawal that was already submitted (or whose
+        submission intent was persisted) is never duplicated.  C-3: once the
+        buy leg has filled, the purchased asset is tracked explicitly — a
+        withdrawal that cannot proceed escalates to MANUAL_REVIEW instead of
+        silently abandoning the asset.
+        """
         self._guard.ensure_can_trade()
         plan = record.plan
+        if record.withdrawal_id is not None:
+            # A previous attempt already submitted (or attempted) the
+            # withdrawal — never submit a second one.  The state machine
+            # normally routes WITHDRAW_SUBMITTED to _check_withdrawal; this
+            # guards the BUY_FILLED re-entry path.
+            logger.warning(
+                "transfer_withdrawal_already_submitted",
+                extra={"transfer_id": record.id, "withdrawal_id": record.withdrawal_id},
+            )
+            return record
         adapter = self._manager.adapter(plan.source_exchange)
         dest_adapter = self._manager.adapter(plan.dest_exchange)
+
+        def _asset_note() -> str:
+            return (
+                f"purchased {record.buy_filled_amount} {plan.asset} remains on "
+                f"{plan.source_exchange}"
+            )
 
         # Re-validate the network right before moving funds (venues suspend
         # networks; the world may have changed since planning).
@@ -342,7 +527,9 @@ class TransferOrchestrator:
         except NetworkMismatchError as exc:
             return await self._fail(
                 record,
-                f"network validation failed before withdrawal: {exc}",
+                f"network validation failed before withdrawal: {exc}; {_asset_note()} "
+                "— manual review required",
+                state=TransferState.MANUAL_REVIEW,
             )
         if (
             route.code.upper()
@@ -354,26 +541,69 @@ class TransferOrchestrator:
             return await self._fail(
                 record,
                 f"planned network {plan.network} no longer matches validated "
-                f"network {route.network} — refusing to withdraw",
+                f"network {route.network} — refusing to withdraw; {_asset_note()} "
+                "— manual review required",
+                state=TransferState.MANUAL_REVIEW,
             )
 
         try:
             address = await dest_adapter.fetch_deposit_address(plan.asset, network=plan.network)
         except Exception as exc:  # noqa: BLE001
-            return await self._fail(record, f"deposit address unavailable: {exc}")
+            return await self._fail(
+                record,
+                f"deposit address unavailable: {exc}; {_asset_note()} — manual "
+                "review required",
+                state=TransferState.MANUAL_REVIEW,
+            )
+
+        # Memo/tag safety: a withdrawal to a tag-required asset WITHOUT a
+        # tag is sent to an uncredited address and the funds are lost.
+        # Fail closed BEFORE the external withdrawal call when the venue
+        # returned no memo for an asset we know requires one.  A
+        # post-withdrawal MANUAL_REVIEW is not sufficient — the funds
+        # are already gone.
+        if plan.asset.upper() in _MEMO_REQUIRED_ASSETS and not (
+            address.memo and str(address.memo).strip()
+        ):
+            return await self._fail(
+                record,
+                f"destination venue {plan.dest_exchange} returned no memo/tag "
+                f"for the {plan.asset} deposit address on {plan.network} — "
+                f"withdrawals to a {plan.asset} address without a tag lose "
+                f"funds; {_asset_note()} — manual review required",
+                state=TransferState.MANUAL_REVIEW,
+            )
 
         send_amount = record.buy_filled_amount - route.withdrawal_fee
         if send_amount <= DEC0:
             return await self._fail(
                 record,
                 f"bought amount {record.buy_filled_amount} does not cover the "
-                f"withdrawal fee {route.withdrawal_fee}",
+                f"withdrawal fee {route.withdrawal_fee}; {_asset_note()} — "
+                "manual review required",
+                state=TransferState.MANUAL_REVIEW,
             )
+
+        # H-2: persist the withdrawal intent BEFORE submitting, so a crash
+        # between venue acceptance and the outcome save can never lead to a
+        # second withdrawal.  In LIVE mode an unmatched intent fails closed
+        # through the deposit timeout into MANUAL_REVIEW.
+        record = record.with_state(
+            TransferState.WITHDRAW_SUBMITTED,
+            withdrawal_id=f"{_WITHDRAWAL_INTENT_PREFIX}{record.id[-12:]}",
+            deposit_address=address.address,
+            withdrawal_amount=send_amount.quantize(_QUANTUM),
+        )
+        await self._transfers.save(record)
 
         try:
             if self._mode is TradingMode.PAPER:
                 tx = await adapter.withdraw(
-                    plan.asset, f"{send_amount}", address.address, network=plan.network
+                    plan.asset,
+                    f"{send_amount}",
+                    address.address,
+                    memo=address.memo,
+                    network=plan.network,
                 )
                 withdrawal_id, txid = tx.txid, tx.txid
             elif self._mode is TradingMode.DEMO:
@@ -392,7 +622,12 @@ class TransferOrchestrator:
         except ExecutionDisabledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            return await self._fail(record, f"withdrawal failed: {exc}")
+            return await self._fail(
+                record,
+                f"withdrawal failed: {exc}; {_asset_note()} — manual review "
+                "required",
+                state=TransferState.MANUAL_REVIEW,
+            )
 
         if self._mode is TradingMode.PAPER:
             wallet = self._paper_wallets.get(plan.source_exchange)
@@ -450,7 +685,16 @@ class TransferOrchestrator:
                 await self._transfers.save(record)
                 return record
             if tx.status in ("failed", "canceled", "cancelled", "reject"):
-                return await self._fail(record, f"withdrawal failed on venue: {tx.status}")
+                # The venue reports the withdrawal failed: the purchased
+                # asset did NOT leave the source venue — track it
+                # explicitly instead of abandoning it (C-3).
+                return await self._fail(
+                    record,
+                    f"withdrawal failed on venue: {tx.status}; purchased "
+                    f"{record.buy_filled_amount} {plan.asset} remains on "
+                    f"{plan.source_exchange} — manual review required",
+                    state=TransferState.MANUAL_REVIEW,
+                )
             return record.with_state(TransferState.WITHDRAW_PENDING)
         return await self._timeout_guard(record, "withdrawal not visible in history yet")
 
@@ -498,13 +742,29 @@ class TransferOrchestrator:
         return await self._timeout_guard(record, "deposit not detected yet")
 
     async def _execute_sell(self, record: TransferRecord) -> TransferRecord:
-        """SELL leg on the destination venue."""
+        """SELL leg on the destination venue.
+
+        C-4: the destination asset is tracked explicitly — a sell that cannot
+        be confirmed or completed escalates to MANUAL_REVIEW instead of
+        marking the whole operation FAILED while holding the asset.
+        """
         self._guard.ensure_can_trade()
         plan = record.plan
         symbol = Symbol(base=plan.asset, quote=self._settings.trading.base_currency)
         sell_amount = record.deposit_amount
         if sell_amount <= DEC0:
-            return await self._fail(record, "nothing to sell: deposit amount is zero")
+            return await self._fail(
+                record,
+                "nothing to sell: deposit amount is zero",
+                state=TransferState.MANUAL_REVIEW,
+            )
+
+        def _asset_note() -> str:
+            return (
+                f"{record.deposit_amount} {plan.asset} deposited on "
+                f"{plan.dest_exchange}"
+            )
+
         try:
             fill, order = await self._fill(
                 plan.dest_exchange, symbol, OrderSide.SELL, base_amount=sell_amount
@@ -512,7 +772,11 @@ class TransferOrchestrator:
         except ExecutionDisabledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            return await self._fail(record, f"sell leg error: {exc}")
+            return await self._fail(
+                record,
+                f"sell leg error: {exc}; {_asset_note()} — manual review required",
+                state=TransferState.MANUAL_REVIEW,
+            )
         # Net-of-fee proceeds in quote currency (paper: simulator net; live:
         # venue average price x fill minus the quote-denominated fee).
         if fill is not None:
@@ -530,10 +794,20 @@ class TransferOrchestrator:
             sell_proceeds_quote=proceeds.quantize(_QUANTUM) if proceeds > DEC0 else DEC0,
         )
         await self._transfers.save(record)
+        if order.outcome_unconfirmed:
+            return await self._fail(
+                record,
+                f"sell leg outcome unconfirmed ({order.status.value}"
+                f"{f': {order.error}' if order.error else ''}) — the deposit may "
+                f"have been (partially) sold; {_asset_note()} — manual review "
+                "required",
+                state=TransferState.MANUAL_REVIEW,
+            )
         if order.filled_amount <= DEC0:
             return await self._fail(
                 record,
-                f"sell leg rejected: {order.error or 'no fill'}",
+                f"sell leg rejected: {order.error or 'no fill'}; {_asset_note()} "
+                "— manual review required",
                 state=TransferState.MANUAL_REVIEW,
             )
         return await self._finish(record)
@@ -611,8 +885,14 @@ class TransferOrchestrator:
         *,
         base_amount: Decimal | None = None,
         quote_amount: Decimal | None = None,
+        on_submit: Callable[[OrderRequest], Awaitable[None]] | None = None,
     ) -> tuple[SimulatedFill | None, Order]:
-        """One order leg in the current mode (paper simulation vs real order)."""
+        """One order leg in the current mode (paper simulation vs real order).
+
+        ``on_submit`` (venue legs only) is fired with the final request right
+        before submission so the caller can persist a PENDING intent
+        identified by its ``client_order_id``.
+        """
         book = self._fresh_book(venue, symbol)
         if self._mode is TradingMode.PAPER:
             fill = self._sim.simulate(
@@ -664,6 +944,9 @@ class TransferOrchestrator:
             amount=amount,
         )
         adapter = self._manager.adapter(venue)
+        if on_submit is not None:
+            # H-2: persist the intent BEFORE the order exists on the venue.
+            await on_submit(request)
         try:
             order = await asyncio.wait_for(
                 adapter.create_order(request),
@@ -691,6 +974,10 @@ class TransferOrchestrator:
                 status=OrderStatus.UNKNOWN,
                 error=f"{type(exc).__name__}: {exc}"[:500],
             )
+        if not order.client_order_id:
+            # Some venues do not echo the client id; keep the intent identity
+            # so the persisted outcome replaces the PENDING placeholder.
+            order = order.model_copy(update={"client_order_id": request.client_order_id})
         if order.status in (
             OrderStatus.TIMEOUT,
             OrderStatus.UNKNOWN,
@@ -768,3 +1055,12 @@ def _order_to_json(order: Order) -> dict:
 
     computed = set(order.model_computed_fields)
     return json.loads(order.model_dump_json(exclude=computed))
+
+
+def _order_from_json(data: dict | None) -> Order | None:
+    if data is None:
+        return None
+    try:
+        return Order.model_validate(data)
+    except Exception:  # noqa: BLE001 - unparsable records must fail closed
+        return None

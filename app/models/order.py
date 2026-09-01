@@ -9,7 +9,15 @@ from decimal import Decimal
 from pydantic import Field, computed_field
 
 from app.models.base import DEC0, DomainModel, utc_now
-from app.models.enums import MarketType, OrderSide, OrderStatus, OrderType, TimeInForce
+from app.models.enums import (
+    _CONFIRMED_FILL_STATUSES,
+    _UNCONFIRMED_OUTCOME_STATUSES,
+    MarketType,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from app.models.symbol import Symbol
 
 __all__ = ["Fill", "Order", "OrderRequest"]
@@ -92,6 +100,30 @@ class Order(DomainModel):
     @property
     def is_open(self) -> bool:
         return not self.status.is_terminal
+
+    @property
+    def is_confirmed_fill(self) -> bool:
+        """Venue-confirmed fill evidence: a venue-terminated order that
+        reports a filled amount.  The amount is real inventory — never mark
+        such an order as a plain rejection (B-1)."""
+        return self.filled_amount > DEC0 and self.status in _CONFIRMED_FILL_STATUSES
+
+    @property
+    def outcome_unconfirmed(self) -> bool:
+        """The final state could NOT be established (still live on the
+        venue, or recovery failed).  Such an order must never be retried,
+        never unwound against, and never reported as rejected."""
+        return self.status in _UNCONFIRMED_OUTCOME_STATUSES
+
+    @property
+    def confirmed_not_filled(self) -> bool:
+        """The venue established the order will not fill (terminal status,
+        zero fill) — safe to treat as a rejection."""
+        return (
+            self.filled_amount <= DEC0
+            and self.status.is_terminal
+            and not self.outcome_unconfirmed
+        )
 
     @property
     def is_partially_filled(self) -> bool:

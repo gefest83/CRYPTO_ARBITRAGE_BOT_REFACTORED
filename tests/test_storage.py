@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+import pytest
 from app.models.enums import (
     ArbitrageStrategy,
     TradeStatus,
@@ -203,4 +204,101 @@ async def test_schema_drift_recreates_database(tmp_path):
     )
     assert await trades.realized_pnl_today() == D("0")
     assert (tmp_path / "drift.db.bak").exists()
+    await db2.dispose()
+
+
+async def _induce_drift(tmp_path, name: str = "drift.db"):
+    """Create a drifted database file (legacy trades table)."""
+    from app.config.settings import DatabaseSettings
+    from sqlalchemy import text
+
+    path = tmp_path / name
+    db = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    await db.create_schema()
+    async with db.session() as session:
+        await session.execute(text("DROP TABLE trades"))
+        await session.execute(text("CREATE TABLE trades (id TEXT PRIMARY KEY, legacy TEXT)"))
+    await db.dispose()
+    return path
+
+
+async def test_schema_drift_with_open_transfer_fails_closed(tmp_path):
+    """H-14: a drifted database containing an OPEN transfer must never be
+    renamed/destroyed — startup refuses instead of losing recovery history."""
+    from app.config.settings import DatabaseSettings
+    from app.errors import ConfigurationError
+
+    path = await _induce_drift(tmp_path)
+
+    # an open transfer lives in the drifted file
+    db_seed = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    db_seed.start()
+    transfers = TransferRepository(db_seed)
+    await transfers.save(
+        TransferRecord(
+            source_exchange="binance",
+            dest_exchange="okx",
+            asset="ETH",
+            network="SIM",
+            amount=D("5"),
+            plan=TransferPlan(
+                source_exchange="binance",
+                dest_exchange="okx",
+                asset="ETH",
+                network="SIM",
+                amount=D("5"),
+                buy_price=D("100"),
+                sell_price=D("105"),
+            ),
+            state=TransferState.BUY_FILLED,
+        )
+    )
+    await db_seed.dispose()
+
+    db2 = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    with pytest.raises(ConfigurationError, match="open transfer"):
+        await db2.create_schema()
+    # nothing was destroyed
+    assert path.exists()
+    assert not (tmp_path / "drift.db.bak").exists()
+    await db2.dispose()
+
+    # the open transfer is still recoverable from the untouched file
+    db3 = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    db3.start()
+    open_records = await TransferRepository(db3).list_open()
+    assert len(open_records) == 1
+    await db3.dispose()
+
+
+async def test_schema_drift_with_executing_trade_fails_closed(tmp_path):
+    """H-14: an interrupted (EXECUTING) triangle trade is lifecycle state
+    too — the drifted file must not be rotated away under it."""
+    from app.config.settings import DatabaseSettings
+    from app.errors import ConfigurationError
+    from sqlalchemy import text
+
+    path = tmp_path / "drift2.db"
+    db = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    await db.create_schema()
+    # seed an EXECUTING trade, THEN drift a different table's schema under it
+    # (the trade row itself must survive in the drifted file)
+    await TradeRepository(db).save(
+        TradeRecord(
+            strategy=ArbitrageStrategy.TRIANGLE,
+            exchange_id="binance",
+            route="USDT->BTC->ETH->USDT",
+            status=TradeStatus.EXECUTING,
+        )
+    )
+    async with db.session() as session:
+        await session.execute(text("DROP TABLE transfers"))
+        await session.execute(text("CREATE TABLE transfers (id TEXT PRIMARY KEY, legacy TEXT)"))
+    await db.dispose()
+
+    db2 = Database(DatabaseSettings(url=f"sqlite+aiosqlite:///{path}"))
+    with pytest.raises(ConfigurationError):
+        await db2.create_schema()
+    assert path.exists()
+    assert not (tmp_path / "drift2.db.bak").exists()
     await db2.dispose()

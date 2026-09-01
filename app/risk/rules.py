@@ -8,6 +8,7 @@ converted by the engine into a CRITICAL violation — risk fails closed.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -234,12 +235,19 @@ class MaxDataAgeRule(RiskRule):
 
     def check(self, context: RiskContext, limits: RiskLimits) -> RiskViolation | None:
         if context.data_age_ms > limits.max_data_age_ms:
+            # ``inf`` (e.g. a materially future timestamp, H-9, or missing
+            # data) is stale but cannot be converted to a finite int.
+            actual = (
+                Decimal(str(int(context.data_age_ms)))
+                if math.isfinite(context.data_age_ms)
+                else None
+            )
             return _violation(
                 self.name,
                 f"market data age {context.data_age_ms:.0f} ms exceeds maximum "
                 f"{limits.max_data_age_ms} ms",
                 limit=Decimal(str(limits.max_data_age_ms)),
-                actual=Decimal(str(int(context.data_age_ms))),
+                actual=actual,
                 severity=RiskLevel.CRITICAL,
             )
         return None

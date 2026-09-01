@@ -179,11 +179,31 @@ class StreamSupervisor:
         iterator_factory: Callable[[], AsyncIterator[Any]],
         on_event: Callable[[Any], Awaitable[None]] | Callable[[Any], None],
     ) -> None:
-        """Main supervision loop for a single stream."""
+        """Main supervision loop for a single stream.
+
+        C-5: semaphore acquisition is guarded — a cancellation (or any other
+        error) between acquiring the global permit and the exchange permit
+        releases what was already acquired.  Without this, a cancelled stream
+        waiting on its exchange semaphore would leak a global permit forever.
+        """
         while not state.stopped:
-            await self._semaphore.acquire()
-            ex_sem = self._get_exchange_semaphore(state.spec.exchange_id)
-            await ex_sem.acquire()
+            acquired_global = False
+            acquired_exchange = False
+            ex_sem: asyncio.Semaphore | None = None
+            try:
+                await self._semaphore.acquire()
+                acquired_global = True
+                ex_sem = self._get_exchange_semaphore(state.spec.exchange_id)
+                await ex_sem.acquire()
+                acquired_exchange = True
+            except BaseException:
+                # CancelledError (and any acquisition failure) must not leak
+                # permits that were already taken.
+                if acquired_exchange and ex_sem is not None:
+                    ex_sem.release()
+                if acquired_global:
+                    self._semaphore.release()
+                raise
 
             try:
                 iterator = iterator_factory()

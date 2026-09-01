@@ -117,6 +117,10 @@ class TransferPlan(DomainModel):
     #: Estimated execution slippage (bps) already included via depth pricing;
     #: kept separately for reporting.
     estimated_slippage_bps: Decimal = DEC0
+    #: Age (ms) of the freshest book the plan was priced from, measured at
+    #: planning time (H-7).  Risk validation compares it against the
+    #: max-data-age limit so a plan cannot be started on stale pricing.
+    data_age_ms: float = 0.0
 
     @property
     def buy_cost_quote(self) -> Decimal:
