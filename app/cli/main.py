@@ -25,7 +25,6 @@ import sys
 from decimal import Decimal
 from typing import Any
 
-from app.auto import AutoTrader
 from app.config.logging_config import get_logger
 from app.errors import TerminalError
 from app.models.enums import TransferState
@@ -353,15 +352,27 @@ async def cmd_start_auto(services: AppServices, args: argparse.Namespace) -> int
             return 1
         await services.release_kill_switch()
         print("kill switch released")
-    await services.set_auto_trading(True)
-    print("auto trading enabled — Ctrl+C to stop")
-    trader = AutoTrader(services)
+    # Use the AutoTradingController — same entry point as the Telegram
+    # ``/start_trading`` command — so CLI and Telegram cannot create two
+    # independent auto loops in the same process.
+    started, message = await services.auto_controller.start()
+    if not started:
+        print(message)
+        return 1
+    print(f"{message} — Ctrl+C to stop")
+    # Wait for either an external stop signal (the controller's task), or the
+    # operator pressing Ctrl+C.  The controller is the single owner of the
+    # loop: pressing Ctrl+C asks the loop to stop and waits for it to exit.
+    controller = services.auto_controller
+    assert controller is not None
     try:
-        await trader.run_forever()
+        task = controller._task
+        if task is not None:
+            await asyncio.shield(task)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        trader.stop()
+        pass
     finally:
-        await services.set_auto_trading(False)
+        await controller.stop()
     return 0
 
 
@@ -370,9 +381,11 @@ async def cmd_stop_auto(services: AppServices, args: argparse.Namespace) -> int:
     if args.kill:
         await services.engage_kill_switch(args.reason)
         print(f"auto trading disabled; kill switch ENGAGED ({args.reason})")
-    else:
-        await services.set_auto_trading(False)
-        print("auto trading disabled (running loops observe the flag and stop)")
+        return 0
+    # Use the controller so we share state with Telegram; the controller is
+    # idempotent and never raises.
+    stopped, message = await services.auto_controller.stop()
+    print(message)
     return 0
 
 

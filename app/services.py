@@ -86,6 +86,9 @@ class AppServices:
     started_at: float = field(default_factory=time.monotonic)
     #: Background Telegram runner (None when disabled / not configured).
     telegram_runner: Any = None
+    #: Background auto-trading loop controller (None only during build; always
+    #: non-None once :func:`build_app` returns).
+    auto_controller: Any = None
     _cached_exchange_exposure: dict = field(default_factory=dict)
     _cached_asset_exposure: dict = field(default_factory=dict)
     #: Serialises transfer starts (H-6): together with an in-lock exposure
@@ -290,11 +293,18 @@ class AppServices:
         await self.refresh_risk_exposure()
         recent_trades = await self.trades.list_recent(5)
         open_transfers = await self.transfers.list_open()
+        auto_flag = await self.auto_trading_enabled()
+        auto_loop_running = (
+            await self.auto_controller.is_running()
+            if self.auto_controller is not None
+            else False
+        )
         return {
             "mode": self.settings.mode.value,
             "uptime_seconds": round(time.monotonic() - self.started_at, 1),
             "guard": self.guard.status(),
-            "auto_trading": await self.auto_trading_enabled(),
+            "auto_trading": auto_flag,
+            "auto_loop_running": auto_loop_running,
             "exchanges": self.manager.status_snapshot(),
             "market_data": self.store.stats(),
             "risk": {
@@ -495,6 +505,12 @@ async def build_app(settings: Settings | None = None) -> AppServices:
         paper_wallets=paper_wallets,
     )
     services.orchestrator = orchestrator
+    # AutoTradingController: single owner of the AutoTrader background loop.
+    # Both the CLI start_auto / stop_auto and the Telegram /start_trading /
+    # /stop_trading commands must go through this controller.
+    from app.auto_controller import AutoTradingController
+
+    services.auto_controller = AutoTradingController(services)
     return services
 
 
@@ -542,6 +558,10 @@ async def start_app(services: AppServices) -> None:
 
 async def shutdown_app(services: AppServices) -> None:
     """Stop streams, close adapters, dispose the database."""
+    # Auto-trading loop first: stop any in-flight cycle before tearing down
+    # state.  The controller's shutdown is idempotent and never raises.
+    if services.auto_controller is not None:
+        await services.auto_controller.shutdown()
     # Telegram first: stop accepting new commands before tearing down state.
     await _stop_telegram(services)
     await services.market.stop_streams()

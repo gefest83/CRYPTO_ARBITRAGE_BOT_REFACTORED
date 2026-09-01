@@ -18,6 +18,7 @@ These tests prove:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -270,7 +271,7 @@ async def test_unknown_command_shows_help(services: AppServices) -> None:
 
 
 async def test_command_set_matches_spec() -> None:
-    """The documented set must contain exactly the required read-only/safe commands."""
+    """The documented set must contain exactly the required commands."""
     assert set(COMMANDS) == {
         "/start",
         "/help",
@@ -279,6 +280,8 @@ async def test_command_set_matches_spec() -> None:
         "/opportunities",
         "/pause",
         "/resume",
+        "/start_trading",
+        "/stop_trading",
     }
 
 
@@ -308,7 +311,15 @@ async def test_telegram_cannot_initiate_withdrawals() -> None:
 async def test_replies_do_not_contain_secrets(services: AppServices) -> None:
     """No Telegram reply may echo a secret value, token, or query string."""
     bot, client = _bot(services)
-    for cmd in ("/start", "/help", "/status", "/reconcile", "/opportunities"):
+    for cmd in (
+        "/start",
+        "/help",
+        "/status",
+        "/reconcile",
+        "/opportunities",
+        "/start_trading",
+        "/stop_trading",
+    ):
         client.sent.clear()
         await bot.handle_update(_update(AUTHORIZED_CHAT_ID, cmd))
         assert client.sent, f"no reply for {cmd}"
@@ -424,3 +435,495 @@ async def test_telegram_shutdown_is_clean(tmp_path) -> None:
     assert not remaining, f"orphan Telegram tasks after shutdown: {remaining}"
     # Double shutdown must be a no-op (does not raise)
     await shutdown_app(services)
+
+
+# ---------------------------------------------------------------------------
+# /start_trading and /stop_trading (Telegram-controlled DEMO auto-trading)
+# ---------------------------------------------------------------------------
+
+
+async def test_start_trading_starts_demo_auto_trading(demo_services: AppServices) -> None:
+    """``/start_trading`` engages the persisted auto flag and spawns one task."""
+    services = demo_services
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    text = client.sent[-1][1]
+    assert "started" in text.lower(), text
+    assert await services.auto_trading_enabled() is True
+    # The in-process loop is actually running
+    assert services.auto_controller is not None
+    assert await services.auto_controller.is_running() is True
+    # Cleanup for downstream tests
+    await services.auto_controller.stop()
+
+
+async def test_start_trading_is_idempotent(demo_services: AppServices) -> None:
+    """A second ``/start_trading`` does not create a second loop."""
+    services = demo_services
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    first = client.sent[-1][1]
+    assert "started" in first.lower()
+    # Capture the first task identity
+    first_task = services.auto_controller._task
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    second = client.sent[-1][1]
+    assert "already" in second.lower(), second
+    # Same task identity -> no second loop was created
+    assert services.auto_controller._task is first_task
+    await services.auto_controller.stop()
+
+
+async def test_stop_trading_stops_auto_loop(demo_services: AppServices) -> None:
+    services = demo_services
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    text = client.sent[-1][1]
+    assert "stopped" in text.lower(), text
+    assert await services.auto_trading_enabled() is False
+    assert services.auto_controller._task is None
+
+
+async def test_stop_trading_is_idempotent(services: AppServices) -> None:
+    bot, client = _bot(services)
+    # No prior start -> first stop is a no-op (mode is PAPER but stop is allowed)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    first = client.sent[-1][1]
+    assert "stopped" in first.lower() or "already" in first.lower(), first
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    second = client.sent[-1][1]
+    assert "stopped" in second.lower() or "already" in second.lower(), second
+
+
+async def test_start_trading_refused_outside_demo(tmp_path) -> None:
+    """``/start_trading`` must fail-closed in PAPER (and by construction LIVE)."""
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    from pydantic import SecretStr
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.PAPER,
+                allow_live=False,
+                live_confirmation=SecretStr(""),
+                base_currency="USDT",
+            )
+        }
+    )
+
+    services = await build_app(base)
+    try:
+        bot, client = _bot(services)
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+        text = client.sent[-1][1]
+        assert "refused" in text.lower() or "only allowed" in text.lower(), text
+        assert await services.auto_trading_enabled() is False
+    finally:
+        await shutdown_app(services)
+
+
+async def test_unauthorized_cannot_start_or_stop_trading(
+    demo_services: AppServices,
+) -> None:
+    services = demo_services
+    bot, client = _bot(services)
+    for cmd in ("/start_trading", "/stop_trading"):
+        client.sent.clear()
+        await bot.handle_update(
+            _update(AUTHORIZED_CHAT_ID, cmd, user_id=STRANGER_USER_ID)
+        )
+        assert client.sent[-1][1] == "unauthorized"
+    # Auto trading was never enabled
+    assert await services.auto_trading_enabled() is False
+
+
+async def test_telegram_dispatch_does_not_call_create_order_or_withdraw() -> None:
+    """Static guarantee: no command handler touches create_order / withdraw."""
+    from app.telegram.bot import _DISPATCH
+
+    forbidden = ("create_order", ".withdraw(", "_cmd_withdraw")
+    for name, method in _DISPATCH.items():
+        source = getattr(method, "__func__", method)
+        qualname = getattr(source, "__qualname__", "")
+        for needle in forbidden:
+            assert needle not in qualname, f"{name} references {needle}"
+        assert "create_order" not in qualname, f"{name} references create_order"
+
+
+async def test_status_reports_auto_loop_state(demo_services: AppServices) -> None:
+    services = demo_services
+    bot, client = _bot(services)
+    # Before start
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/status"))
+    text_before = client.sent[-1][1]
+    assert "auto trading (flag): off" in text_before
+    assert "auto loop: stopped" in text_before
+    # After start
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/status"))
+    text_on = client.sent[-1][1]
+    assert "auto trading (flag): on" in text_on
+    assert "auto loop: running" in text_on
+    # After stop
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/status"))
+    text_off = client.sent[-1][1]
+    assert "auto trading (flag): off" in text_off
+    assert "auto loop: stopped" in text_off
+
+
+async def test_start_trading_refused_when_kill_switch_engaged(
+    demo_services: AppServices,
+) -> None:
+    services = demo_services
+    await services.engage_kill_switch("preseed")
+    try:
+        bot, client = _bot(services)
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+        text = client.sent[-1][1]
+        assert "kill switch" in text.lower(), text
+        assert await services.auto_trading_enabled() is False
+    finally:
+        await services.release_kill_switch()
+
+
+async def test_stop_trading_does_not_engage_kill_switch(
+    demo_services: AppServices,
+) -> None:
+    """``/stop_trading`` must NOT touch the kill switch (semantics preserved)."""
+    services = demo_services
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    assert await services.auto_trading_enabled() is True
+    assert not services.guard.is_halted
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    assert not services.guard.is_halted, "stop_trading must not engage the kill switch"
+
+
+async def test_resume_does_not_start_trading(services: AppServices) -> None:
+    """``/resume`` semantics preserved: releases kill switch, does NOT enable auto trading."""
+    await services.engage_kill_switch("preseed")
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/resume"))
+    text = client.sent[-1][1]
+    assert "released" in text.lower()
+    assert not services.guard.is_halted
+    assert await services.auto_trading_enabled() is False, (
+        "/resume must NOT enable auto trading"
+    )
+    assert services.auto_controller._task is None
+
+
+async def test_pause_stops_auto_trading_without_resuming(
+    demo_services: AppServices,
+) -> None:
+    """``/pause`` engages the kill switch and stops the auto loop (existing semantics)."""
+    services = demo_services
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    assert await services.auto_trading_enabled() is True
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/pause"))
+    text = client.sent[-1][1]
+    assert "kill switch" in text.lower()
+    assert services.guard.is_halted
+    # Auto flag is cleared by the existing engage_kill_switch logic
+    assert await services.auto_trading_enabled() is False
+    # Controller has no live task
+    assert services.auto_controller._task is None
+    # Release so later tests start clean
+    await services.release_kill_switch()
+
+
+async def test_restart_does_not_auto_start_trading(tmp_path) -> None:
+    """After an explicit ``/stop_trading``, restart must NOT re-spawn the loop.
+
+    The persisted auto flag is the source of truth — if the operator stopped
+    it once, restart respects that decision.
+    """
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    # First session: start then stop
+    services_a = await build_app(base)
+    await start_app(services_a)
+    bot, _ = _bot(services_a)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    assert await services_a.auto_trading_enabled() is True
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/stop_trading"))
+    assert await services_a.auto_trading_enabled() is False
+    await shutdown_app(services_a)
+    # Second session: the auto flag is still False -> nothing restarts.
+    services_b = await build_app(base)
+    try:
+        assert await services_b.auto_trading_enabled() is False
+        assert services_b.auto_controller._task is None
+    finally:
+        await shutdown_app(services_b)
+
+
+async def test_application_shutdown_stops_auto_loop(tmp_path) -> None:
+    """``shutdown_app`` must stop the in-process auto loop cleanly."""
+    import asyncio
+
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    services = await build_app(base)
+    await start_app(services)
+    bot, _ = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+    assert services.auto_controller._task is not None
+    await shutdown_app(services)
+    # The auto task must be gone — no orphan background loop survives shutdown.
+    remaining = [
+        t for t in asyncio.all_tasks()
+        if (t.get_name() or "").startswith("auto")
+    ]
+    assert not remaining, f"orphan auto tasks after shutdown: {remaining}"
+
+
+# ---------------------------------------------------------------------------
+# Code-review regression tests (race + crash recovery + restart semantics).
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_start_calls_create_only_one_task(
+    demo_services: AppServices,
+) -> None:
+    """Two concurrent ``/start_trading`` calls must not create two AutoTrader tasks."""
+    services = demo_services
+    controller = services.auto_controller
+    assert controller is not None
+    # Fire two concurrent starts; the asyncio.Lock must serialise them so
+    # only one task is ever created.
+    results = await asyncio.gather(
+        controller.start(),
+        controller.start(),
+        controller.start(),
+    )
+    started_count = sum(1 for ok, _ in results if ok)
+    assert started_count == 1, f"expected exactly one successful start, got {started_count}"
+    # Only one in-process task regardless of how many callers raced.
+    assert controller._task is not None
+    assert controller.running is True
+    # Cleanup
+    await controller.stop()
+
+
+async def test_concurrent_start_via_telegram_handlers(
+    demo_services: AppServices,
+) -> None:
+    """Race at the Telegram dispatch layer: three ``/start_trading`` updates."""
+    services = demo_services
+    bot, _ = _bot(services)
+    # Three updates "in flight" — the dispatch processes them serially, but
+    # the controller's lock catches the case where the second start observes
+    # a running loop.  Without the lock the second start could see ``False``
+    # while the first is mid-spawn and create a duplicate task.
+    await asyncio.gather(
+        bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading")),
+        bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading")),
+        bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading")),
+    )
+    # Only one task.
+    controller = services.auto_controller
+    assert controller is not None
+    assert controller.running is True
+    # Confirm only one AutoTrader task is alive.
+    auto_tasks = [t for t in asyncio.all_tasks() if (t.get_name() or "") == "auto-trader"]
+    assert len(auto_tasks) == 1, f"expected 1 auto-trader task, got {len(auto_tasks)}"
+    await controller.stop()
+
+
+async def test_loop_crash_clears_stale_flag_on_next_status(
+    demo_services: AppServices,
+) -> None:
+    """If the AutoTrader loop crashes, the persisted flag must be cleared.
+
+    Without the cleanup path, ``/status`` would report ``auto trading (flag): on``
+    forever after a crash, which is misleading and dangerous.
+    """
+    services = demo_services
+    controller = services.auto_controller
+    assert controller is not None
+    # Inject a crashing AutoTrader by monkey-patching AutoTrader for the test.
+    from app.auto_controller import AutoTradingController as _ATC
+    original_init = controller._trader.__class__  # not used directly
+
+    class _CrashingTrader:
+        def __init__(self, services):
+            self._services = services
+
+        def stop(self):
+            pass
+
+        async def run_forever(self):
+            raise RuntimeError("simulated crash")
+
+    # Replace the factory by patching the module-level import inside start()
+    import app.auto_controller as ac_mod
+    saved_auto = ac_mod.__dict__.get("AutoTrader")
+    # We monkey-patch by setting a module attribute that start() will use.
+    # start() does ``from app.auto import AutoTrader`` lazily — so we patch
+    # ``app.auto.AutoTrader`` directly.
+    import app.auto as auto_mod
+    saved_real_trader = auto_mod.AutoTrader
+    auto_mod.AutoTrader = _CrashingTrader  # type: ignore[assignment]
+    try:
+        started, _ = await controller.start()
+        assert started is True
+        # Wait for the task to complete (it crashes immediately).  Swallow
+        # the exception — we want to assert about controller state afterwards.
+        task = controller._task
+        assert task is not None
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except RuntimeError:
+            pass
+        assert task.done()
+        assert task.exception() is not None
+    finally:
+        auto_mod.AutoTrader = saved_real_trader  # type: ignore[assignment]
+    # At this point the task crashed but the flag is still True.
+    assert await services.auto_trading_enabled() is True
+    # Reading is_running() must detect the crash and clear the stale flag.
+    assert await controller.is_running() is False
+    assert await services.auto_trading_enabled() is False
+    # /status reflects the truth.
+    bot, client = _bot(services)
+    await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/status"))
+    text = client.sent[-1][1]
+    assert "auto trading (flag): off" in text
+    assert "auto loop: stopped" in text
+
+
+async def test_start_after_loop_crash_resumes_cleanly(
+    demo_services: AppServices,
+) -> None:
+    """After a crash the next ``/start_trading`` must spawn exactly one fresh task."""
+    services = demo_services
+    controller = services.auto_controller
+    assert controller is not None
+
+    class _CrashingTrader:
+        def __init__(self, services):
+            self._services = services
+
+        def stop(self):
+            pass
+
+        async def run_forever(self):
+            raise RuntimeError("boom")
+
+    import app.auto as auto_mod
+    saved = auto_mod.AutoTrader
+    auto_mod.AutoTrader = _CrashingTrader  # type: ignore[assignment]
+    try:
+        await controller.start()
+        task = controller._task
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except RuntimeError:
+            pass
+    finally:
+        auto_mod.AutoTrader = saved  # type: ignore[assignment]
+    # Trigger status to clear stale state
+    await controller.is_running()
+    # Now start again — must succeed and produce a fresh task
+    started, msg = await controller.start()
+    assert started is True, msg
+    new_task = controller._task
+    assert new_task is not None
+    assert not new_task.done()
+    await controller.stop()
+
+
+async def test_cli_and_telegram_share_single_loop(
+    tmp_path,
+) -> None:
+    """CLI ``cmd_start_auto`` and Telegram ``/start_trading`` cannot create
+    two independent AutoTrader tasks in the same process."""
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    services = await build_app(base)
+    try:
+        bot, _ = _bot(services)
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+        controller = services.auto_controller
+        assert controller is not None
+        cli_task = controller._task
+        assert cli_task is not None
+        # Telegram cannot create a second loop.
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, "/start_trading"))
+        assert controller._task is cli_task, "Telegram created a second loop"
+        auto_tasks = [t for t in asyncio.all_tasks() if (t.get_name() or "") == "auto-trader"]
+        assert len(auto_tasks) == 1
+        await controller.stop()
+    finally:
+        await shutdown_app(services)

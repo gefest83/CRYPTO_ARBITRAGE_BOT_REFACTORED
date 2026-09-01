@@ -7,11 +7,14 @@ Scope (deliberately restricted)
 -------------------------------
 
 The Telegram bot is a **secondary control interface**.  Every command it
-exposes is either read-only, a reconciliation query, or a safe state change
-(persistent kill switch + auto-trading flag).  It must NOT be able to:
+exposes is either read-only, a reconciliation query, a safe state change
+(persistent kill switch + auto-trading flag), or — for ``/start_trading`` /
+``/stop_trading`` — a wrapper around the existing
+:class:`app.auto_controller.AutoTradingController` which is the SINGLE owner
+of the background strategy loop.  It must NOT be able to:
 
 * place exchange orders (no ``/triangle``, no ``/transfer`` execution, no
-  ``/start_auto`` / ``/stop_auto`` toggling of the background loop);
+  ``/buy`` / ``/sell`` commands);
 * initiate withdrawals;
 * expose configuration, credentials, exchange API keys, the database URL or
   raw exception tracebacks to the operator.
@@ -22,6 +25,17 @@ itself is persisted in :class:`app.storage.repositories.BotStateRepository`
 and survives restart.  They do NOT bypass the LIVE confirmation, mode policy
 or risk engine — ``/resume`` only restores a flag that the rest of the bot
 already enforces.
+
+The ``/start_trading`` command:
+
+* is rejected with an explicit error when `` ``mode is not DEMO;
+* goes through the existing :class:`AutoTradingController` which drives the
+  existing :class:`app.auto.AutoTrader`;
+* the :class:`AutoTrader` calls :meth:`AppServices.execute_triangle` for
+  every cycle, which is the ONLY path that may eventually reach the order
+  gate, the risk engine, the execution guard and the exchange adapter;
+* never calls :meth:`create_order` or :meth:`withdraw` directly from
+  Telegram.
 
 Security (fail-closed)
 ----------------------
@@ -60,6 +74,8 @@ COMMANDS: tuple[str, ...] = (
     "/opportunities",
     "/pause",
     "/resume",
+    "/start_trading",
+    "/stop_trading",
 )
 
 HELP_TEXT = (
@@ -71,6 +87,8 @@ HELP_TEXT = (
     "/opportunities - scan triangles (no execution)\n"
     "/pause        - engage the persistent kill switch (safe)\n"
     "/resume       - release the kill switch (safe)\n"
+    "/start_trading - start the DEMO auto-trading loop (DEMO only)\n"
+    "/stop_trading  - stop the auto-trading loop (idempotent)\n"
     "\n"
     "Order placement, transfers and withdrawals are NOT exposed here — "
     "use the CLI for any execution that moves funds."
@@ -170,6 +188,8 @@ class TelegramBot:
     async def _cmd_status(self) -> str:
         status = await self._services.status()
         guard = status["guard"]
+        auto_flag = "on" if status["auto_trading"] else "off"
+        auto_loop = "running" if status.get("auto_loop_running") else "stopped"
         lines: list[str] = [
             f"mode: {status['mode']}",
             f"uptime: {status['uptime_seconds']}s",
@@ -180,7 +200,8 @@ class TelegramBot:
                 if guard["halted"] == "true"
                 else "released"
             ),
-            f"auto trading: {'on' if status['auto_trading'] else 'off'}",
+            f"auto trading (flag): {auto_flag}",
+            f"auto loop: {auto_loop}",
             "exchanges:",
         ]
         for venue, info in status["exchanges"].items():
@@ -288,9 +309,13 @@ class TelegramBot:
                 f"kill switch already engaged: {self._services.guard.halt_reason}"
             )
         await self._services.engage_kill_switch("telegram /pause")
-        # engage_kill_switch also disables auto trading; mirror the state for
-        # operators watching /status.
-        await self._services.set_auto_trading(False)
+        # engage_kill_switch already disables the auto flag; tell the
+        # controller to stop the in-process loop right now so the kill switch
+        # is observed immediately (the loop may be parked in a wait between
+        # cycles — we want it gone NOW, not on the next interval tick).
+        controller = self._services.auto_controller
+        if controller is not None:
+            await controller.stop()
         return "kill switch engaged (persisted across restart)"
 
     async def _cmd_resume(self) -> str:
@@ -305,6 +330,49 @@ class TelegramBot:
             "kill switch released — auto trading is still OFF; "
             "start it from the CLI when ready"
         )
+
+    async def _cmd_start_trading(self) -> str:
+        """Start the DEMO auto-trading loop via the existing controller.
+
+        Hard safety gates (in this order):
+          1. Mode must be DEMO.  PAPER and LIVE are refused with an explicit
+             error — Telegram must NEVER auto-trade in LIVE.
+          2. The :class:`AutoTradingController` itself refuses if the kill
+             switch is engaged, if the loop is already running, etc.
+
+        The controller drives the existing :class:`AutoTrader`, which calls
+        :meth:`AppServices.execute_triangle` for each opportunity.  That path
+        is the only one that ever reaches the order gate, the risk engine,
+        the execution guard and (in DEMO) the exchange adapter.  Telegram
+        never calls :meth:`create_order` or :meth:`withdraw` directly.
+        """
+        from app.models.enums import TradingMode
+
+        mode = self._services.settings.mode
+        if mode is not TradingMode.DEMO:
+            return f"refused: /start_trading is only allowed in DEMO mode (current: {mode.value})"
+        controller = self._services.auto_controller
+        if controller is None:
+            return "refused: auto-trading controller is not initialised"
+        started, message = await controller.start()
+        prefix = "auto trading started" if started else "auto trading not started"
+        return f"{prefix}: {message}"
+
+    async def _cmd_stop_trading(self) -> str:
+        """Stop the auto-trading loop (idempotent, does NOT touch the kill switch).
+
+        ``/stop_trading`` is the symmetric counterpart of ``/start_trading``.
+        It does NOT engage the kill switch — the existing architecture keeps
+        ``/pause`` as the kill-switch command.  The controller sets the
+        persisted auto flag to ``False`` and asks the in-process task to exit
+        cleanly.
+        """
+        controller = self._services.auto_controller
+        if controller is None:
+            return "auto trading controller is not initialised"
+        stopped, message = await controller.stop()
+        prefix = "auto trading stopped" if stopped else "auto trading already stopped"
+        return f"{prefix}: {message}"
 
     # ---------------------------------------------------------------- send
     async def _safe_send(self, chat_id: int, text: str) -> None:
@@ -332,6 +400,8 @@ _DISPATCH: dict[str, Callable[[TelegramBot], Awaitable[str]]] = {
     "/opportunities": TelegramBot._cmd_opportunities,
     "/pause": TelegramBot._cmd_pause,
     "/resume": TelegramBot._cmd_resume,
+    "/start_trading": TelegramBot._cmd_start_trading,
+    "/stop_trading": TelegramBot._cmd_stop_trading,
 }
 
 

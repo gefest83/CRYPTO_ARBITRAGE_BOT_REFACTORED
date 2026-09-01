@@ -62,5 +62,33 @@ async def services(tmp_path: pathlib.Path) -> AsyncIterator[AppServices]:
 
 
 @pytest.fixture()
+async def demo_services(tmp_path: pathlib.Path) -> AsyncIterator[AppServices]:
+    """Same as ``services`` but in DEMO mode (for Telegram auto-trading tests).
+
+    DEMO mode is required for ``/start_trading``; the fixture is kept separate
+    from the fast PAPER default so the broader suite keeps running quickly.
+    """
+    from app.config.settings import TradingSettings
+    from app.models.enums import TradingMode
+
+    settings = make_settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    app = await build_app(settings)
+    await start_app(app)
+    try:
+        yield app
+    finally:
+        await shutdown_app(app)
+
+
+@pytest.fixture()
 def event_loop_policy():
     return asyncio.DefaultEventLoopPolicy()
