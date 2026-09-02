@@ -97,6 +97,7 @@ class TriangleExecutor:
         trade_repo: TradeRepository,
         audit: AuditLogRepository,
         paper_wallets: dict[str, PaperWallet] | None = None,
+        market=None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -109,6 +110,7 @@ class TriangleExecutor:
         self._audit = audit
         self._wallets = paper_wallets or {}
         self._mode = settings.mode
+        self._market = market
 
     # ---------------------------------------------------------------- public
     async def execute(self, opportunity: ArbitrageOpportunity) -> TradeRecord:
@@ -313,7 +315,7 @@ class TriangleExecutor:
         symbols = [leg.symbol for leg in legs]
 
         # --- preview: expected value must clear the execution-time floor ---
-        preview = self._preview_cycle(venue, legs, spend)
+        preview = await self._preview_cycle(venue, legs, spend)
         if preview is None:
             return trade.with_status(
                 TradeStatus.FAILED,
@@ -451,7 +453,7 @@ class TriangleExecutor:
         intent identifying the order by its ``client_order_id``.
         """
         self._guard.ensure_can_trade()  # kill switch re-checked every leg
-        book = self._fresh_book(venue, symbol)
+        book = await self._fresh_book(venue, symbol)
 
         if self._mode is TradingMode.PAPER:
             fill = self._sim.simulate(
@@ -571,36 +573,46 @@ class TriangleExecutor:
         return None, order
 
     # ---------------------------------------------------------------- helpers
-    def _fresh_book(self, venue: str, symbol: Symbol):
+    async def _fresh_book(self, venue: str, symbol: Symbol):
         book = self._store.order_book(venue, symbol)
+        if book is not None and not self._store.is_stale(self._store.age_ms(book)):
+            return book
+        # Stale or missing -> one on-demand refresh in DEMO (single attempt, fail-closed if still stale)
+        # PAPER/LIVE keep original fail-closed without refresh to avoid changing their behavior.
+        if self._mode is TradingMode.DEMO and self._market is not None:
+            try:
+                await self._market.refresh_order_books([symbol], exchange_ids=[venue])
+            except Exception:
+                pass
+            book = self._store.order_book(venue, symbol)
+            if book is not None and not self._store.is_stale(self._store.age_ms(book)):
+                return book
         if book is None:
             raise ValueError(f"no order book cached for {venue} {symbol.name}")
-        if self._store.is_stale(self._store.age_ms(book)):
-            raise ValueError(
-                f"stale order book for {venue} {symbol.name} "
-                f"({self._store.age_ms(book):.0f} ms) — refusing to execute"
-            )
-        return book
+        raise ValueError(
+            f"stale order book for {venue} {symbol.name} "
+            f"({self._store.age_ms(book):.0f} ms) — refusing to execute"
+        )
 
-    def _preview_cycle(self, venue: str, legs, spend: Decimal) -> Decimal | None:
+    async def _preview_cycle(self, venue: str, legs, spend: Decimal) -> Decimal | None:
         """Non-destructive walk of the three current books; expected proceeds."""
         try:
             symbols = [leg.symbol for leg in legs]
             fill1 = self._sim.simulate(
-                self._fresh_book(venue, symbols[0]), OrderSide.BUY, quote_amount=spend
+                await self._fresh_book(venue, symbols[0]), OrderSide.BUY, quote_amount=spend
             )
             if fill1.is_rejected:
                 return None
             side2 = legs[1].side
             if side2 is OrderSide.BUY:
                 fill2 = self._sim.simulate(
-                    self._fresh_book(venue, symbols[1]),
+                    await self._fresh_book(venue, symbols[1]),
                     OrderSide.BUY,
                     quote_amount=fill1.filled_amount,
                 )
             else:
                 fill2 = self._sim.simulate(
-                    self._fresh_book(venue, symbols[1]),
+                    await self._fresh_book(venue, symbols[1]),
                     OrderSide.SELL,
                     base_amount=fill1.filled_amount,
                 )
@@ -608,7 +620,7 @@ class TriangleExecutor:
                 return None
             held_y = fill2.filled_amount if side2 is OrderSide.BUY else fill2.quote_amount
             fill3 = self._sim.simulate(
-                self._fresh_book(venue, symbols[2]), OrderSide.SELL, base_amount=held_y
+                await self._fresh_book(venue, symbols[2]), OrderSide.SELL, base_amount=held_y
             )
             if fill3.is_rejected:
                 return None

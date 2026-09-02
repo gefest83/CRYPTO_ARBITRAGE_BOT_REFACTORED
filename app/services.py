@@ -473,6 +473,7 @@ async def build_app(settings: Settings | None = None) -> AppServices:
         trade_repo=trades,
         audit=audit,
         paper_wallets=paper_wallets or None,
+        market=market,
     )
 
     services = AppServices(
