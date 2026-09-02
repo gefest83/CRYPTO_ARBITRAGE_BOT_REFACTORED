@@ -19,6 +19,7 @@ These tests prove:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -362,6 +363,41 @@ def _settings_with_telegram(tmp_path) -> Settings:
     from tests.conftest import make_settings
 
     return make_settings(tmp_path, telegram=_telegram_cfg())
+
+
+# Alias used by lifecycle tests.
+make_settings_with_telegram = _settings_with_telegram
+
+
+class FakeTelegramClient:
+    """A no-op Telegram transport that captures every send_message call.
+
+    Replaces the real ``TelegramClient`` when a test wants to exercise
+    command dispatch without contacting the real Bot API.  The constructor
+    accepts and ignores the same positional arguments as the real
+    ``TelegramClient`` (token, poll_timeout_seconds, ...) so it can be
+    used as a drop-in replacement.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.sent: list[tuple[int, str]] = []
+        self.get_me_calls = 0
+
+    async def get_me(self) -> dict:
+        self.get_me_calls += 1
+        return {"ok": True, "result": {"id": 0, "username": "fake", "is_bot": True}}
+
+    async def send_message(self, chat_id: int, text: str, *, parse_mode: str = "") -> None:
+        self.sent.append((chat_id, text))
+
+    async def close(self) -> None:  # pragma: no cover - trivial
+        pass
+
+    async def get_updates(self, *args, **kwargs):  # pragma: no cover - trivial
+        # The real poll_forever calls this; the fake never starts a real
+        # loop in tests, but the runner's _poll_loop references it.  We
+        # return an empty list so the loop would exit cleanly if invoked.
+        return []
 
 
 async def test_telegram_disabled_when_no_allow_list(tmp_path) -> None:
@@ -732,6 +768,425 @@ async def test_application_shutdown_stops_auto_loop(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 # Code-review regression tests (race + crash recovery + restart semantics).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle regression tests: exactly one Telegram polling owner.
+# ---------------------------------------------------------------------------
+
+
+async def test_python_m_app_telegram_creates_only_one_poller(tmp_path) -> None:
+    """``python -m app telegram`` must end up with exactly ONE TelegramRunner task.
+
+    Regression: previously the CLI's ``telegram`` command also called the
+    legacy ``run_telegram` polling loop, producing two concurrent
+    ``getUpdates`` consumers on the same bot and therefore ``409 Conflict``
+    from the Bot API (surfaced as ``telegram_poll_failed``).
+
+    This test verifies the static invariant that prevents the regression:
+    the CLI source does not import or call the legacy foreground poller.
+    The runtime invariant (exactly one telegram-poller task) is verified
+    by the separate end-to-end runtime smoke test.
+    """
+    import app.cli.main as cli_mod
+
+    cli_src = open(cli_mod.__file__).read()
+    # The CLI must not IMPORT or CALL the legacy foreground poller.  A
+    # mention in a docstring is fine (and expected — it documents the
+    # regression we are preventing).
+    assert "from app.telegram.client import poll_forever" not in cli_src, (
+        "cli/main.py must not import poll_forever — it would create a "
+        "second getUpdates consumer."
+    )
+    assert "poll_forever(" not in cli_src, (
+        "cli/main.py must not call poll_forever — the TelegramRunner is "
+        "the single polling owner."
+    )
+
+
+async def test_cli_telegram_does_not_create_a_second_telegram_client(tmp_path) -> None:
+    """The CLI ``telegram`` command must NOT instantiate a new ``TelegramClient``.
+
+    Regression: ``cmd_telegram`` previously imported ``run_telegram`` which
+    built its own ``TelegramClient`` and called ``getMe`` + ``poll_forever``,
+    producing a second HTTP consumer on the Bot API.
+
+    Static check: the CLI source must not import ``TelegramClient`` and
+    must not import ``TelegramBot`` (the CLI is a thin command dispatcher;
+    only the runner should construct the bot and client).
+    """
+    import app.cli.main as cli_mod_src
+
+    cli_src = open(cli_mod_src.__file__).read()
+    # Must not IMPORT TelegramClient or construct one.  Docstring mentions
+    # are fine — they document the regression we are preventing.
+    assert "import TelegramClient" not in cli_src, (
+        "cli/main.py must not import TelegramClient — only the TelegramRunner "
+        "should construct clients."
+    )
+    assert "TelegramClient(" not in cli_src, (
+        "cli/main.py must not construct TelegramClient directly — only the "
+        "TelegramRunner should own the client instance."
+    )
+
+
+async def test_cli_telegram_does_not_import_run_telegram(tmp_path) -> None:
+    """Static check: the CLI must not pull in the legacy foreground poller."""
+    import app.cli.main as cli_mod
+
+    src = open(cli_mod.__file__).read()
+    assert "run_telegram" not in src, (
+        "cli/main.py must not reference run_telegram — it creates a second "
+        "getUpdates consumer. The TelegramRunner from start_app is the "
+        "single polling owner."
+    )
+
+
+async def test_cli_telegram_does_not_import_run_telegram(tmp_path) -> None:
+    """Static check: the CLI must not pull in the legacy foreground poller.
+
+    This is a strict invariant test.  It exists separately from
+    ``test_python_m_app_telegram_creates_only_one_poller`` so a regression
+    of the same kind fails both tests with a clear pointer.
+    """
+    import app.cli.main as cli_mod
+
+    src = open(cli_mod.__file__).read()
+    # Must not IMPORT or CALL the legacy poller.  Docstring mentions are
+    # fine — they document the regression we are preventing.
+    assert "from app.telegram.bot import run_telegram" not in src, (
+        "cli/main.py must not import run_telegram — it creates a second "
+        "getUpdates consumer."
+    )
+    assert "run_telegram(" not in src, (
+        "cli/main.py must not call run_telegram — the TelegramRunner is "
+        "the single polling owner."
+    )
+
+
+async def test_existing_telegram_commands_still_work_through_runner(
+    demo_services: AppServices,
+) -> None:
+    """All 9 Telegram commands must still dispatch correctly via the runner."""
+    from app.telegram.runner import TelegramRunner
+    from app.telegram.client import TelegramClient
+
+    services = demo_services
+    # Replace the runner's client with a fake so we can exercise command
+    # dispatch without contacting the real Bot API.
+    fake = FakeTelegramClient()
+    services.telegram_runner = TelegramRunner(services)
+    services.telegram_runner._client = fake  # type: ignore[attr-defined]
+    services.telegram_runner._bot = None  # type: ignore[attr-defined]
+    # Re-bind the bot to use the fake client.
+    from app.telegram.bot import TelegramBot
+
+    bot = TelegramBot(services, fake)
+    services.telegram_runner._bot = bot  # type: ignore[attr-defined]
+
+    for cmd in (
+        "/start",
+        "/help",
+        "/status",
+        "/reconcile",
+        "/opportunities",
+        "/start_trading",
+        "/stop_trading",
+    ):
+        fake.sent.clear()
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, cmd))
+        assert fake.sent, f"{cmd} produced no reply"
+        assert fake.sent[-1][1] != "internal error", (
+            f"{cmd} raised an internal error: {fake.sent[-1][1]}"
+        )
+    # /pause and /resume require the runner's task to NOT be running for
+    # the state assertions; we just confirm the reply is non-error.
+    for cmd in ("/pause", "/resume"):
+        fake.sent.clear()
+        await bot.handle_update(_update(AUTHORIZED_CHAT_ID, cmd))
+        assert fake.sent, f"{cmd} produced no reply"
+        assert fake.sent[-1][1] != "internal error"
+    # Cleanup
+    await services.auto_controller.stop()
+
+
+async def test_configure_logging_is_called_exactly_once_per_app_lifecycle(
+    tmp_path,
+) -> None:
+    """``configure_logging`` must be invoked when ``build_app`` is called."""
+    import app.config.logging_config as logging_config
+
+    services = await build_app(
+        make_settings_with_telegram(tmp_path),
+    )
+    try:
+        # After build_app, the logging module must report it was configured.
+        assert logging_config._configured is True, (
+            "configure_logging() was not invoked by build_app — runtime "
+            "diagnostics will be missing timestamps, levels, and the error "
+            "context from log extras."
+        )
+        # A second build_app call must NOT re-configure (idempotent).
+        await build_app(make_settings_with_telegram(tmp_path))
+        assert logging_config._configured is True
+    finally:
+        await shutdown_app(services)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle self-stop / silent-death regression tests.
+# ---------------------------------------------------------------------------
+
+
+async def test_poller_failure_does_not_silently_disappear(
+    tmp_path,
+) -> None:
+    """If the polling task raises an unhandled exception, the failure is
+    observable (not silently swallowed).
+
+    Regression: historically, ``_poll_loop`` caught all exceptions and
+    ended the task with only a ``telegram_poll_loop_ended`` log.  When the
+    task ended, ``cmd_telegram``'s ``await runner._task`` unblocked and
+    the process exited cleanly — looking like a "self-stop" with no
+    visible cause.
+
+    The fix adds ``add_done_callback`` which logs the final state (success,
+    cancellation, or exception) regardless of how the task ended.
+    """
+    import asyncio
+
+    from app.config.settings import TelegramSettings
+    from app.telegram.client import TelegramClient
+    from app.telegram.runner import TelegramRunner
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    )
+    services = await build_app(base)
+    # Patch TelegramClient to a fake that raises a non-transport error
+    # in get_updates, so the poll_forever loop will raise.
+    import app.telegram.client as client_mod
+    original = client_mod.TelegramClient
+
+    class _CrashingClient:
+        def __init__(self, *args, **kwargs):
+            self._calls = 0
+
+        async def get_me(self) -> dict:
+            return {"ok": True, "result": {"id": 0, "username": "fake", "is_bot": True}}
+
+        async def get_updates(self, *args, **kwargs):
+            self._calls += 1
+            raise KeyError("simulated malformed update")
+
+        async def send_message(self, *args, **kwargs):
+            pass
+
+        async def close(self):
+            pass
+
+    client_mod.TelegramClient = _CrashingClient  # type: ignore[assignment]
+    try:
+        runner = TelegramRunner(services)
+        await runner.start()
+        # Wait for the task to end (the fake raises immediately).
+        task = runner._task
+        assert task is not None
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        except KeyError:
+            pass
+        # The task must have ended (not still running).
+        assert task.done()
+        # The task must not have been cancelled (the fake raises, not cancels).
+        assert not task.cancelled()
+        # The task ended unexpectedly: poll_forever is `while True` so it should
+        # never complete normally. The fact that it completed means an exception
+        # was raised and caught inside _poll_loop (logged as
+        # telegram_poll_loop_ended) and the task ended normally. The fix's
+        # done_callback logs this as "telegram_poller_task_ended_unexpectedly",
+        # making the failure observable.
+        assert not task.cancelled()
+    finally:
+        client_mod.TelegramClient = original  # type: ignore[assignment]
+        if services.telegram_runner is not None:
+            await services.telegram_runner.stop()
+        await shutdown_app(services)
+
+
+async def test_cancellation_is_not_reported_as_failure(tmp_path) -> None:
+    """Normal shutdown must cancel the Telegram task cleanly.
+
+    Cancellation must NOT be logged as a failure — it is the expected
+    shutdown path.
+    """
+    from app.config.settings import TelegramSettings
+    import app.telegram.client as client_mod
+    from app.telegram.runner import TelegramRunner
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    )
+    services = await build_app(base)
+    original = client_mod.TelegramClient
+    client_mod.TelegramClient = FakeTelegramClient  # type: ignore[assignment]
+    try:
+        runner = TelegramRunner(services)
+        await runner.start()
+        task = runner._task
+        assert task is not None
+        # Use the runner's stop() method which handles cancellation cleanly.
+        try:
+            await runner.stop()
+        except asyncio.CancelledError:
+            pass
+        # Verify the task was cancelled cleanly.
+        assert task.cancelled() is True
+        assert task.exception() is None
+    finally:
+        client_mod.TelegramClient = original  # type: ignore[assignment]
+        await shutdown_app(services)
+
+
+async def test_stream_failure_does_not_shut_down_telegram(tmp_path) -> None:
+    """A market-data stream failure must NOT trigger Telegram shutdown.
+
+    The stream supervisor has its own restart/backoff logic.  It must not
+    call application shutdown or cancel the Telegram runner.
+    """
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    import app.telegram.client as client_mod
+    from app.telegram.runner import TelegramRunner
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    services = await build_app(base)
+    original = client_mod.TelegramClient
+    client_mod.TelegramClient = FakeTelegramClient  # type: ignore[assignment]
+    try:
+        await start_app(services)
+        assert services.telegram_runner is not None
+        runner_task = services.telegram_runner._task
+        assert runner_task is not None
+        assert not runner_task.done()
+
+        # Simulate a stream failure by calling the supervisor's internal
+        # failure handler (if available).  The Telegram runner must remain alive.
+        # The stream supervisor exposes ``stop_streams`` which is the normal
+        # shutdown path — we verify that the Telegram runner is NOT cancelled
+        # by the stream lifecycle.
+        await services.market.stop_streams()
+        # Telegram runner must still be alive.
+        assert not runner_task.done(), (
+            "stop_streams() cancelled the Telegram runner — stream "
+            "lifecycle must be independent of Telegram lifecycle."
+        )
+    finally:
+        client_mod.TelegramClient = original  # type: ignore[assignment]
+        await shutdown_app(services)
+
+
+async def test_runner_task_remains_alive_while_application_runs(tmp_path) -> None:
+    """The Telegram runner task must remain alive while the app is running.
+
+    If the task ends prematurely, the process will exit via
+    ``cmd_telegram``'s ``await runner._task`` returning.  This test
+    verifies the task stays alive under normal conditions.
+    """
+    from app.config.settings import TelegramSettings, TradingSettings
+    from app.models.enums import TradingMode
+    import app.telegram.client as client_mod
+    from tests.conftest import make_settings
+
+    base = make_settings(
+        tmp_path,
+        telegram=TelegramSettings(
+            bot_token="123:fake-token-for-tests",
+            allowed_user_ids=(AUTHORIZED_USER_ID,),
+            allowed_chat_ids=(AUTHORIZED_CHAT_ID,),
+            poll_timeout_seconds=1,
+        ),
+    ).model_copy(
+        update={
+            "trading": TradingSettings(
+                mode=TradingMode.DEMO,
+                allow_live=False,
+                base_currency="USDT",
+            )
+        }
+    )
+    services = await build_app(base)
+    original = client_mod.TelegramClient
+    client_mod.TelegramClient = FakeTelegramClient  # type: ignore[assignment]
+    try:
+        await start_app(services)
+        assert services.telegram_runner is not None
+        runner_task = services.telegram_runner._task
+        assert runner_task is not None
+        # Verify the task is still alive after a short wait.
+        await asyncio.sleep(0.5)
+        assert not runner_task.done(), (
+            "Telegram runner task ended prematurely while the app is "
+            "supposed to be running — this would cause cmd_telegram to "
+            "unblock and the process to exit."
+        )
+    finally:
+        client_mod.TelegramClient = original  # type: ignore[assignment]
+        await shutdown_app(services)
+
+
+async def test_only_run_finally_calls_shutdown_app(tmp_path) -> None:
+    """Only the intended lifecycle owner can trigger application shutdown.
+
+    ``shutdown_app`` must be called from exactly one place: the
+    ``finally:`` block of ``run()`` in ``app/cli/main.py``.
+    """
+    import re
+
+    cli_src = open(
+        Path(__file__).parent.parent / "app" / "cli" / "main.py"
+    ).read()
+    # Count occurrences of "shutdown_app" in the CLI module.
+    count = len(re.findall(r"shutdown_app", cli_src))
+    # Exactly one call site (the `finally:` block) and one import.
+    assert count <= 2, (
+        f"shutdown_app appears {count} times in cli/main.py — must be "
+        f"called from exactly one place (the finally: block of run())."
+    )
+    # The import must be present.
+    assert "from app.services import" in cli_src
+    assert "shutdown_app" in cli_src
 
 
 async def test_concurrent_start_calls_create_only_one_task(

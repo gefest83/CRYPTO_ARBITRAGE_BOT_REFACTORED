@@ -77,6 +77,38 @@ class TelegramRunner:
         self._task = asyncio.create_task(
             self._poll_loop(), name="telegram-poller"
         )
+        # Diagnostic: log when the poller task ends, regardless of cause
+        # (cancellation, clean exit, or unexpected exception).  Without this
+        # callback a silent end of the polling task looks indistinguishable
+        # from a normal shutdown — the process exits via
+        # ``cmd_telegram``'s ``await runner._task`` returning.
+        self._task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Called when the polling task ends for any reason.
+
+        Logs the final state so the operator can distinguish:
+          * normal cancellation (expected during ``shutdown_app``),
+          * unexpected exception (the poller died — this is the
+            historical "5 self-stops" root cause if the process then
+            exits because ``cmd_telegram`` unblocks).
+        """
+        if task.cancelled():
+            logger.info("telegram_poller_task_cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "telegram_poller_task_failed",
+                extra={
+                    "error": str(exc)[:300],
+                    "error_type": type(exc).__name__,
+                },
+            )
+        else:
+            # The task returned normally — ``poll_forever`` is
+            # ``while True`` so this should not happen.  Log it loudly.
+            logger.error("telegram_poller_task_ended_unexpectedly")
 
     async def _poll_loop(self) -> None:
         """The background polling loop.  Errors are caught; one bad poll never dies."""
@@ -88,9 +120,14 @@ class TelegramRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - bot must never propagate to the app
+            # Log the full traceback so silent exits are diagnosable.
             logger.warning(
                 "telegram_poll_loop_ended",
-                extra={"error": str(exc)[:200]},
+                extra={
+                    "error": str(exc)[:300],
+                    "error_type": type(exc).__name__,
+                },
+                exc_info=True,
             )
 
     async def stop(self) -> None:

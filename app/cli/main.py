@@ -390,9 +390,52 @@ async def cmd_stop_auto(services: AppServices, args: argparse.Namespace) -> int:
 
 
 async def cmd_telegram(services: AppServices, args: argparse.Namespace) -> int:
-    from app.telegram.bot import run_telegram
+    """Wait for the application lifetime.
 
-    return await run_telegram(services)
+    The actual Telegram polling is owned by :class:`AutoTradingController`'s
+    sibling :class:`TelegramRunner`, which :func:`start_app` starts in the
+    background.  This command does NOT create a second ``TelegramClient`` and
+    does NOT call the legacy foreground ``poll_forever`` loop — doing so
+    previously caused two ``getUpdates`` consumers on the same bot, which
+    resulted in ``409 Conflict`` and ``telegram_poll_failed`` from the Bot
+    API.  The runner is the single polling owner.
+    """
+    import logging
+
+    _log = logging.getLogger("cat.cli.main")
+    runner = services.telegram_runner
+    if runner is not None and runner._task is not None:
+        # Block here until shutdown cancels the runner task (the process
+        # typically exits on Ctrl+C / SIGTERM, at which point
+        # :func:`shutdown_app` cancels this task via ``_stop_telegram``).
+        _log.info("cmd_telegram_awaiting_runner")
+        try:
+            await runner._task
+        except asyncio.CancelledError:
+            pass
+        # If we reach here without cancellation, the poller task ended
+        # on its own — this is the historical "self-stop" signal.
+        if runner._task is not None and runner._task.done() and not runner._task.cancelled():
+            _log.warning(
+                "cmd_telegram_runner_ended_unexpectedly",
+                extra={
+                    "task_name": runner._task.get_name(),
+                    "has_exception": runner._task.exception() is not None,
+                },
+            )
+    else:
+        # No runner started (e.g. Telegram not configured or startup failed).
+        # Block on a cancelled event so the process does not exit; the
+        # shutdown_app call in run()'s finally will break us out via
+        # SIGINT / KeyboardInterrupt.
+        _log.info("cmd_telegram_no_runner_blocking")
+        stop = asyncio.Event()
+        try:
+            await stop.wait()
+        except asyncio.CancelledError:
+            pass
+    _log.info("cmd_telegram_returning")
+    return 0
 
 
 _HANDLERS = {

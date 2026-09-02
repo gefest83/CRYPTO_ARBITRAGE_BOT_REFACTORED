@@ -396,6 +396,11 @@ class AppServices:
 async def build_app(settings: Settings | None = None) -> AppServices:
     """Compose the whole application (no network I/O beyond schema creation)."""
     settings = settings or get_settings()
+    # Initialise logging exactly once at the entry point of the application.
+    # The function is idempotent (a no-op on repeat calls unless ``force=True``).
+    from app.config.logging_config import configure_logging
+
+    configure_logging(settings.logging)
     db = Database(settings.database)
     if settings.database.auto_create_schema:
         await db.create_schema()
@@ -558,6 +563,9 @@ async def start_app(services: AppServices) -> None:
 
 async def shutdown_app(services: AppServices) -> None:
     """Stop streams, close adapters, dispose the database."""
+    import traceback
+
+    logger.info("shutdown_app_invoked", extra={"caller": traceback.extract_stack()[-2].name})
     # Auto-trading loop first: stop any in-flight cycle before tearing down
     # state.  The controller's shutdown is idempotent and never raises.
     if services.auto_controller is not None:
@@ -568,6 +576,7 @@ async def shutdown_app(services: AppServices) -> None:
     await services.manager.close()
     await services.db.dispose()
     await services.audit.log("APP_STOPPED")
+    logger.info("shutdown_app_complete")
 
 
 async def _init_paper_wallets(services: AppServices) -> None:
