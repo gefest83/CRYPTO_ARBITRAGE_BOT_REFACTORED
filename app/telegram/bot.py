@@ -60,6 +60,13 @@ from app.exchanges.sanitize import redact_secrets
 from app.services import AppServices
 
 from .client import TelegramClient, poll_forever
+from .i18n import (
+    LANGUAGE_PICKER_KEYBOARD,
+    LANGUAGE_PICKER_PROMPT,
+    SUPPORTED_LANGUAGES,
+    lang_storage_key,
+    t,
+)
 
 __all__ = ["COMMANDS", "HELP_TEXT", "TelegramBot", "run_telegram"]
 
@@ -76,6 +83,7 @@ COMMANDS: tuple[str, ...] = (
     "/resume",
     "/start_trading",
     "/stop_trading",
+    "/language",
 )
 
 HELP_TEXT = (
@@ -89,6 +97,7 @@ HELP_TEXT = (
     "/resume       - release the kill switch (safe)\n"
     "/start_trading - start the DEMO auto-trading loop (DEMO only)\n"
     "/stop_trading  - stop the auto-trading loop (idempotent)\n"
+    "/language     - choose language (English / Русский)\n"
     "\n"
     "Order placement, transfers and withdrawals are NOT exposed here — "
     "use the CLI for any execution that moves funds."
@@ -125,8 +134,98 @@ class TelegramBot:
         self._client = client
         self._auto_task: asyncio.Task | None = None
 
+    # ---------------------------------------------------------------- language
+    async def _get_lang(self, user_id: int | None) -> str | None:
+        if user_id is None:
+            return None
+        try:
+            val = await self._services.bot_state.get(lang_storage_key(user_id))
+        except Exception:
+            return None
+        if isinstance(val, str) and val in SUPPORTED_LANGUAGES:
+            return val
+        return None
+
+    async def _set_lang(self, user_id: int, lang: str) -> None:
+        if lang not in SUPPORTED_LANGUAGES:
+            return
+        try:
+            await self._services.bot_state.set(lang_storage_key(user_id), lang)
+        except Exception as exc:  # noqa: BLE001 - storage failure must not crash bot
+            logger.warning("telegram_set_lang_failed", extra={"error": str(exc)[:200]})
+
+    async def _send_picker(self, chat_id: int) -> None:
+        try:
+            await self._safe_send(chat_id, LANGUAGE_PICKER_PROMPT, reply_markup=LANGUAGE_PICKER_KEYBOARD)
+        except Exception:
+            pass
+
+    async def _handle_callback(self, callback: dict[str, Any]) -> None:
+        cb_id = callback.get("id")
+        data = str(callback.get("data") or "")
+        user = callback.get("from") or {}
+        user_id = user.get("id")
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        message_id = message.get("message_id")
+        if not data.startswith("lang:"):
+            if cb_id:
+                try:
+                    await self._client.answer_callback_query(str(cb_id))
+                except Exception:
+                    pass
+            return
+        lang = data.split(":", 1)[1].strip().lower()
+        if lang not in SUPPORTED_LANGUAGES:
+            if cb_id:
+                try:
+                    await self._client.answer_callback_query(str(cb_id), text="Invalid language")
+                except Exception:
+                    pass
+            return
+        # Persist — language selection never grants trading access
+        if isinstance(user_id, int):
+            await self._set_lang(user_id, lang)
+        # Answer callback in newly selected language
+        if cb_id:
+            try:
+                await self._client.answer_callback_query(str(cb_id), text=t("callback_language_changed", lang))
+            except Exception:
+                pass
+        if chat_id is None:
+            return
+        # Confirm change in newly selected language + show help
+        try:
+            confirmation = t("language_selected", lang)
+            help_text = t("help_text", lang)
+            full = f"{confirmation}\n\n{help_text}"
+            await self._safe_send(int(chat_id), full)
+        except Exception:
+            pass
+        # Edit original picker message to remove inline keyboard (best-effort)
+        if chat_id is not None and message_id is not None:
+            try:
+                await self._client.edit_message_text(
+                    int(chat_id), int(message_id), text=t("language_picker_chosen", lang)
+                )
+            except Exception:
+                pass
+
     # ---------------------------------------------------------------- dispatch
     async def handle_update(self, update: dict[str, Any]) -> None:
+        # Callback query path — language selection
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            try:
+                await self._handle_callback(callback)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "telegram_callback_failed",
+                    extra={"error": redact_secrets(str(exc))[:300]},
+                )
+            return
+
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -135,18 +234,57 @@ class TelegramBot:
         text = str(message.get("text") or "").strip()
         if chat_id is None or not text:
             return
-        if not self._authorized(user_id, chat_id):
-            # Never reveal whether the chat or the user id was the problem.
-            await self._safe_send(chat_id, _DENIED_MESSAGE)
-            return
+
+        # Parse command
         command, _, _rest = text.partition(" ")
         command = command.split("@")[0].lower()
+
+        # Language-sensitive commands: /start and /language
+        # They may show the picker before authorization (spec allowance),
+        # but must not bypass auth for protected functionality.
+        if command == "/start":
+            lang = await self._get_lang(user_id)
+            if lang is None:
+                await self._send_picker(int(chat_id))
+                return
+            # Language exists — now check authorization for welcome/help
+            if not self._authorized(user_id, chat_id):
+                await self._safe_send(int(chat_id), t("unauthorized", lang))
+                return
+            await self._safe_send(int(chat_id), t("help_text", lang))
+            return
+
+        if command == "/language":
+            # /language always shows picker (even if language already set)
+            # No auth gate for the picker itself (may be shown before auth),
+            # but actual language change is persisted per user_id and does not
+            # grant any trading privileges.
+            await self._send_picker(int(chat_id))
+            return
+
+        # For all other commands: authorization first (fail-closed)
+        # Use stored language for denied message localization if available.
+        lang_for_denied = await self._get_lang(user_id)
+        effective_denied_lang = lang_for_denied if lang_for_denied in SUPPORTED_LANGUAGES else "en"
+        if not self._authorized(user_id, chat_id):
+            # Never reveal whether the chat or the user id was the problem.
+            await self._safe_send(int(chat_id), t("unauthorized", effective_denied_lang))
+            return
+
+        # Authorized — ensure language is selected, otherwise show picker
+        lang = await self._get_lang(user_id)
+        if lang is None:
+            await self._send_picker(int(chat_id))
+            return
+
         handler = self._dispatch(command)
         if handler is None:
-            await self._safe_send(chat_id, f"unknown command\n\n{HELP_TEXT}")
+            help_text = t("help_text", lang)
+            reply = t("unknown_command", lang, help_text=help_text)
+            await self._safe_send(int(chat_id), reply)
             return
         try:
-            reply = await handler()
+            reply = await handler(lang)
         except Exception as exc:  # noqa: BLE001 - one bad command stops nothing
             logger.error(
                 "telegram_command_failed",
@@ -157,16 +295,16 @@ class TelegramBot:
                     "error": redact_secrets(str(exc))[:300],
                 },
             )
-            reply = _INTERNAL_ERROR_MESSAGE
-        await self._safe_send(chat_id, reply or "")
+            reply = t("internal_error", lang)
+        await self._safe_send(int(chat_id), reply or "")
 
-    def _dispatch(self, command: str) -> Callable[[], Awaitable[str]] | None:
+    def _dispatch(self, command: str) -> Callable[[str], Awaitable[str]] | None:
         method = _DISPATCH.get(command)
         if method is None:
             return None
-        # Bind the method to this bot so the dispatch can call it as ``handler()``.
+        # Bind the method to this bot so the dispatch can call it as ``handler(lang)``.
         bound = method.__get__(self, type(self))
-        return bound
+        return bound  # type: ignore[return-value]
 
     def _authorized(self, user_id: int | None, chat_id: int | None) -> bool:
         """Authorisation is by Telegram user ID alone.
@@ -179,80 +317,110 @@ class TelegramBot:
         return user_id is not None and user_id in cfg.allowed_user_ids
 
     # ---------------------------------------------------------------- commands
-    async def _cmd_start(self) -> str:
-        return HELP_TEXT
+    async def _cmd_start(self, lang: str) -> str:
+        return t("help_text", lang)
 
-    async def _cmd_help(self) -> str:
-        return HELP_TEXT
+    async def _cmd_help(self, lang: str) -> str:
+        return t("help_text", lang)
 
-    async def _cmd_status(self) -> str:
+    async def _cmd_status(self, lang: str) -> str:
         status = await self._services.status()
         guard = status["guard"]
-        auto_flag = "on" if status["auto_trading"] else "off"
-        auto_loop = "running" if status.get("auto_loop_running") else "stopped"
+        flag_key = "common_on" if status["auto_trading"] else "common_off"
+        flag_local = t(flag_key, lang)
+        loop_key = "common_running" if status.get("auto_loop_running") else "common_stopped"
+        loop_local = t(loop_key, lang)
+        # Kill switch line
+        if guard["halted"] == "true":
+            kill_line = t("status_kill_switch_engaged", lang, reason=guard["halt_reason"])
+        else:
+            kill_line = t("status_kill_switch_released", lang)
         lines: list[str] = [
-            f"mode: {status['mode']}",
-            f"uptime: {status['uptime_seconds']}s",
-            f"trading enabled: {guard['trading_enabled']}",
-            "kill switch: "
-            + (
-                f"ENGAGED ({guard['halt_reason']})"
-                if guard["halted"] == "true"
-                else "released"
-            ),
-            f"auto trading (flag): {auto_flag}",
-            f"auto loop: {auto_loop}",
-            "exchanges:",
+            t("status_mode", lang, mode=status["mode"]),
+            t("status_uptime", lang, sec=status["uptime_seconds"]),
+            t("status_trading_enabled", lang, val=guard["trading_enabled"]),
+            kill_line,
+            t("status_auto_trading_flag", lang, flag=flag_local),
+            t("status_auto_loop", lang, state=loop_local),
+            t("status_exchanges_header", lang),
         ]
         for venue, info in status["exchanges"].items():
-            lines.append(f"  {venue}: {info['status']} (keys {info['credentials']})")
+            lines.append(
+                t("status_exchange_line", lang, venue=venue, status=info["status"], credentials=info["credentials"])
+            )
         md = status["market_data"]
         lines.append(
-            f"market data: {md['order_books']} books / {md['tickers']} tickers "
-            f"across {md['exchanges']} venues"
+            t(
+                "status_market_data",
+                lang,
+                order_books=md["order_books"],
+                tickers=md["tickers"],
+                exchanges=md["exchanges"],
+            )
         )
         risk = status["risk"]
-        lines.append(f"daily pnl: {risk['daily_pnl']}")
-        lines.append(f"open transfers: {risk['open_transfers']}")
+        lines.append(t("status_daily_pnl", lang, pnl=risk["daily_pnl"]))
+        lines.append(t("status_open_transfers_count", lang, count=risk["open_transfers"]))
         if status["transfers_open"]:
-            lines.append("open transfers:")
+            lines.append(t("status_open_transfers_header", lang))
             for transfer in status["transfers_open"]:
                 lines.append(
-                    f"  {transfer['route']} {transfer['asset']} "
-                    f"{transfer['amount']}: {transfer['state']}"
+                    t(
+                        "status_open_transfer_line",
+                        lang,
+                        route=transfer["route"],
+                        asset=transfer["asset"],
+                        amount=transfer["amount"],
+                        state=transfer["state"],
+                    )
                 )
         if status["recent_trades"]:
-            lines.append("recent trades:")
+            lines.append(t("status_recent_trades_header", lang))
             for trade in status["recent_trades"]:
                 lines.append(
-                    f"  {trade['strategy']} {trade['route']} "
-                    f"{trade['status']} net {trade['net_profit']}"
+                    t(
+                        "status_recent_trade_line",
+                        lang,
+                        strategy=trade["strategy"],
+                        route=trade["route"],
+                        status=trade["status"],
+                        net_profit=trade["net_profit"],
+                    )
                 )
         return "\n".join(lines)
 
-    async def _cmd_reconcile(self) -> str:
+    async def _cmd_reconcile(self, lang: str) -> str:
         from app.models.enums import TransferState
 
         records = await self._services.transfers.list_by_state(
             TransferState.MANUAL_REVIEW.value
         )
         if not records:
-            return "no transfers require manual review"
-        lines = [f"{len(records)} transfer(s) require manual review:"]
+            return t("reconcile_empty", lang)
+        lines = [t("reconcile_header", lang, count=len(records))]
         for record in records[:_RECONCILE_LIMIT]:
             lines.append("")
-            lines.append(f"  id        : {record.id}")
-            lines.append(f"  state     : {record.state.value}")
+            lines.append(t("reconcile_id", lang, id=record.id))
+            lines.append(t("reconcile_state", lang, state=record.state.value))
             lines.append(
-                f"  route     : {record.source_exchange} -> {record.dest_exchange}"
+                t(
+                    "reconcile_route",
+                    lang,
+                    route=f"{record.source_exchange} -> {record.dest_exchange}",
+                )
             )
             lines.append(
-                f"  asset     : {record.asset} (planned {record.amount})"
+                t("reconcile_asset", lang, asset=record.asset, amount=record.amount)
             )
             if record.buy_filled_amount and record.buy_filled_amount > 0:
                 lines.append(
-                    f"  held      : {record.buy_filled_amount} {record.asset} "
-                    f"on {record.source_exchange}"
+                    t(
+                        "reconcile_held",
+                        lang,
+                        amount=record.buy_filled_amount,
+                        asset=record.asset,
+                        exchange=record.source_exchange,
+                    )
                 )
             withdrawal_bits = []
             if record.withdrawal_id:
@@ -260,54 +428,83 @@ class TelegramBot:
             if record.withdrawal_txid:
                 withdrawal_bits.append(f"txid={record.withdrawal_txid}")
             if record.withdrawal_amount and record.withdrawal_amount > 0:
-                lines.append(
-                    f"  withdrawal: {record.withdrawal_amount} {record.asset} "
-                    f"on {record.source_exchange} "
-                    + ("(" + ", ".join(withdrawal_bits) + ")" if withdrawal_bits else "")
-                )
-            lines.append(f"  created   : {record.created_at.isoformat()}")
-            lines.append(f"  updated   : {record.updated_at.isoformat()}")
+                details = ", ".join(withdrawal_bits)
+                if details:
+                    lines.append(
+                        t(
+                            "reconcile_withdrawal",
+                            lang,
+                            amount=record.withdrawal_amount,
+                            asset=record.asset,
+                            exchange=record.source_exchange,
+                            details=details,
+                        )
+                    )
+                else:
+                    lines.append(
+                        t(
+                            "reconcile_withdrawal_no_details",
+                            lang,
+                            amount=record.withdrawal_amount,
+                            asset=record.asset,
+                            exchange=record.source_exchange,
+                        )
+                    )
+            lines.append(t("reconcile_created", lang, ts=record.created_at.isoformat()))
+            lines.append(t("reconcile_updated", lang, ts=record.updated_at.isoformat()))
             if record.error:
-                lines.append(f"  reason    : {record.error}")
+                lines.append(t("reconcile_reason", lang, reason=record.error))
         if len(records) > _RECONCILE_LIMIT:
             lines.append("")
             lines.append(
-                f"... and {len(records) - _RECONCILE_LIMIT} more (CLI has the full list)"
+                t("reconcile_more", lang, remaining=len(records) - _RECONCILE_LIMIT)
             )
         return "\n".join(lines)
 
-    async def _cmd_opportunities(self) -> str:
+    async def _cmd_opportunities(self, lang: str) -> str:
         opportunities = await self._services.scan_triangles()
         plans = await self._services.plan_transfers()
         lines = [
-            f"triangle opportunities: {len(opportunities)}",
+            t("opportunities_triangle", lang, count=len(opportunities)),
         ]
         if opportunities:
             for opp in opportunities[:_OPPORTUNITY_LIMIT]:
                 lines.append(
-                    f"  {opp.direction} net {opp.net_profit_bps} bps "
-                    f"notional {opp.size_notional_quote}"
+                    t(
+                        "opportunities_triangle_line",
+                        lang,
+                        direction=opp.direction,
+                        net_profit_bps=opp.net_profit_bps,
+                        size_notional_quote=opp.size_notional_quote,
+                    )
                 )
         else:
-            lines.append("  (none above configured minimum)")
-        lines.append(f"transfer plans: {len(plans)}")
+            lines.append(t("opportunities_triangle_none", lang))
+        lines.append(t("opportunities_transfer", lang, count=len(plans)))
         if plans:
             for plan in plans[:_OPPORTUNITY_LIMIT]:
                 lines.append(
-                    f"  {plan.source_exchange}->{plan.dest_exchange} {plan.asset} "
-                    f"{plan.amount} via {plan.network}: net {plan.net_profit_bps:.1f} bps"
+                    t(
+                        "opportunities_transfer_line",
+                        lang,
+                        source=plan.source_exchange,
+                        dest=plan.dest_exchange,
+                        asset=plan.asset,
+                        amount=plan.amount,
+                        network=plan.network,
+                        net_profit_bps=plan.net_profit_bps,
+                    )
                 )
         else:
-            lines.append("  (none above configured minimum)")
-        lines.append("\n(no execution — view-only)")
+            lines.append(t("opportunities_transfer_none", lang))
+        lines.append("")
+        lines.append(t("opportunities_view_only", lang))
         return "\n".join(lines)
 
-    async def _cmd_pause(self) -> str:
+    async def _cmd_pause(self, lang: str) -> str:
         """Engage the persistent kill switch (safe)."""
         if self._services.guard.is_halted:
-            return (
-                f"kill switch already engaged: {self._services.guard.halt_reason}"
-            )
+            return t("pause_already_engaged", lang, reason=self._services.guard.halt_reason)
         await self._services.engage_kill_switch("telegram /pause")
         # engage_kill_switch already disables the auto flag; tell the
         # controller to stop the in-process loop right now so the kill switch
@@ -316,22 +513,19 @@ class TelegramBot:
         controller = self._services.auto_controller
         if controller is not None:
             await controller.stop()
-        return "kill switch engaged (persisted across restart)"
+        return t("pause_engaged", lang)
 
-    async def _cmd_resume(self) -> str:
+    async def _cmd_resume(self, lang: str) -> str:
         """Release the persistent kill switch (safe)."""
         if not self._services.guard.is_halted:
-            return "kill switch already released"
+            return t("resume_already_released", lang)
         # The guard is the single source of truth for "may we trade?".  This
         # command restores it but does NOT enable auto trading — operators
         # must do that explicitly through the CLI.
         await self._services.release_kill_switch()
-        return (
-            "kill switch released — auto trading is still OFF; "
-            "start it from the CLI when ready"
-        )
+        return t("resume_released", lang)
 
-    async def _cmd_start_trading(self) -> str:
+    async def _cmd_start_trading(self, lang: str) -> str:
         """Start the DEMO auto-trading loop via the existing controller.
 
         Hard safety gates (in this order):
@@ -350,15 +544,16 @@ class TelegramBot:
 
         mode = self._services.settings.mode
         if mode is not TradingMode.DEMO:
-            return f"refused: /start_trading is only allowed in DEMO mode (current: {mode.value})"
+            return t("start_trading_refused_mode", lang, mode=mode.value)
         controller = self._services.auto_controller
         if controller is None:
-            return "refused: auto-trading controller is not initialised"
+            return t("start_trading_no_controller", lang)
         started, message = await controller.start()
-        prefix = "auto trading started" if started else "auto trading not started"
-        return f"{prefix}: {message}"
+        if started:
+            return t("start_trading_started", lang, msg=message)
+        return t("start_trading_not_started", lang, msg=message)
 
-    async def _cmd_stop_trading(self) -> str:
+    async def _cmd_stop_trading(self, lang: str) -> str:
         """Stop the auto-trading loop (idempotent, does NOT touch the kill switch).
 
         ``/stop_trading`` is the symmetric counterpart of ``/start_trading``.
@@ -369,19 +564,34 @@ class TelegramBot:
         """
         controller = self._services.auto_controller
         if controller is None:
-            return "auto trading controller is not initialised"
+            return t("stop_trading_no_controller", lang)
         stopped, message = await controller.stop()
-        prefix = "auto trading stopped" if stopped else "auto trading already stopped"
-        return f"{prefix}: {message}"
+        if stopped:
+            return t("stop_trading_stopped", lang, msg=message)
+        return t("stop_trading_already_stopped", lang, msg=message)
+
+    async def _cmd_language(self, lang: str) -> str:
+        # This handler is not used directly — /language is intercepted in
+        # handle_update to always show the picker.  Kept for dispatch completeness.
+        return t("language_picker_prompt", lang)
 
     # ---------------------------------------------------------------- send
-    async def _safe_send(self, chat_id: int, text: str) -> None:
+    async def _safe_send(
+        self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None
+    ) -> None:
         """Send ``text`` after redacting secrets and truncating to Telegram limits."""
         cleaned = redact_secrets(text)
         if len(cleaned) > _MAX_REPLY_LENGTH:
             cleaned = cleaned[: _MAX_REPLY_LENGTH - 20] + "... (truncated)"
         try:
-            await self._client.send_message(chat_id, cleaned)
+            if reply_markup is not None:
+                try:
+                    await self._client.send_message(chat_id, cleaned, reply_markup=reply_markup)  # type: ignore[call-arg]
+                except TypeError:
+                    # Compatibility with FakeClient in tests that does not accept reply_markup
+                    await self._client.send_message(chat_id, cleaned)  # type: ignore[call-arg]
+            else:
+                await self._client.send_message(chat_id, cleaned)  # type: ignore[call-arg]
         except Exception as exc:  # noqa: BLE001 - send errors must not crash the bot
             logger.warning(
                 "telegram_send_failed",
@@ -392,7 +602,7 @@ class TelegramBot:
             )
 
 
-_DISPATCH: dict[str, Callable[[TelegramBot], Awaitable[str]]] = {
+_DISPATCH: dict[str, Callable[[TelegramBot, str], Awaitable[str]]] = {
     "/start": TelegramBot._cmd_start,
     "/help": TelegramBot._cmd_help,
     "/status": TelegramBot._cmd_status,
@@ -402,6 +612,7 @@ _DISPATCH: dict[str, Callable[[TelegramBot], Awaitable[str]]] = {
     "/resume": TelegramBot._cmd_resume,
     "/start_trading": TelegramBot._cmd_start_trading,
     "/stop_trading": TelegramBot._cmd_stop_trading,
+    "/language": TelegramBot._cmd_language,
 }
 
 

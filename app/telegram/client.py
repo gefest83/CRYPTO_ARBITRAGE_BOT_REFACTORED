@@ -66,13 +66,23 @@ class TelegramClient:
         return data.get("result")
 
     async def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
-        payload: dict[str, Any] = {"timeout": self._poll_timeout, "allowed_updates": ["message"]}
+        payload: dict[str, Any] = {
+            "timeout": self._poll_timeout,
+            "allowed_updates": ["message", "callback_query"],
+        }
         if offset is not None:
             payload["offset"] = offset
         result = await self._call("getUpdates", payload)
         return list(result or [])
 
-    async def send_message(self, chat_id: int, text: str, *, parse_mode: str = "") -> None:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        parse_mode: str = "",
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
         if len(text) <= MAX_MESSAGE_LENGTH:
             body = text
         else:
@@ -80,7 +90,36 @@ class TelegramClient:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": body}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         await self._call("sendMessage", payload)
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            body = text
+        else:
+            body = text[: MAX_MESSAGE_LENGTH - 20] + "... (truncated)"
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": body,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        await self._call("editMessageText", payload)
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:200]
+        await self._call("answerCallbackQuery", payload)
 
     async def get_me(self) -> dict[str, Any]:
         return await self._call("getMe")
