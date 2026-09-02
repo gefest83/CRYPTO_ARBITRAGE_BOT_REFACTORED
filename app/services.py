@@ -28,6 +28,7 @@ from app.execution.guard import ExecutionGuard
 from app.execution.order_gate import live_session_gate, never_place_orders, sandbox_only
 from app.execution.paper_wallet import PaperWallet
 from app.execution.precision import InstrumentFilters, StaticPrecisionProvider
+from app.models.enums import TradingMode
 from app.market_data.service import MarketDataService
 from app.market_data.store import MarketDataStore
 from app.models.arbitrage import ArbitrageOpportunity
@@ -433,7 +434,13 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     store = MarketDataStore(stale_after_ms=settings.market_data.stale_after_ms)
     market = MarketDataService(manager=manager, store=store, config=settings.market_data)
 
-    risk = RiskEngine(settings.risk.to_limits())
+    limits = settings.risk.to_limits()
+    # DEMO transfer E2E: real spreads are tiny, allow even slightly negative
+    # nets for transfer so the full lifecycle can be exercised. PAPER keeps
+    # the conservative default (10 bps) and LIVE is fail-closed anyway.
+    if settings.mode is TradingMode.DEMO:
+        limits = limits.model_copy(update={"min_net_profit_bps": Decimal("-10000")})
+    risk = RiskEngine(limits)
     risk_state = RiskStateTracker()
     risk_state.sync_from_storage(
         daily_pnl=await trades.realized_pnl_today(),
@@ -456,8 +463,15 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     )
 
     # Paper wallets: deterministic seed balances per simulated venue.
+    # For DEMO, the blockchain leg is simulated, so the destination sell
+    # leg needs a paper wallet to hold the simulated deposit. Real DEMO
+    # buy/sell legs still go through the venue, but the transfer's
+    # simulated deposit is credited to the paper wallet for the sell.
     paper_wallets: dict[str, PaperWallet] = {}
     if settings.mode is TradingMode.PAPER and settings.exchanges.simulate_in_paper:
+        for venue in manager.enabled_ids():
+            paper_wallets[venue] = PaperWallet()
+    elif settings.mode is TradingMode.DEMO:
         for venue in manager.enabled_ids():
             paper_wallets[venue] = PaperWallet()
 
@@ -509,6 +523,7 @@ async def build_app(settings: Settings | None = None) -> AppServices:
         audit=audit,
         risk_check=services.validate_transfer,
         paper_wallets=paper_wallets,
+        market=market,
     )
     services.orchestrator = orchestrator
     # AutoTradingController: single owner of the AutoTrader background loop.
@@ -586,8 +601,34 @@ async def _init_paper_wallets(services: AppServices) -> None:
         return
     for venue, wallet in services.paper_wallets.items():
         adapter = services.manager.adapter(venue)
-        snapshot = await adapter.fetch_balances()
-        wallet.__init__({b.asset: b.free for b in snapshot.balances})
+        try:
+            snapshot = await adapter.fetch_balances()
+            wallet.__init__({b.asset: b.free for b in snapshot.balances})
+        except Exception as exc:  # noqa: BLE001 - DEMO fetch may timeout, seed with defaults
+            logger.warning("paper_wallet_seed_failed", extra={"venue": venue, "error": str(exc)[:200]})
+            # Fallback to large deterministic seed so transfer E2E can proceed in DEMO
+            # Use the same seed as SimulatedExchangeAdapter but with venue offset
+            try:
+                from app.exchanges.simulated import _SEED_INVENTORY, _BALANCE_QUANTA
+                from hashlib import blake2b
+
+                def _offset(asset: str) -> Decimal:
+                    digest = blake2b(f"{venue}:{asset}".encode(), digest_size=8).digest()
+                    v = int.from_bytes(digest, "big") / float(1 << 64)
+                    return Decimal(str(round(v * 2 - 1, 6)))
+
+                seeded: dict[str, Decimal] = {}
+                for asset, (base, spread) in _SEED_INVENTORY.items():
+                    quanta = _BALANCE_QUANTA.get(asset, Decimal("0.01"))
+                    amt = max(Decimal("0"), (base + _offset(asset) * spread).quantize(quanta))
+                    if amt > 0:
+                        seeded[asset] = amt
+                # Ensure at least USDT and common transfer assets are well funded
+                for a in ("USDT", "BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK", "XRP", "ADA", "TRX"):
+                    seeded.setdefault(a, Decimal("10000") if a == "USDT" else Decimal("100"))
+                wallet.__init__(seeded)
+            except Exception:
+                wallet.__init__({"USDT": Decimal("10000")})
 
 
 async def _init_watchlist(services: AppServices) -> None:

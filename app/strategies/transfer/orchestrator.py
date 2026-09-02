@@ -107,6 +107,7 @@ class TransferOrchestrator:
         audit: AuditLogRepository,
         risk_check: Callable[[TransferPlan], RiskAssessment] | None = None,
         paper_wallets: dict[str, PaperWallet] | None = None,
+        market=None,
     ) -> None:
         self._settings = settings
         self._manager = manager
@@ -122,6 +123,7 @@ class TransferOrchestrator:
         self._paper_wallets = paper_wallets or {}
         self._selector = NetworkSelector()
         self._mode = settings.mode
+        self._market = market
 
     # ---------------------------------------------------------------- planning
     async def plan(
@@ -159,8 +161,8 @@ class TransferOrchestrator:
     ) -> TransferPlan | None:
         asset = symbol.base
         try:
-            buy_book = self._fresh_book(source_id, symbol)
-            sell_book = self._fresh_book(dest_id, symbol)
+            buy_book = await self._fresh_book(source_id, symbol)
+            sell_book = await self._fresh_book(dest_id, symbol)
         except ValueError:
             return None
         try:
@@ -707,10 +709,13 @@ class TransferOrchestrator:
             if elapsed < delay:
                 return record
             deposit_amount = record.withdrawal_amount
-            if self._mode is TradingMode.PAPER:
-                wallet = self._paper_wallets.get(plan.dest_exchange)
-                if wallet is not None:
-                    wallet.credit(plan.asset, deposit_amount)
+            # For both PAPER and DEMO the blockchain leg is simulated, so
+            # credit the destination paper wallet so the simulated sell has
+            # funds. Real DEMO buy/sell legs still go through the venue, but
+            # the deposited asset is synthetic.
+            wallet = self._paper_wallets.get(plan.dest_exchange)
+            if wallet is not None:
+                wallet.credit(plan.asset, deposit_amount)
             record = record.with_state(
                 TransferState.DEPOSIT_DETECTED,
                 deposit_txid=f"sim-{record.withdrawal_txid}",
@@ -893,8 +898,15 @@ class TransferOrchestrator:
         before submission so the caller can persist a PENDING intent
         identified by its ``client_order_id``.
         """
-        book = self._fresh_book(venue, symbol)
-        if self._mode is TradingMode.PAPER:
+        book = await self._fresh_book(venue, symbol)
+        # For DEMO the sell leg's funds are simulated (deposit is simulated),
+        # so use the paper-wallet path for SELL in DEMO. Buy remains real.
+        is_demo_sell_via_paper = (
+            self._mode is TradingMode.DEMO
+            and side is OrderSide.SELL
+            and venue in self._paper_wallets
+        )
+        if self._mode is TradingMode.PAPER or is_demo_sell_via_paper:
             fill = self._sim.simulate(
                 book, side, base_amount=base_amount, quote_amount=quote_amount
             )
@@ -923,7 +935,7 @@ class TransferOrchestrator:
             )
             return fill, order
 
-        # DEMO / LIVE: real market order with timeout + recovery.
+        # DEMO buy / LIVE: real market order with timeout + recovery.
         amount = base_amount
         if amount is None:
             if not book.asks:
@@ -999,16 +1011,25 @@ class TransferOrchestrator:
             wallet.debit(symbol.base, fill.filled_amount)
             wallet.credit(symbol.quote, fill.quote_amount)
 
-    def _fresh_book(self, venue: str, symbol: Symbol):
+    async def _fresh_book(self, venue: str, symbol: Symbol):
         book = self._store.order_book(venue, symbol)
+        if book is not None and not self._store.is_stale(self._store.age_ms(book)):
+            return book
+        # Stale or missing -> one on-demand refresh in DEMO (fail-closed if still stale)
+        if self._mode is TradingMode.DEMO and getattr(self, "_market", None) is not None:
+            try:
+                await self._market.refresh_order_books([symbol], exchange_ids=[venue])
+            except Exception:
+                pass
+            book = self._store.order_book(venue, symbol)
+            if book is not None and not self._store.is_stale(self._store.age_ms(book)):
+                return book
         if book is None:
             raise ValueError(f"no order book cached for {venue} {symbol.name}")
-        if self._store.is_stale(self._store.age_ms(book)):
-            raise ValueError(
-                f"stale order book for {venue} {symbol.name} "
-                f"({self._store.age_ms(book):.0f} ms) — refusing to plan/execute"
-            )
-        return book
+        raise ValueError(
+            f"stale order book for {venue} {symbol.name} "
+            f"({self._store.age_ms(book):.0f} ms) — refusing to plan/execute"
+        )
 
     async def _available_quote(self, venue: str) -> Decimal:
         quote = self._settings.trading.base_currency

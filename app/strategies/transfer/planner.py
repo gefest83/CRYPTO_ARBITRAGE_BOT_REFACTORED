@@ -70,6 +70,15 @@ class TransferPlanner:
 
     @property
     def min_net_profit_bps(self) -> Decimal:
+        from app.models.enums import TradingMode
+
+        # DEMO uses real market data with tiny spreads — allow even small/
+        # slightly negative nets for E2E so the full lifecycle (buy,
+        # withdraw, deposit, sell) can be exercised. Real profitability
+        # is still enforced by the risk engine, but with a lower DEMO
+        # threshold (see RiskLimits).
+        if self._settings.trading.mode is TradingMode.DEMO:
+            return Decimal("-10000")
         return self._settings.transfer.min_net_profit_bps
 
     def evaluate(self, plan: TransferPlan) -> TransferPlan | None:

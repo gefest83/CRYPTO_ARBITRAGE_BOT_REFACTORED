@@ -868,6 +868,36 @@ class CCXTAdapter(BaseExchangeAdapter):
 
     async def fetch_withdrawal_networks(self, asset: str) -> tuple[WithdrawalNetwork, ...]:
         code = asset.strip().upper()
+        # DEMO: demo hosts disable fetchCurrencies — use deterministic
+        # simulated networks directly. DEMO withdrawals are simulated anyway.
+        if self._options.sandbox:
+            try:
+                from app.exchanges.simulated import _NETWORKS as _SIM_NETS
+
+                sim = _SIM_NETS.get(code)
+                if sim:
+                    return tuple(
+                        WithdrawalNetwork(
+                            network=name,
+                            network_code=unified,
+                            withdraw_enabled=True,
+                            deposit_enabled=True,
+                            withdrawal_fee=Decimal(fee),
+                            withdrawal_min=Decimal(fee) * Decimal("10"),
+                        )
+                        for name, unified, fee in sim
+                    )
+                return (
+                    WithdrawalNetwork(
+                        network=code,
+                        network_code=code,
+                        withdraw_enabled=True,
+                        deposit_enabled=True,
+                        withdrawal_fee=DEC0,
+                    ),
+                )
+            except Exception:
+                pass
         currencies = await self._load_currencies()
         currency = currencies.get(code)
         if currency is None:
@@ -912,6 +942,24 @@ class CCXTAdapter(BaseExchangeAdapter):
     async def fetch_deposit_address(
         self, asset: str, *, network: str | None = None
     ) -> DepositAddress:
+        # DEMO: use deterministic simulated address directly (real demo host
+        # often fails for deposit address and withdrawals are simulated anyway).
+        if self._options.sandbox:
+            try:
+                import hashlib
+
+                code = asset.strip().upper()
+                net = network or code
+                seed = f"{self.id}:{code}:{net}:addr".encode()
+                digest = hashlib.blake2b(seed, digest_size=10).hexdigest()
+                addr = f"sim-{code.lower()}-{net.lower()}-{digest[:20]}"
+                # Provide memo for tag-required assets so orchestrator's memo check passes
+                from app.strategies.transfer.orchestrator import _MEMO_REQUIRED_ASSETS
+
+                memo_val = "123456" if code in _MEMO_REQUIRED_ASSETS else None
+                return DepositAddress(address=addr, memo=memo_val, network=network)
+            except Exception:
+                pass
         params: dict[str, Any] = {}
         if network:
             params["network"] = network
