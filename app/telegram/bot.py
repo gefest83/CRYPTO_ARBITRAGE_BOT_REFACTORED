@@ -63,8 +63,13 @@ from .client import TelegramClient, poll_forever
 from .i18n import (
     LANGUAGE_PICKER_KEYBOARD,
     LANGUAGE_PICKER_PROMPT,
+    STRATEGY_PICKER_KEYBOARD,
+    STRATEGY_PICKER_PROMPT,
     SUPPORTED_LANGUAGES,
+    SUPPORTED_STRATEGIES,
+    is_supported_strategy,
     lang_storage_key,
+    strategy_storage_key,
     t,
 )
 
@@ -84,6 +89,7 @@ COMMANDS: tuple[str, ...] = (
     "/start_trading",
     "/stop_trading",
     "/language",
+    "/strategy",
 )
 
 HELP_TEXT = (
@@ -98,6 +104,7 @@ HELP_TEXT = (
     "/start_trading - start the DEMO auto-trading loop (DEMO only)\n"
     "/stop_trading  - stop the auto-trading loop (idempotent)\n"
     "/language     - choose language (English / Русский)\n"
+    "/strategy     - choose strategy (Triangle / Transfer)\n"
     "\n"
     "Order placement, transfers and withdrawals are NOT exposed here — "
     "use the CLI for any execution that moves funds."
@@ -160,6 +167,29 @@ class TelegramBot:
         except Exception:
             pass
 
+    async def _get_strategy(self) -> str | None:
+        try:
+            val = await self._services.bot_state.get(strategy_storage_key())
+        except Exception:
+            return None
+        if isinstance(val, str) and val in SUPPORTED_STRATEGIES:
+            return val
+        return None
+
+    async def _set_strategy(self, strategy: str) -> None:
+        if strategy not in SUPPORTED_STRATEGIES:
+            return
+        try:
+            await self._services.bot_state.set(strategy_storage_key(), strategy)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("telegram_set_strategy_failed", extra={"error": str(exc)[:200]})
+
+    async def _send_strategy_picker(self, chat_id: int, lang: str) -> None:
+        try:
+            await self._safe_send(chat_id, t("strategy_picker_prompt", lang), reply_markup=STRATEGY_PICKER_KEYBOARD)
+        except Exception:
+            pass
+
     async def _handle_callback(self, callback: dict[str, Any]) -> None:
         cb_id = callback.get("id")
         data = str(callback.get("data") or "")
@@ -169,48 +199,107 @@ class TelegramBot:
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         message_id = message.get("message_id")
-        if not data.startswith("lang:"):
+        # Language selection
+        if data.startswith("lang:"):
+            lang = data.split(":", 1)[1].strip().lower()
+            if lang not in SUPPORTED_LANGUAGES:
+                if cb_id:
+                    try:
+                        await self._client.answer_callback_query(str(cb_id), text="Invalid language")
+                    except Exception:
+                        pass
+                return
+            # Persist — language selection never grants trading access
+            if isinstance(user_id, int):
+                await self._set_lang(user_id, lang)
+            # Answer callback in newly selected language
             if cb_id:
                 try:
-                    await self._client.answer_callback_query(str(cb_id))
+                    await self._client.answer_callback_query(str(cb_id), text=t("callback_language_changed", lang))
+                except Exception:
+                    pass
+            if chat_id is None:
+                return
+            # Confirm change in newly selected language + show help
+            try:
+                confirmation = t("language_selected", lang)
+                help_text = t("help_text", lang)
+                full = f"{confirmation}\n\n{help_text}"
+                await self._safe_send(int(chat_id), full)
+            except Exception:
+                pass
+            # Edit original picker message to remove inline keyboard (best-effort)
+            if chat_id is not None and message_id is not None:
+                try:
+                    await self._client.edit_message_text(
+                        int(chat_id), int(message_id), text=t("language_picker_chosen", lang)
+                    )
                 except Exception:
                     pass
             return
-        lang = data.split(":", 1)[1].strip().lower()
-        if lang not in SUPPORTED_LANGUAGES:
+        # Strategy selection
+        if data.startswith("strategy:"):
+            # Strategy changes require authorization — fail-closed if not authorized
+            # Extract chat_id for auth check (use user_id and chat_id)
+            chat_id_val = chat.get("id")
+            # Need to check authorization: only allowed users may change strategy
+            # We don't have user_id/chat_id in this scope for auth? Use the ones from callback
+            # For safety, check if user_id is authorized; if not, deny
+            if not self._authorized(user_id, chat_id_val):
+                if cb_id:
+                    try:
+                        # Use lang for denied message if available, else en
+                        lang_for_denied = await self._get_lang(user_id)
+                        eff = lang_for_denied if lang_for_denied in SUPPORTED_LANGUAGES else "en"
+                        await self._client.answer_callback_query(str(cb_id), text=t("unauthorized", eff))
+                    except Exception:
+                        pass
+                return
+            strategy = data.split(":", 1)[1].strip().lower()
+            if strategy not in SUPPORTED_STRATEGIES:
+                if cb_id:
+                    try:
+                        await self._client.answer_callback_query(str(cb_id), text="Invalid strategy")
+                    except Exception:
+                        pass
+                return
+            await self._set_strategy(strategy)
+            # Need lang for response
+            lang = await self._get_lang(user_id)
+            eff_lang = lang if lang in SUPPORTED_LANGUAGES else "en"
             if cb_id:
                 try:
-                    await self._client.answer_callback_query(str(cb_id), text="Invalid language")
+                    await self._client.answer_callback_query(str(cb_id), text=t("callback_strategy_changed", eff_lang))
+                except Exception:
+                    pass
+            if chat_id is None:
+                return
+            try:
+                # Confirmation in selected language
+                key = f"strategy_selected_{strategy}"
+                confirmation = t(key, eff_lang)
+                # Also show current strategy and help
+                help_text = t("help_text", eff_lang)
+                full = f"{confirmation}\n\n{help_text}"
+                await self._safe_send(int(chat_id), full)
+            except Exception:
+                pass
+            if chat_id is not None and message_id is not None:
+                try:
+                    key_chosen = f"strategy_picker_chosen_{strategy}"
+                    await self._client.edit_message_text(
+                        int(chat_id), int(message_id), text=t(key_chosen, eff_lang)
+                    )
                 except Exception:
                     pass
             return
-        # Persist — language selection never grants trading access
-        if isinstance(user_id, int):
-            await self._set_lang(user_id, lang)
-        # Answer callback in newly selected language
+        # Unknown callback data
         if cb_id:
             try:
-                await self._client.answer_callback_query(str(cb_id), text=t("callback_language_changed", lang))
+                await self._client.answer_callback_query(str(cb_id))
             except Exception:
                 pass
-        if chat_id is None:
-            return
-        # Confirm change in newly selected language + show help
-        try:
-            confirmation = t("language_selected", lang)
-            help_text = t("help_text", lang)
-            full = f"{confirmation}\n\n{help_text}"
-            await self._safe_send(int(chat_id), full)
-        except Exception:
-            pass
-        # Edit original picker message to remove inline keyboard (best-effort)
-        if chat_id is not None and message_id is not None:
-            try:
-                await self._client.edit_message_text(
-                    int(chat_id), int(message_id), text=t("language_picker_chosen", lang)
-                )
-            except Exception:
-                pass
+        return
 
     # ---------------------------------------------------------------- dispatch
     async def handle_update(self, update: dict[str, Any]) -> None:
@@ -262,6 +351,20 @@ class TelegramBot:
             await self._send_picker(int(chat_id))
             return
 
+        if command == "/strategy":
+            # Strategy selection is for authorized operators only (it influences trading)
+            lang_for_denied2 = await self._get_lang(user_id)
+            eff2 = lang_for_denied2 if lang_for_denied2 in SUPPORTED_LANGUAGES else "en"
+            if not self._authorized(user_id, chat_id):
+                await self._safe_send(int(chat_id), t("unauthorized", eff2))
+                return
+            lang2 = await self._get_lang(user_id)
+            if lang2 is None:
+                await self._send_picker(int(chat_id))
+                return
+            await self._send_strategy_picker(int(chat_id), lang2)
+            return
+
         # For all other commands: authorization first (fail-closed)
         # Use stored language for denied message localization if available.
         lang_for_denied = await self._get_lang(user_id)
@@ -276,6 +379,19 @@ class TelegramBot:
         if lang is None:
             await self._send_picker(int(chat_id))
             return
+
+        # DEMO strategy gate for /start_trading
+        if command == "/start_trading":
+            from app.models.enums import TradingMode
+
+            if self._services.settings.mode is TradingMode.DEMO:
+                strat = await self._get_strategy()
+                if strat is None:
+                    # For backwards compat, default to triangle if not chosen.
+                    # The operator can explicitly choose via /strategy.
+                    await self._set_strategy("triangle")
+                    # Also inform but not block start
+                    # Continue to handler
 
         handler = self._dispatch(command)
         if handler is None:
@@ -335,6 +451,14 @@ class TelegramBot:
             kill_line = t("status_kill_switch_engaged", lang, reason=guard["halt_reason"])
         else:
             kill_line = t("status_kill_switch_released", lang)
+        strat = status.get("active_strategy", "not_set")
+        # Translate strategy name if possible
+        strat_key = f"strategy_{strat}" if strat in ("triangle", "transfer") else "common_off"
+        # Use t for strategy name, fallback to raw
+        strat_display = t(strat_key, lang) if strat in ("triangle", "transfer") else str(strat)
+        # If translation returned the key itself (missing), use raw
+        if strat_display == strat_key:
+            strat_display = str(strat)
         lines: list[str] = [
             t("status_mode", lang, mode=status["mode"]),
             t("status_uptime", lang, sec=status["uptime_seconds"]),
@@ -342,6 +466,7 @@ class TelegramBot:
             kill_line,
             t("status_auto_trading_flag", lang, flag=flag_local),
             t("status_auto_loop", lang, state=loop_local),
+            t("status_strategy", lang, strategy=strat_display),
             t("status_exchanges_header", lang),
         ]
         for venue, info in status["exchanges"].items():
@@ -575,6 +700,11 @@ class TelegramBot:
         # handle_update to always show the picker.  Kept for dispatch completeness.
         return t("language_picker_prompt", lang)
 
+    async def _cmd_strategy(self, lang: str) -> str:
+        # This handler is not used directly — /strategy is intercepted in
+        # handle_update to always show the picker.  Kept for dispatch completeness.
+        return t("strategy_picker_prompt", lang)
+
     # ---------------------------------------------------------------- send
     async def _safe_send(
         self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None
@@ -613,6 +743,7 @@ _DISPATCH: dict[str, Callable[[TelegramBot, str], Awaitable[str]]] = {
     "/start_trading": TelegramBot._cmd_start_trading,
     "/stop_trading": TelegramBot._cmd_stop_trading,
     "/language": TelegramBot._cmd_language,
+    "/strategy": TelegramBot._cmd_strategy,
 }
 
 

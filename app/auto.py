@@ -65,22 +65,50 @@ class AutoTrader:
     async def _cycle(self) -> None:
         services = self._services
         services.guard.ensure_auto_trading()
-        opportunities = await services.scan_triangles(
-            notional_quote=services.settings.execution.auto_notional_quote
-        )
-        for executed, opportunity in enumerate(opportunities):
-            if executed >= services.settings.execution.auto_max_per_cycle:
-                break
-            if services.guard.is_halted:
-                break
-            trade, assessment = await services.execute_triangle(opportunity)
-            logger.info(
-                "auto_triangle_executed",
-                extra={
-                    "trade_id": trade.id,
-                    "status": trade.status.value,
-                    "net_profit": str(trade.net_profit),
-                    "violations": len(assessment.violations) if assessment else 0,
-                },
+        # Respect active strategy: triangle, transfer, or not_set (default triangle for backwards compat)
+        strategy = await services.get_active_strategy()
+        # If not set, default to triangle to keep existing CLI/tests working
+        active = strategy or "triangle"
+        if active in ("triangle", "not_set"):
+            opportunities = await services.scan_triangles(
+                notional_quote=services.settings.execution.auto_notional_quote
             )
+            for executed, opportunity in enumerate(opportunities):
+                if executed >= services.settings.execution.auto_max_per_cycle:
+                    break
+                if services.guard.is_halted:
+                    break
+                trade, assessment = await services.execute_triangle(opportunity)
+                logger.info(
+                    "auto_triangle_executed",
+                    extra={
+                        "trade_id": trade.id,
+                        "status": trade.status.value,
+                        "net_profit": str(trade.net_profit),
+                        "violations": len(assessment.violations) if assessment else 0,
+                    },
+                )
+        if active == "transfer":
+            # Transfer auto: plan and start one transfer per cycle (risk-checked)
+            try:
+                plans = await services.plan_transfers()
+                for plan in plans[: services.settings.execution.auto_max_per_cycle]:
+                    if services.guard.is_halted:
+                        break
+                    try:
+                        rec = await services.start_transfer(plan)
+                        logger.info(
+                            "auto_transfer_started",
+                            extra={
+                                "transfer_id": rec.id,
+                                "asset": rec.asset,
+                                "state": rec.state.value,
+                            },
+                        )
+                    except Exception as exc:
+                        logger.info("auto_transfer_rejected", extra={"error": str(exc)[:200]})
+                        continue
+                    break  # only one per cycle
+            except Exception as exc:
+                logger.error("auto_transfer_cycle_error", extra={"error": str(exc)[:200]})
         await services.tick_transfers()

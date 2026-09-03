@@ -8,15 +8,21 @@ from __future__ import annotations
 
 __all__ = [
     "SUPPORTED_LANGUAGES",
+    "SUPPORTED_STRATEGIES",
     "LANGUAGE_PICKER_PROMPT",
     "LANGUAGE_PICKER_KEYBOARD",
+    "STRATEGY_PICKER_PROMPT",
+    "STRATEGY_PICKER_KEYBOARD",
     "is_supported_lang",
+    "is_supported_strategy",
     "lang_storage_key",
+    "strategy_storage_key",
     "t",
     "TRANSLATIONS",
 ]
 
 SUPPORTED_LANGUAGES: tuple[str, ...] = ("en", "ru")
+SUPPORTED_STRATEGIES: tuple[str, ...] = ("triangle", "transfer")
 
 LANGUAGE_PICKER_PROMPT = "Choose language / Выберите язык:"
 
@@ -29,6 +35,17 @@ LANGUAGE_PICKER_KEYBOARD = {
     ]
 }
 
+STRATEGY_PICKER_PROMPT = "Choose strategy / Выберите стратегию:"
+
+STRATEGY_PICKER_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "Triangle", "callback_data": "strategy:triangle"},
+            {"text": "Transfer", "callback_data": "strategy:transfer"},
+        ]
+    ]
+}
+
 
 def is_supported_lang(lang: str | None) -> bool:
     return lang in SUPPORTED_LANGUAGES
@@ -36,6 +53,14 @@ def is_supported_lang(lang: str | None) -> bool:
 
 def lang_storage_key(user_id: int) -> str:
     return f"tg_lang:{user_id}"
+
+
+def is_supported_strategy(strategy: str | None) -> bool:
+    return strategy in SUPPORTED_STRATEGIES
+
+
+def strategy_storage_key() -> str:
+    return "active_strategy"
 
 
 # fmt: off
@@ -53,6 +78,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "/start_trading - start the DEMO auto-trading loop (DEMO only)\n"
             "/stop_trading  - stop the auto-trading loop (idempotent)\n"
             "/language     - choose language (English / Русский)\n"
+            "/strategy     - choose strategy (Triangle / Transfer)\n"
             "\n"
             "Order placement, transfers and withdrawals are NOT exposed here — "
             "use the CLI for any execution that moves funds."
@@ -125,6 +151,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "stop_trading_already_stopped": "auto trading already stopped: {msg}",
 
         "callback_language_changed": "Language changed",
+
+        "strategy_picker_prompt": "Choose strategy / Выберите стратегию:",
+        "strategy_selected_triangle": "Strategy set to Triangle.",
+        "strategy_selected_transfer": "Strategy set to Transfer.",
+        "strategy_picker_chosen_triangle": "Strategy selected: Triangle",
+        "strategy_picker_chosen_transfer": "Strategy selected: Transfer",
+        "status_strategy": "strategy: {strategy}",
+        "strategy_required": "Please choose a strategy first: /strategy",
+        "callback_strategy_changed": "Strategy changed",
+        "strategy_triangle": "triangle",
+        "strategy_transfer": "transfer",
     },
     "ru": {
         "help_text": (
@@ -139,6 +176,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "/start_trading - запустить DEMO автоторговлю (только DEMO)\n"
             "/stop_trading  - остановить автоторговлю (идемпотентно)\n"
             "/language     - выбрать язык (English / Русский)\n"
+            "/strategy     - выбрать стратегию (Triangle / Transfer)\n"
             "\n"
             "Размещение ордеров, переводы и выводы НЕ доступны здесь — "
             "используйте CLI для любых операций с движением средств."
@@ -211,6 +249,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "stop_trading_already_stopped": "автоторговля уже остановлена: {msg}",
 
         "callback_language_changed": "Язык изменён",
+
+        "strategy_picker_prompt": "Choose strategy / Выберите стратегию:",
+        "strategy_selected_triangle": "Стратегия установлена: Triangle.",
+        "strategy_selected_transfer": "Стратегия установлена: Transfer.",
+        "strategy_picker_chosen_triangle": "Стратегия выбрана: Triangle",
+        "strategy_picker_chosen_transfer": "Стратегия выбрана: Transfer",
+        "status_strategy": "стратегия: {strategy}",
+        "strategy_required": "Сначала выберите стратегию: /strategy",
+        "callback_strategy_changed": "Стратегия изменена",
+        "strategy_triangle": "triangle",
+        "strategy_transfer": "transfer",
     },
 }
 # fmt: on

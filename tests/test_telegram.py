@@ -308,6 +308,7 @@ async def test_command_set_matches_spec() -> None:
         "/start_trading",
         "/stop_trading",
         "/language",
+        "/strategy",
     }
 
 

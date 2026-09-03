@@ -57,10 +57,15 @@ async def services(tmp_path: pathlib.Path) -> AsyncIterator[AppServices]:
     await start_app(app)
     # Default language for existing tests: authorized user has English.
     # Individual i18n tests that need a fresh picker state will delete/overwrite this.
-    from app.telegram.i18n import lang_storage_key
+    from app.telegram.i18n import lang_storage_key, strategy_storage_key
 
     try:
         await app.bot_state.set(lang_storage_key(11111), "en")
+    except Exception:
+        pass
+    # Default strategy for existing tests (triangle)
+    try:
+        await app.bot_state.set(strategy_storage_key(), "triangle")
     except Exception:
         pass
     try:
@@ -97,10 +102,14 @@ async def demo_services(tmp_path: pathlib.Path) -> AsyncIterator[AppServices]:
         with patch.object(app.market, "refresh_order_books", new=AsyncMock()):
             with patch.object(app.market, "start_streams", new=AsyncMock()):
                 await start_app(app)
-    from app.telegram.i18n import lang_storage_key
+    from app.telegram.i18n import lang_storage_key, strategy_storage_key
 
     try:
         await app.bot_state.set(lang_storage_key(11111), "en")
+    except Exception:
+        pass
+    try:
+        await app.bot_state.set(strategy_storage_key(), "triangle")
     except Exception:
         pass
     try:

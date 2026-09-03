@@ -59,6 +59,7 @@ __all__ = ["AppServices", "build_app", "shutdown_app"]
 logger = get_logger("runtime")
 
 _AUTO_FLAG_KEY = "auto_trading"
+_STRATEGY_KEY = "active_strategy"
 
 #: Fallback taker fee (bps) used when a venue does not publish account fees.
 _DEFAULT_TAKER_BPS = Decimal("10")
@@ -300,12 +301,14 @@ class AppServices:
             if self.auto_controller is not None
             else False
         )
+        active_strategy = await self.get_active_strategy()
         return {
             "mode": self.settings.mode.value,
             "uptime_seconds": round(time.monotonic() - self.started_at, 1),
             "guard": self.guard.status(),
             "auto_trading": auto_flag,
             "auto_loop_running": auto_loop_running,
+            "active_strategy": active_strategy or "not_set",
             "exchanges": self.manager.status_snapshot(),
             "market_data": self.store.stats(),
             "risk": {
@@ -377,6 +380,19 @@ class AppServices:
         await self.bot_state.set(_AUTO_FLAG_KEY, enabled)
         self.guard.enable_trading(enabled=enabled)
         await self.audit.log("AUTO_TRADING_ENABLED" if enabled else "AUTO_TRADING_DISABLED")
+
+    async def get_active_strategy(self) -> str | None:
+        """Active DEMO strategy: 'triangle' or 'transfer', or None if not chosen."""
+        value = await self.bot_state.get(_STRATEGY_KEY)
+        if isinstance(value, str) and value in ("triangle", "transfer"):
+            return value
+        return None
+
+    async def set_active_strategy(self, strategy: str) -> None:
+        if strategy not in ("triangle", "transfer"):
+            raise ValueError(f"unknown strategy: {strategy}")
+        await self.bot_state.set(_STRATEGY_KEY, strategy)
+        await self.audit.log("ACTIVE_STRATEGY_SET", strategy)
 
     async def engage_kill_switch(self, reason: str) -> None:
         self.guard.engage_kill_switch(reason)
