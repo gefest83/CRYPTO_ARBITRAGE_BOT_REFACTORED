@@ -451,11 +451,6 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     market = MarketDataService(manager=manager, store=store, config=settings.market_data)
 
     limits = settings.risk.to_limits()
-    # DEMO transfer E2E: real spreads are tiny, allow even slightly negative
-    # nets for transfer so the full lifecycle can be exercised. PAPER keeps
-    # the conservative default (10 bps) and LIVE is fail-closed anyway.
-    if settings.mode is TradingMode.DEMO:
-        limits = limits.model_copy(update={"min_net_profit_bps": Decimal("-10000")})
     risk = RiskEngine(limits)
     risk_state = RiskStateTracker()
     risk_state.sync_from_storage(

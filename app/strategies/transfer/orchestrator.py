@@ -659,11 +659,16 @@ class TransferOrchestrator:
             # after the (simulated) withdrawal was accepted.
             elapsed = (utc_now() - record.updated_at).total_seconds()
             delay = self._settings.transfer.simulated_transfer_seconds
-            if elapsed < delay / 2 and record.state is TransferState.WITHDRAW_SUBMITTED:
+            # For DEMO make lifecycle faster (10s total) so withdraw_pending
+            # does not appear stuck; PAPER keeps 30s for realism.
+            if self._mode is TradingMode.DEMO:
+                delay = min(delay, Decimal("10"))
+            delay_f = float(delay)
+            if elapsed < delay_f / 2 and record.state is TransferState.WITHDRAW_SUBMITTED:
                 record = record.with_state(TransferState.WITHDRAW_PENDING)
                 await self._transfers.save(record)
                 return record
-            if elapsed < delay:
+            if elapsed < delay_f:
                 return record
             record = record.with_state(TransferState.TRANSFER_IN_PROGRESS)
             await self._transfers.save(record)
@@ -706,7 +711,10 @@ class TransferOrchestrator:
         if self._mode in (TradingMode.PAPER, TradingMode.DEMO):
             elapsed = (utc_now() - record.updated_at).total_seconds()
             delay = self._settings.transfer.simulated_transfer_seconds
-            if elapsed < delay:
+            if self._mode is TradingMode.DEMO:
+                delay = min(delay, Decimal("10"))
+            delay_f = float(delay)
+            if elapsed < delay_f:
                 return record
             deposit_amount = record.withdrawal_amount
             # For both PAPER and DEMO the blockchain leg is simulated, so
@@ -763,6 +771,17 @@ class TransferOrchestrator:
                 "nothing to sell: deposit amount is zero",
                 state=TransferState.MANUAL_REVIEW,
             )
+        # For DEMO the deposit is simulated and lives in the paper wallet.
+        # On a fresh process the in-memory wallet is empty, so ensure it
+        # holds the deposited asset before the simulated sell.
+        if self._mode is TradingMode.DEMO:
+            wallet = self._paper_wallets.get(plan.dest_exchange)
+            if wallet is not None and wallet.free(plan.asset) < sell_amount:
+                # Credit the exact deposited amount (idempotent if already credited)
+                try:
+                    wallet.credit(plan.asset, sell_amount - wallet.free(plan.asset))
+                except Exception:
+                    wallet.credit(plan.asset, sell_amount)
 
         def _asset_note() -> str:
             return (
@@ -838,18 +857,32 @@ class TransferOrchestrator:
                 wallet.debit(plan.asset, filled)
                 wallet.credit(self._settings.trading.base_currency, proceeds)
 
-        buy_cost = plan.buy_cost_quote
-        # All fees are already embedded in the net amounts (the buy fee reduced
-        # the received asset, the sell fee reduced the proceeds, and the
-        # withdrawal fee reduced the transferred amount), so the realised
-        # profit is simply proceeds minus cost.  The fee figure below is for
-        # reporting: plan-level economics scaled to the actual sizes.
+        # Use actual buy cost from the filled buy order when available
+        buy_avg = None
+        try:
+            buy_avg = Decimal(str((record.buy_order or {}).get("average_price"))) if record.buy_order else None
+        except Exception:
+            buy_avg = None
+        if buy_avg is not None and buy_avg > DEC0:
+            buy_cost = record.buy_filled_amount * buy_avg
+        else:
+            buy_cost = plan.buy_cost_quote
+        # Realized is proceeds (already net of sell fee) minus actual buy cost.
+        # Fees are already embedded via reduced amounts, so realized is net.
+        # For reporting, compute fees from actual averages when available.
+        sell_avg = None
+        try:
+            sell_avg = Decimal(str(sell_order.get("average_price"))) if sell_order.get("average_price") else None
+        except Exception:
+            sell_avg = None
+        if sell_avg is None or sell_avg <= DEC0:
+            sell_avg = plan.sell_price
+        buy_avg_for_fee = buy_avg if buy_avg is not None and buy_avg > DEC0 else plan.buy_price
         realized = proceeds - buy_cost
-        sell_price = plan.sell_price
         fees = (
-            record.buy_filled_amount * plan.buy_price * plan.buy_fee_bps / Decimal("10000")
-            + filled * sell_price * plan.sell_fee_bps / Decimal("10000")
-            + plan.withdrawal_fee * sell_price
+            record.buy_filled_amount * buy_avg_for_fee * plan.buy_fee_bps / Decimal("10000")
+            + filled * sell_avg * plan.sell_fee_bps / Decimal("10000")
+            + plan.withdrawal_fee * sell_avg
         )
         record = record.with_state(
             TransferState.COMPLETED,
