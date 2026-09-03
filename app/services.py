@@ -648,6 +648,10 @@ async def _init_watchlist(services: AppServices) -> None:
     assets.update(services.settings.transfer.assets)
     quote = services.settings.trading.base_currency
     watch: list[Symbol] = [Symbol(base=asset, quote=quote) for asset in sorted(assets)]
+    # Venue-specific listed sets: only include a cross for a venue if that
+    # venue actually lists it as active. The global watch is the union of
+    # per-venue actives, but the check below uses per-venue data.
+    listed_per_venue: dict[str, set[str]] = {}
     listed: set[str] = set()
     for venue in services.manager.enabled_ids():
         try:
@@ -655,9 +659,17 @@ async def _init_watchlist(services: AppServices) -> None:
         except Exception as exc:  # noqa: BLE001 - one venue failing is isolated
             logger.warning("load_markets_failed", extra={"venue": venue, "error": str(exc)})
             continue
+        venue_listed: set[str] = set()
         for market in markets:
+            if not market.active:
+                continue
+            venue_listed.add(market.symbol.name)
             listed.add(market.symbol.name)
-    # Cross pairs among the watched assets that at least one venue lists.
+        listed_per_venue[venue] = venue_listed
+    # Cross pairs among the watched assets that at least one venue lists as active.
+    # The watch remains global (union), but scanner will filter per-venue via
+    # _venue_spot_books, so a cross like AVAX/BNB that is only active on
+    # binance will not be attempted on okx/bybit.
     watched_assets = sorted(assets)
     for i, quote_asset in enumerate(watched_assets):
         for base_asset in watched_assets[i + 1 :]:
