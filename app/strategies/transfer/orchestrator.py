@@ -186,32 +186,75 @@ class TransferOrchestrator:
             )
             return None
 
-        requested = amount or self._settings.transfer.default_amount
         available_quote = await self._available_quote(source_id)
         buy_fees = await self._taker_fees(source_id, symbol)
         sell_fees = await self._taker_fees(dest_id, symbol)
 
-        # Price a reference size first, then size the trade honouring caps.
-        # The notional cap honours the *risk* trade-size limit too, so plans
-        # never propose something risk validation will reject on size.
-        max_notional = min(
-            self._settings.transfer.max_notional_quote,
-            self._settings.risk.max_trade_size,
-        )
-        probe = max(requested, route.withdrawal_min)
-        prices = price_pair(buy_book, sell_book, probe)
-        executable = self._planner.executable_amount(
-            requested_amount=requested,
-            withdrawal_min=route.withdrawal_min,
-            available_quote=available_quote,
-            buy_price=prices.buy_price,
-            max_amount=self._settings.transfer.max_amount,
-            max_notional=max_notional,
-        )
-        if executable <= DEC0:
-            return None
-        if executable != probe:
-            prices = price_pair(buy_book, sell_book, executable)
+        # Sizing: explicit `amount` (coin) overrides notional; otherwise
+        # derive coin amount from USDT notional $100-500 capped by risk and
+        # available quote.
+        if amount is not None:
+            requested = amount
+            max_notional = min(
+                self._settings.transfer.max_notional_quote,
+                self._settings.risk.max_trade_size,
+            )
+            probe = max(requested, route.withdrawal_min)
+            prices = price_pair(buy_book, sell_book, probe)
+            executable = self._planner.executable_amount(
+                requested_amount=requested,
+                withdrawal_min=route.withdrawal_min,
+                available_quote=available_quote,
+                buy_price=prices.buy_price,
+                max_amount=self._settings.transfer.max_amount,
+                max_notional=max_notional,
+            )
+            if executable <= DEC0:
+                return None
+            if executable != probe:
+                prices = price_pair(buy_book, sell_book, executable)
+        else:
+            min_notional = self._settings.transfer.min_notional_quote
+            max_notional = min(
+                self._settings.transfer.max_notional_quote,
+                self._settings.risk.max_trade_size,
+            )
+            # Cap by available quote before deriving amount
+            max_notional = min(max_notional, available_quote)
+            if max_notional < min_notional:
+                return None
+            # Estimate amount from max notional using best ask as proxy
+            est_price = buy_book.asks[0].price if buy_book.asks else DEC0
+            if est_price <= DEC0:
+                return None
+            est_amount = (max_notional / est_price).quantize(_QUANTUM)
+            est_amount = max(est_amount, route.withdrawal_min)
+            prices = price_pair(buy_book, sell_book, est_amount)
+            executable = self._planner.executable_amount_from_notional(
+                min_notional=min_notional,
+                max_notional=max_notional,
+                available_quote=available_quote,
+                buy_price=prices.buy_price,
+                withdrawal_min=route.withdrawal_min,
+                max_amount=self._settings.transfer.max_amount,
+            )
+            if executable <= DEC0:
+                return None
+            if executable != est_amount:
+                prices = price_pair(buy_book, sell_book, executable)
+                # Re-validate after repricing (buy_price may have moved)
+                executable = self._planner.executable_amount_from_notional(
+                    min_notional=min_notional,
+                    max_notional=max_notional,
+                    available_quote=available_quote,
+                    buy_price=prices.buy_price,
+                    withdrawal_min=route.withdrawal_min,
+                    max_amount=self._settings.transfer.max_amount,
+                )
+                if executable <= DEC0:
+                    return None
+                if executable != est_amount:
+                    prices = price_pair(buy_book, sell_book, executable)
         plan = self._planner.build(
             source_exchange=source_id,
             dest_exchange=dest_id,

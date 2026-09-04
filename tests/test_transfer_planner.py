@@ -45,8 +45,9 @@ def test_min_profit_rejection():
     from app.config.settings import Settings
 
     planner = TransferPlanner(Settings(_env_file=None))
-    # ~46.9 bps net: above the default 30 bps floor
+    # ~469 bps net (buy 100, sell 105) – above 70 bps floor -> accepted
     assert planner.evaluate(_plan()) is not None
+    assert _plan().net_profit_bps >= planner.min_net_profit_bps
     # Barely profitable plan below the floor -> rejected
     low = _plan(sell_price=D("100.5"))
     assert low.net_profit_bps < planner.min_net_profit_bps
@@ -109,3 +110,106 @@ def test_executable_amount_honours_constraints():
         buy_price=D("100"),
         max_amount=D("3"),
     ) == D("3")
+
+
+def test_default_transfer_assets_is_top50():
+    from app.config.settings import Settings, DEFAULT_TRANSFER_ASSETS
+
+    settings = Settings(_env_file=None)
+    assert len(settings.transfer.assets) == 50
+    assert len(DEFAULT_TRANSFER_ASSETS) == 50
+    # Must include core liquid assets and be supported on all venues
+    for core in ("BTC", "ETH", "SOL", "BNB", "XRP", "TRX"):
+        assert core in settings.transfer.assets
+    # Triangular unchanged
+    assert settings.arbitrage.triangle_assets == ("BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "LINK", "AVAX", "TRX")
+
+
+def test_transfer_min_net_profit_is_70bps():
+    from app.config.settings import Settings
+
+    settings = Settings(_env_file=None)
+    assert settings.transfer.min_net_profit_bps == D("70")
+
+
+def test_notional_sizing_100_500():
+    from app.config.settings import Settings
+
+    settings = Settings(_env_file=None)
+    assert settings.transfer.min_notional_quote == D("100")
+    assert settings.transfer.max_notional_quote == D("500")
+    planner = TransferPlanner(settings)
+    # $100 notional at 100 price => 1.0 coin; $500 => 5.0 coin
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("100"),
+        withdrawal_min=D("0.1"),
+    ) == D("5")
+    # available < min => 0
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("50"),
+        buy_price=D("100"),
+        withdrawal_min=D("0.1"),
+    ) == D("0")
+    # withdrawal_min violation
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("100"),
+        withdrawal_min=D("10"),
+    ) == D("0")
+    # max_amount cap truncates
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("100"),
+        withdrawal_min=D("0.1"),
+        max_amount=D("2"),
+    ) == D("2")
+    # amount*price < min after max_amount truncation => 0
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("100"),
+        withdrawal_min=D("0.1"),
+        max_amount=D("0.5"),
+    ) == D("0")
+    # cheap coin (SHIB) with tiny price: 500 / 0.00002 = 25M
+    assert planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("0.00002"),
+        withdrawal_min=D("1000000"),
+    ) == D("25000000.00000000")
+
+
+def test_notional_sizing_uses_buy_price():
+    from app.config.settings import Settings
+
+    planner = TransferPlanner(Settings(_env_file=None))
+    # $500 at 2500 price => 0.2 coin
+    amt = planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("2500"),
+        withdrawal_min=D("0.001"),
+    )
+    assert amt == D("0.20000000")
+    # $500 at 0.3 price => 1666.66 coin
+    amt2 = planner.executable_amount_from_notional(
+        min_notional=D("100"),
+        max_notional=D("500"),
+        available_quote=D("10000"),
+        buy_price=D("0.3"),
+        withdrawal_min=D("0.1"),
+    )
+    assert amt2 == (D("500") / D("0.3")).quantize(D("0.00000001"))

@@ -65,16 +65,61 @@ DEFAULT_TRIANGLE_ASSETS: tuple[str, ...] = (
 )
 
 #: Assets considered for transfer arbitrage by default.
+#: Top 50 by liquidity (market-cap / volume) where spot trading + withdrawal
+#: networks exist on Binance, OKX and Bybit.  The runtime still filters at
+#: plan time via `load_markets` / `fetch_withdrawal_networks` – this tuple is
+#: the *candidate* universe, not a guarantee of availability on every venue.
 DEFAULT_TRANSFER_ASSETS: tuple[str, ...] = (
     "BTC",
     "ETH",
     "SOL",
+    "BNB",
     "XRP",
     "ADA",
     "DOGE",
     "LINK",
     "AVAX",
     "TRX",
+    "LTC",
+    "DOT",
+    "BCH",
+    "UNI",
+    "ATOM",
+    "ETC",
+    "XLM",
+    "FIL",
+    "HBAR",
+    "APT",
+    "NEAR",
+    "ARB",
+    "OP",
+    "SUI",
+    "TAO",
+    "RNDR",
+    "MATIC",
+    "TON",
+    "SHIB",
+    "PEPE",
+    "AAVE",
+    "ENA",
+    "WIF",
+    "FLOKI",
+    "BONK",
+    "TIA",
+    "INJ",
+    "IMX",
+    "MKR",
+    "GRT",
+    "STX",
+    "FET",
+    "AR",
+    "SEI",
+    "JUP",
+    "ONDO",
+    "STRK",
+    "WLD",
+    "PYTH",
+    "JTO",
 )
 
 
@@ -269,13 +314,16 @@ class TransferSettings(_Section):
     #: Assets considered when scanning for transfer opportunities.
     assets: tuple[str, ...] = DEFAULT_TRANSFER_ASSETS
     #: Minimum net profit (bps) for a transfer plan to be executable.
-    min_net_profit_bps: Decimal = Field(default=Decimal("30"), ge=0)
+    min_net_profit_bps: Decimal = Field(default=Decimal("70"), ge=0)
     #: Default amount (in the transferred asset) when not specified explicitly.
+    #: Kept for explicit `amount` overrides; the auto-sizer uses notional below.
     default_amount: Decimal = Field(default=Decimal("1"), gt=0)
     #: Upper bound for amount when auto-sizing from a quote budget.
     max_amount: Decimal = Field(default=Decimal("10000"), gt=0)
+    #: Minimum quote budget spent on the buy leg of one transfer.
+    min_notional_quote: Decimal = Field(default=Decimal("100"), gt=0)
     #: Max quote budget spent on the buy leg of one transfer.
-    max_notional_quote: Decimal = Field(default=Decimal("5000"), gt=0)
+    max_notional_quote: Decimal = Field(default=Decimal("500"), gt=0)
     #: How long to wait for a deposit before flagging MANUAL_REVIEW (seconds).
     deposit_timeout_seconds: int = Field(default=3600, ge=60)
     #: Poll interval while tracking an in-flight transfer (seconds).

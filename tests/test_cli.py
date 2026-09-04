@@ -58,7 +58,8 @@ async def test_status_command_prints_structured_output(services: AppServices, ca
 
 
 async def test_balances_command_lists_venues(services: AppServices, capsys):
-    code = await cmd_balances(services, build_parser().parse_args(["balances"]))
+    # Use large limit so Top-50 universe (USDT is alphabetically late) is fully shown
+    code = await cmd_balances(services, build_parser().parse_args(["balances", "--limit", "100"]))
     assert code == 0
     out = capsys.readouterr().out
     assert "binance:" in out

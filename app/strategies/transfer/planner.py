@@ -144,3 +144,34 @@ class TransferPlanner:
         if amount <= DEC0 or amount < withdrawal_min:
             return DEC0
         return amount
+
+    def executable_amount_from_notional(
+        self,
+        *,
+        min_notional: Decimal,
+        max_notional: Decimal,
+        available_quote: Decimal,
+        buy_price: Decimal,
+        withdrawal_min: Decimal,
+        max_amount: Decimal | None = None,
+    ) -> Decimal:
+        """USDT-notional sizing: $100-500 → coin amount.
+
+        Caps `max_notional` by `available_quote`, requires `max_notional >=
+        min_notional`, derives `amount = max_notional / buy_price` (best
+        notional for absolute profit at same bps), honours `max_amount` and
+        `withdrawal_min`.  Returns ``0`` when nothing tradable remains.
+        """
+        effective_max = min(max_notional, available_quote)
+        if effective_max < min_notional or buy_price <= DEC0:
+            return DEC0
+        amount = (effective_max / buy_price).quantize(_QUANTUM)
+        if max_amount is not None:
+            amount = min(amount, max_amount)
+        amount = amount.quantize(_QUANTUM)
+        if amount <= DEC0 or amount < withdrawal_min:
+            return DEC0
+        # Ensure derived notional still >= min (covers max_amount truncation)
+        if amount * buy_price < min_notional:
+            return DEC0
+        return amount
