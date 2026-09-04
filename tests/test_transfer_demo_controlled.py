@@ -102,8 +102,8 @@ async def _demo_orchestrator(tmp_path: Path):
         "transfer": settings.transfer.model_copy(update={"simulated_transfer_seconds": 0.1, "poll_interval_seconds": 0.05}),
         "execution": settings.execution.model_copy(update={"leg_timeout_seconds": 0.3}),
     })
-    # Keep real thresholds: 70 and 10 (not -10000)
-    assert settings.transfer.min_net_profit_bps == D("70")
+    # Keep real thresholds: 50 and 10 (not -10000)
+    assert settings.transfer.min_net_profit_bps == D("50")
     assert settings.risk.min_net_profit_bps == D("10")
     db = Database(settings.database.model_copy(update={"url": f"sqlite+aiosqlite:///{tmp_path / 'demo.db'}"}))
     await db.create_schema()
@@ -150,9 +150,9 @@ async def test_demo_controlled_profitable_plan_found(tmp_path: Path):
     orchestrator, _, _, _, db, _, _ = await _demo_orchestrator(tmp_path)
     try:
         plans = await orchestrator.plan(asset="ETH", source="binance", dest="okx")
-        assert len(plans) == 1, f"expected 1 profitable plan above 70 bps, got {plans}"
+        assert len(plans) == 1, f"expected 1 profitable plan above 50 bps, got {plans}"
         plan = plans[0]
-        assert plan.net_profit_bps >= D("70"), f"net {plan.net_profit_bps} <70"
+        assert plan.net_profit_bps >= D("50"), f"net {plan.net_profit_bps} <50"
         assert plan.net_profit_bps < D("1000")  # sanity
         # Verify PnL includes all fees: net = gross - total_fees
         # gross = (sell - buy)*amount = (105-100)*5=25, total_fees = buy_fee 0.5 + sell_fee 0.525 + withdrawal 1.05 =2.075, net 22.925

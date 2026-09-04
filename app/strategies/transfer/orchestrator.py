@@ -186,6 +186,28 @@ class TransferOrchestrator:
             )
             return None
 
+        # Layer A+B market-data sanity guard (pure, no I/O beyond books)
+        from app.strategies.transfer.planner import validate_transfer_books
+
+        guard_reason = validate_transfer_books(
+            buy_book,
+            sell_book,
+            max_gross_divergence_bps=self._settings.transfer.max_transfer_gross_divergence_bps,
+        )
+        if guard_reason is not None:
+            logger.debug(
+                "transfer_sanity_rejected",
+                extra={
+                    "asset": asset,
+                    "from": source_id,
+                    "to": dest_id,
+                    "reason": guard_reason,
+                    "buy_ask": str(buy_book.best_ask) if buy_book.best_ask is not None else None,
+                    "sell_bid": str(sell_book.best_bid) if sell_book.best_bid is not None else None,
+                },
+            )
+            return None
+
         available_quote = await self._available_quote(source_id)
         buy_fees = await self._taker_fees(source_id, symbol)
         sell_fees = await self._taker_fees(dest_id, symbol)

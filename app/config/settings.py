@@ -314,7 +314,7 @@ class TransferSettings(_Section):
     #: Assets considered when scanning for transfer opportunities.
     assets: tuple[str, ...] = DEFAULT_TRANSFER_ASSETS
     #: Minimum net profit (bps) for a transfer plan to be executable.
-    min_net_profit_bps: Decimal = Field(default=Decimal("70"), ge=0)
+    min_net_profit_bps: Decimal = Field(default=Decimal("50"), ge=0)
     #: Default amount (in the transferred asset) when not specified explicitly.
     #: Kept for explicit `amount` overrides; the auto-sizer uses notional below.
     default_amount: Decimal = Field(default=Decimal("1"), gt=0)
@@ -324,6 +324,12 @@ class TransferSettings(_Section):
     min_notional_quote: Decimal = Field(default=Decimal("100"), gt=0)
     #: Max quote budget spent on the buy leg of one transfer.
     max_notional_quote: Decimal = Field(default=Decimal("500"), gt=0)
+    #: Maximum allowed gross price divergence between source and
+    #: destination venues (bps).  `gross = (sell_bid - buy_ask)/buy_ask*10000`.
+    #: Rejects absurd cross-venue quotes (e.g. STRK 0.026 vs 312).
+    max_transfer_gross_divergence_bps: Decimal = Field(
+        default=Decimal("5000"), ge=0
+    )
     #: How long to wait for a deposit before flagging MANUAL_REVIEW (seconds).
     deposit_timeout_seconds: int = Field(default=3600, ge=60)
     #: Poll interval while tracking an in-flight transfer (seconds).

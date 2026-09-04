@@ -23,10 +23,65 @@ from app.models.enums import OrderSide
 from app.models.market_data import OrderBook
 from app.models.transfer import TransferPlan
 
-__all__ = ["TransferPlanner", "price_pair"]
+__all__ = ["TransferPlanner", "price_pair", "validate_transfer_books"]
 
 _BPS = Decimal("10000")
 _QUANTUM = Decimal("0.00000001")
+
+#: Intra-book spread threshold for Layer A (1000 bps = 10 %).
+_MAX_INTRA_SPREAD_BPS = Decimal("1000")
+
+
+def validate_transfer_books(
+    buy_book: OrderBook,
+    sell_book: OrderBook,
+    *,
+    max_gross_divergence_bps: Decimal,
+) -> str | None:
+    """Pure market-data sanity guard for Transfer (Layers A + B).
+
+    Returns ``None`` when both books are sane, otherwise an explicit
+    rejection reason:
+
+    * ``invalid_book`` – missing best ask/bid, empty side, crossed book
+      (best bid ≥ best ask), or intra-book spread > 1000 bps.
+    * ``gross_divergence`` – cross-venue gross ``|gross| > max`` where
+      ``gross = (sell_bid - buy_ask) / buy_ask * 10000``.
+
+    No I/O, no symbol hard-coding, no side effects – fully testable.
+    """
+    # Layer A: per-book validity
+    buy_ask = buy_book.best_ask
+    sell_bid = sell_book.best_bid
+    if buy_ask is None or sell_bid is None:
+        return "invalid_book"
+    if not buy_book.asks or not sell_book.bids:
+        return "invalid_book"
+    if buy_book.is_crossed or sell_book.is_crossed:
+        return "invalid_book"
+    # best_bid < best_ask must hold (is_crossed already checks bid ≥ ask,
+    # but be explicit for clarity)
+    if buy_book.best_bid is not None and buy_book.best_bid >= buy_ask:
+        return "invalid_book"
+    if sell_book.best_bid is not None and sell_book.best_ask is not None:
+        if sell_book.best_bid >= sell_book.best_ask:
+            return "invalid_book"
+    # intra-book spread sanity
+    for book in (buy_book, sell_book):
+        mid = book.mid
+        if mid is None or mid <= DEC0:
+            continue
+        spread_bps = (book.best_ask - book.best_bid) / mid * _BPS  # type: ignore[operator]
+        if spread_bps > _MAX_INTRA_SPREAD_BPS:
+            return "invalid_book"
+
+    # Layer B: cross-venue gross divergence
+    if buy_ask <= DEC0:
+        return "invalid_book"
+    gross_bps = (sell_bid - buy_ask) / buy_ask * _BPS
+    if abs(gross_bps) > max_gross_divergence_bps:
+        return "gross_divergence"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
