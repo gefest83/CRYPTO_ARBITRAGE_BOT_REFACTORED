@@ -70,10 +70,13 @@ def test_base_config_still_carries_real_values_for_ccxt():
     assert config["password"] == PASSWORD
     assert config["uid"] == "uid-42"
     assert config["enableRateLimit"] is True
+    # signed-request clock-skew tolerance (Bybit 10002 mitigation)
+    assert config["options"] == {"recvWindow": 10000}
     # plain-dict semantics are untouched
     assert dict(config) == {
         "enableRateLimit": True,
         "timeout": 10_000,
+        "options": {"recvWindow": 10000},
         "apiKey": API_KEY,
         "secret": SECRET,
         "password": PASSWORD,
@@ -90,3 +93,5 @@ def test_config_authenticates_a_real_ccxt_client():
     client = ccxt.binance(config)
     assert client.apiKey == API_KEY
     assert client.secret == SECRET
+    # user options merge over exchange defaults (not replace them)
+    assert client.options.get("recvWindow") == 10000

@@ -449,6 +449,12 @@ class CCXTAdapter(BaseExchangeAdapter):
             {
                 "enableRateLimit": self._options.enable_rate_limit,
                 "timeout": int(self._options.timeout_seconds * 1000),
+                # Signed-request tolerance for local clock skew: Bybit DEMO
+                # intermittently rejects private calls with 10002 "timestamp
+                # outside of recvWindow" when the operator clock drifts a few
+                # seconds. 10s is still tight for replay protection and is
+                # ignored by venues that do not use recvWindow (e.g. OKX).
+                "options": {"recvWindow": 10000},
             }
         )
         if self._credentials is not None and not self._credentials.is_empty:
