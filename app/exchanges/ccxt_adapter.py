@@ -581,12 +581,12 @@ class CCXTAdapter(BaseExchangeAdapter):
         client = self._require_client()
         return await self._call_on(client, method, *args, **kwargs)
 
-    async def _call_on(self, client: Any, method: str, *args: Any) -> Any:
+    async def _call_on(self, client: Any, method: str, *args: Any, **kwargs: Any) -> Any:
         func = getattr(client, method, None)
         if func is None:
             raise self._unsupported(method)
         try:
-            return await func(*args)
+            return await func(*args, **kwargs)
         except (CapabilityNotSupportedError, ExchangeError):
             raise
         except Exception as exc:
@@ -608,7 +608,9 @@ class CCXTAdapter(BaseExchangeAdapter):
             if venue_code:
                 context["venue_code"] = venue_code
             if error_cls is CapabilityNotSupportedError:
-                raise error_cls(message, exchange_id=self.id, capability=method) from exc
+                raise error_cls(
+                    message, exchange_id=self.id, capability=method, venue_code=venue_code or None
+                ) from exc
             if error_cls is VenueAuthError:
                 raise error_cls(message, exchange_id=self.id, **context) from exc
             if error_cls is ExchangeUnavailableError:
@@ -813,7 +815,16 @@ class CCXTAdapter(BaseExchangeAdapter):
         orders: list[Order] = []
         for item in raw or ():
             item_symbol = item.get("symbol")
-            parsed = Symbol.parse(str(item_symbol)) if item_symbol else symbol
+            parsed: Symbol | None = symbol
+            if item_symbol:
+                try:
+                    parsed = Symbol.parse(str(item_symbol))
+                except Exception:
+                    # Non-unified venue symbol (e.g. BTCUSDT): fall back to the
+                    # requested symbol instead of tripping the breaker.
+                    parsed = symbol
+                if parsed is None:
+                    parsed = symbol
             if parsed is None:
                 continue
             orders.append(self._to_order(item, parsed))

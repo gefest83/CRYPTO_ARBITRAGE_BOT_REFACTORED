@@ -454,8 +454,14 @@ _HANDLERS = {
 
 async def run(args: argparse.Namespace) -> int:
     services = await build_app()
+    # Telegram polling + WS streams only matter for long-running processes.
+    # One-shot commands must not pay getMe / WS subscribe / poison-recovery /
+    # close costs on every invocation — REST priming is enough to print and exit.
+    long_running = args.command in ("telegram", "start_auto")
     try:
-        await start_app(services)
+        await start_app(
+            services, start_telegram=long_running, start_streams=long_running
+        )
         handler = _HANDLERS[args.command]
         return await handler(services, args)
     finally:

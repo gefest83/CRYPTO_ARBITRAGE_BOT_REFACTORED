@@ -96,6 +96,27 @@ class ConsoleFormatter(logging.Formatter):
     def __init__(self) -> None:
         super().__init__(fmt=self.default_format, datefmt="%H:%M:%S")
 
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        # Console output must carry the structured context (exchange/symbol/
+        # error/...) — otherwise `stream_failed` / `ccxt_call_failed` /
+        # `market_symbol_unsupported` are opaque and the operator cannot see
+        # the REAL underlying exception without switching to JSON logs.
+        extras: list[str] = []
+        for key, value in record.__dict__.items():
+            if key in _RESERVED or key.startswith("_"):
+                continue
+            try:
+                text = str(value)
+            except Exception:
+                continue
+            if len(text) > 300:
+                text = text[:297] + "..."
+            extras.append(f"{key}={text}")
+        if extras:
+            return f"{base} | {' '.join(extras)}"
+        return base
+
 
 def _jsonable(value: Any) -> Any:
     if isinstance(value, str | int | float | bool | type(None)):

@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import asyncio
 
-from app.market_data.streams import StreamSpec, StreamSupervisor
+from app.market_data.streams import (
+    StreamSpec,
+    StreamSupervisor,
+    extract_ws_culprit_symbol,
+    is_permanent_stream_error,
+)
 from app.models.enums import StreamKind
 
 SPEC_A = StreamSpec("binance", "ETH/USDT", StreamKind.ORDER_BOOK)
@@ -110,5 +115,53 @@ async def test_cancelled_stream_releases_both_permits_it_held():
         # slot can start again and deliver.
         await supervisor.start_stream(SPEC_A, _feed("a2"), received.append)
         assert await _wait_for_tag(received, "a2")
+    finally:
+        await supervisor.stop_all()
+
+
+class _BadSymbol(Exception):
+    pass
+
+
+def test_permanent_stream_error_detects_bad_symbol_and_okx_60018():
+    """BadSymbol / OKX 60018 'doesn't exist' are permanent listing facts."""
+    assert is_permanent_stream_error(_BadSymbol("okx does not have market symbol AR/USDT"))
+    okx_60018 = Exception(
+        'okx {"event":"error","msg":"Subscribe failed, wrong URL or channel:books,'
+        'instId:MATIC-USDT doesn\'t exist. Please use the correct URL","code":"60018"}'
+    )
+    assert is_permanent_stream_error(okx_60018)
+    assert not is_permanent_stream_error(Exception("NetworkError: connection reset"))
+
+
+def test_extract_ws_culprit_symbol_parses_okx_inst_id():
+    """The shared-connection poison names its culprit via instId."""
+    err = Exception(
+        'okx {"event":"error","msg":"Subscribe failed, wrong URL or channel:books,'
+        'instId:AVAX-BTC doesn\'t exist.","code":"60018"}'
+    )
+    assert extract_ws_culprit_symbol(err) == "AVAX/BTC"
+    assert extract_ws_culprit_symbol(Exception("plain timeout")) is None
+
+
+async def test_permanent_error_suspends_immediately_without_retries():
+    """A BadSymbol stream suspends on the first failure (no 5x retry storm)."""
+
+    async def _bad():
+        raise _BadSymbol("okx does not have market symbol AR/USDT")
+        yield  # pragma: no cover - makes this an async generator
+
+    supervisor = StreamSupervisor(
+        quarantine_restarts=5, quarantine_after_seconds=45.0, max_streams_per_exchange=4
+    )
+    try:
+        spec = StreamSpec("okx", "AR/USDT", StreamKind.ORDER_BOOK)
+        await supervisor.start_stream(spec, _bad, lambda event: None)
+        await asyncio.sleep(0.3)
+        status = supervisor.get_status(spec)
+        assert status is not None
+        # Suspended immediately: exactly one failure, no reconnect loop.
+        assert status.consecutive_failures == 1
+        assert status.total_restarts == 0
     finally:
         await supervisor.stop_all()

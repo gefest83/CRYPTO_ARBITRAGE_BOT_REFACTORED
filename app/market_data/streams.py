@@ -48,6 +48,81 @@ def reconnect_log_level(total_restarts: int, *, repeat_limit: int) -> int:
     return logging.INFO if total_restarts <= max(0, repeat_limit) else logging.DEBUG
 
 
+#: Exception class names that mean "this (venue, symbol) pair will never work"
+#: — e.g. ccxt BadSymbol for a market the venue does not list. Retrying such
+#: a stream 5x over 45s only burns WS slots / rate limit and floods the log;
+#: the stream must suspend immediately and let REST mark the pair unsupported.
+_PERMANENT_STREAM_ERROR_NAMES = frozenset({"BadSymbol", "NotSupported", "ArgumentsRequired"})
+
+
+def is_permanent_stream_error(exc: BaseException) -> bool:
+    """True when `exc` (or any chained cause) is a permanent listing fact."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        names = {cls.__name__ for cls in type(current).__mro__}
+        if names & _PERMANENT_STREAM_ERROR_NAMES:
+            return True
+        # ccxt phrases the same fact as plain ExchangeError text.
+        message = str(current).lower()
+        if (
+            "does not have market symbol" in message
+            or "symbol not found" in message
+            # OKX WS: one delisted instId (e.g. MATIC-USDT after the POL
+            # migration) poisons the shared connection — every stream on it
+            # fails with code 60018 "doesn't exist". The culprit pair will
+            # never subscribe; it must be marked unsupported, not retried.
+            or "doesn't exist" in message
+            or "does not exist" in message
+            or ("subscribe failed" in message and "wrong url or channel" in message)
+        ):
+            return True
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+    return False
+
+
+def extract_ws_culprit_symbol(exc: BaseException) -> str | None:
+    """Unified ``BASE/QUOTE`` named by a WS subscription error, if any.
+
+    OKX multiplexes all subscriptions over one connection, so a single bad
+    instId (``instId:MATIC-USDT``) raises on *every* stream sharing the
+    connection — including healthy ones like BTC/USDT. The error text names
+    the real culprit; callers use it to mark exactly that pair unsupported
+    instead of penalising the innocent stream that happened to surface it.
+    """
+    import re
+
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    pattern = re.compile(r"instId\s*:\s*([A-Za-z0-9]+)-([A-Za-z0-9]+)", re.IGNORECASE)
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        match = pattern.search(str(current))
+        if match:
+            base, quote = match.group(1).upper(), match.group(2).upper()
+            # OKX uses USDT/USDC/BTC/ETH as quote; default to USDT shape.
+            return f"{base}/{quote}"
+        cause = getattr(current, "__cause__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        context = getattr(current, "__context__", None)
+        if isinstance(context, BaseException):
+            stack.append(context)
+    return None
+
+
 @dataclass(slots=True)
 class _StreamTask:
     """Internal state for a supervised stream."""
@@ -224,28 +299,89 @@ class StreamSupervisor:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any stream failure triggers restart
-                state.consecutive_failures += 1
-                state.last_error = str(exc)
-                if state.consecutive_failures < 3:
-                    state.status = HealthStatus.DEGRADED
+                # Permanent listing facts (BadSymbol / unknown market) never
+                # become healthy by retrying: suspend immediately so the slot
+                # is freed and REST can mark the pair unsupported once.
+                # Shared-connection poisoning (OKX: one bad instId fails every
+                # stream on the connection) is the exception: when the error
+                # names a DIFFERENT pair than this stream, this stream is
+                # innocent — back off and retry while the culprit's own stream
+                # suspends itself permanently.
+                if is_permanent_stream_error(exc):
+                    culprit = extract_ws_culprit_symbol(exc)
+                    if culprit is not None and culprit != state.spec.symbol:
+                        state.consecutive_failures += 1
+                        state.last_error = str(exc)[:300]
+                        state.status = (
+                            HealthStatus.DEGRADED
+                            if state.consecutive_failures < 3
+                            else HealthStatus.UNHEALTHY
+                        )
+                        logger.log(
+                            failure_log_level(
+                                state.consecutive_failures,
+                                repeat_limit=self._log_repeat_limit,
+                            ),
+                            "stream_poisoned_by_other_symbol",
+                            extra={
+                                "exchange_id": state.spec.exchange_id,
+                                "symbol": state.spec.symbol,
+                                "kind": state.spec.kind.value,
+                                "culprit_symbol": culprit,
+                                "error": str(exc)[:200],
+                                "consecutive_failures": state.consecutive_failures,
+                            },
+                        )
+                    else:
+                        state.consecutive_failures += 1
+                        state.last_error = str(exc)[:300]
+                        state.suspended = True
+                        state.status = HealthStatus.UNKNOWN
+                        logger.info(
+                            "stream_suspended_unsupported",
+                            extra={
+                                "exchange_id": state.spec.exchange_id,
+                                "symbol": state.spec.symbol,
+                                "kind": state.spec.kind.value,
+                                "market_type": state.spec.market_type,
+                                "last_error": state.last_error,
+                                "culprit_symbol": culprit or state.spec.symbol,
+                                "reason": "venue does not list this market; REST marks it unsupported",
+                            },
+                        )
+                        break
                 else:
-                    state.status = HealthStatus.UNHEALTHY
-                logger.log(
-                    failure_log_level(
-                        state.consecutive_failures, repeat_limit=self._log_repeat_limit
-                    ),
-                    "stream_failed",
-                    extra={
-                        "exchange_id": state.spec.exchange_id,
-                        "symbol": state.spec.symbol,
-                        "kind": state.spec.kind.value,
-                        "error": str(exc),
-                        "consecutive_failures": state.consecutive_failures,
-                    },
-                )
+                    state.consecutive_failures += 1
+                    state.last_error = str(exc)
+                    if state.consecutive_failures < 3:
+                        state.status = HealthStatus.DEGRADED
+                    else:
+                        state.status = HealthStatus.UNHEALTHY
+                    logger.log(
+                        failure_log_level(
+                            state.consecutive_failures, repeat_limit=self._log_repeat_limit
+                        ),
+                        "stream_failed",
+                        extra={
+                            "exchange_id": state.spec.exchange_id,
+                            "symbol": state.spec.symbol,
+                            "kind": state.spec.kind.value,
+                            "error": str(exc),
+                            "consecutive_failures": state.consecutive_failures,
+                        },
+                    )
             finally:
+                iterator_to_close = state.iterator
                 state.iterator = None
-                ex_sem.release()
+                if iterator_to_close is not None:
+                    aclose = getattr(iterator_to_close, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
+                if ex_sem is not None:
+                    ex_sem.release()
                 self._semaphore.release()
 
             if state.stopped:
@@ -296,6 +432,7 @@ class StreamSupervisor:
                     "kind": state.spec.kind.value,
                     "backoff_seconds": round(state.backoff_seconds, 2),
                     "total_restarts": state.total_restarts,
+                    "last_error": (state.last_error or "")[:160],
                 },
             )
 

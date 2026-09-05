@@ -37,7 +37,15 @@ logger = get_logger("market_data.service")
 
 #: A stream whose last event is older than this is no longer trusted to cover
 #: its pair; REST refresh takes over (fixes silently-stalled-stream starvation).
-STREAM_INACTIVITY_SECONDS = 30.0
+#: Kept close to the freshness horizon (stale 2s / risk 2.5s) so a stalled WS
+#: does not mask its pair as "covered" while scanners reject it as stale.
+STREAM_INACTIVITY_SECONDS = 10.0
+
+#: Upper bound for one REST refresh round. Individual ccxt calls already have
+#: their own timeout, but a 99-symbol x 3-venue round with per-venue
+#: concurrency limits could otherwise stall market-data priming for minutes
+#: when one demo host is slow — every other venue's data goes stale meanwhile.
+REFRESH_ROUND_TIMEOUT_SECONDS = 90.0
 
 
 def _ticker_stream_factory(
@@ -118,6 +126,23 @@ class MarketDataService:
     def stream_supervisor(self) -> StreamSupervisor | None:
         return self._stream_supervisor
 
+    def mark_unsupported(self, venue: str, symbol_name: str, reason: str = "not listed") -> None:
+        """Pre-seed a (venue, symbol) pair as permanently unsupported.
+
+        Used at startup with the `load_markets` active sets so neither WS
+        streams nor REST refresh ever spend a request on a market the venue
+        does not list — without this, a 50-asset universe burns ~200 dead
+        streams (5 retries each) plus matching REST calls on every boot.
+        """
+        key = (venue.strip().lower(), symbol_name)
+        if key in self._unsupported_pairs:
+            return
+        self._unsupported_pairs.add(key)
+        logger.info(
+            "market_symbol_unsupported",
+            extra={"exchange_id": venue.strip().lower(), "symbol": symbol_name, "reason": reason[:160]},
+        )
+
     # ---------------------------------------------------------------- streams
     async def start_streams(
         self,
@@ -130,6 +155,8 @@ class MarketDataService:
         The supervisor limits are admission limits: a spec that does not fit
         the global/per-venue budget is *not* registered — it stays
         REST-refreshable instead of occupying a semaphore slot forever.
+        Pairs already known to be unsupported (BadSymbol / not listed) are
+        never streamed.
         """
         if self._stream_supervisor is None:
             logger.info("streams_disabled", extra={"reason": "streams_enabled=false in config"})
@@ -138,39 +165,51 @@ class MarketDataService:
         supervisor = self._stream_supervisor
         venues = tuple(exchange_ids or self._manager.enabled_ids())
 
+        # Order books drive execution (triangular + transfer); tickers are
+        # auxiliary (status/preflight). With a 50-asset universe the per-venue
+        # budget cannot cover ticker+book for every symbol, so books go first
+        # — otherwise the first 24 alphabetical symbols consume the whole
+        # budget and the remaining USDT pairs never get WS coverage.
+        # Cross pairs (non-USDT quote) are REST-only: OKX/Bybit WS rejects
+        # several REST-listed crosses (e.g. LINK/BTC, AVAX/BTC) with 60018,
+        # and one bad cross poisons the whole shared WS connection for every
+        # other symbol. USDT pairs stream; crosses refresh via REST (fast:
+        # ~20 books for the triangle universe).
+        try:
+            _base_ccy = self._manager._settings.trading.base_currency  # type: ignore[attr-defined]
+        except Exception:
+            _base_ccy = "USDT"
+        book_symbols = [s for s in symbols if s.quote == _base_ccy]
+        if not book_symbols:
+            book_symbols = list(symbols)
         for venue in venues:
             if self._manager.is_breaker_open(venue):
                 continue
-            for symbol in symbols:
+            adapter = self._manager.adapter(venue)
+            has_ticker_stream = adapter.capabilities.watch_ticker
+            has_book_stream = adapter.capabilities.watch_order_book
+            if not has_ticker_stream and not has_book_stream:
+                continue
+            # Pass 1: order books for USDT pairs only (crosses are REST-only).
+            for symbol in book_symbols:
+                if (venue.strip().lower(), symbol.name) in self._unsupported_pairs:
+                    continue
                 if supervisor.registered_count() >= self._config.max_parallel_streams:
                     logger.info(
                         "streams_global_budget_exhausted",
-                        extra={"limit": self._config.max_parallel_streams},
+                        extra={
+                            "limit": self._config.max_parallel_streams,
+                            "skipped_exchange_id": venue,
+                            "skipped_symbol": symbol.name,
+                        },
                     )
                     return
-                adapter = self._manager.adapter(venue)
-                has_ticker_stream = adapter.capabilities.watch_ticker
-                has_book_stream = adapter.capabilities.watch_order_book
-                if not has_ticker_stream and not has_book_stream:
-                    continue
-
                 per_venue_budget = (
                     self._config.max_streams_per_exchange - supervisor.registered_count(venue)
                 )
                 if per_venue_budget <= 0:
-                    break  # this venue is fully streamed; move to the next venue
-
-                if has_ticker_stream:
-                    spec = StreamSpec(exchange_id=venue, symbol=symbol.name, kind=StreamKind.TICKER)
-                    if not supervisor.is_running(spec):
-                        await supervisor.start_stream(
-                            spec,
-                            _ticker_stream_factory(adapter, symbol),
-                            self._make_stream_handler(StreamKind.TICKER),
-                        )
-                        per_venue_budget -= 1
-
-                if has_book_stream and per_venue_budget > 0:
+                    break
+                if has_book_stream:
                     spec = StreamSpec(
                         exchange_id=venue, symbol=symbol.name, kind=StreamKind.ORDER_BOOK
                     )
@@ -179,6 +218,25 @@ class MarketDataService:
                             spec,
                             _book_stream_factory(adapter, symbol),
                             self._make_stream_handler(StreamKind.ORDER_BOOK),
+                        )
+            # Pass 2: tickers only with leftover budget (USDT pairs only).
+            for symbol in book_symbols:
+                if (venue.strip().lower(), symbol.name) in self._unsupported_pairs:
+                    continue
+                if supervisor.registered_count() >= self._config.max_parallel_streams:
+                    return
+                per_venue_budget = (
+                    self._config.max_streams_per_exchange - supervisor.registered_count(venue)
+                )
+                if per_venue_budget <= 0:
+                    break
+                if has_ticker_stream:
+                    spec = StreamSpec(exchange_id=venue, symbol=symbol.name, kind=StreamKind.TICKER)
+                    if not supervisor.is_running(spec):
+                        await supervisor.start_stream(
+                            spec,
+                            _ticker_stream_factory(adapter, symbol),
+                            self._make_stream_handler(StreamKind.TICKER),
                         )
                         per_venue_budget -= 1
 
@@ -216,10 +274,13 @@ class MarketDataService:
                 continue
             if status.status is HealthStatus.UNKNOWN:
                 continue
-            if (
-                status.last_event_at is not None
-                and (now - status.last_event_at).total_seconds() > STREAM_INACTIVITY_SECONDS
-            ):
+            # A stream that never delivered anything covers nothing — without
+            # this, warming streams (HEALTHY, last_event None) falsely claim
+            # coverage, REST skips them, and the store stays empty while the
+            # warmup reports "covered".
+            if status.last_event_at is None:
+                continue
+            if (now - status.last_event_at).total_seconds() > STREAM_INACTIVITY_SECONDS:
                 continue
             covered.add((status.exchange_id, status.symbol))
         return covered
@@ -314,12 +375,28 @@ class MarketDataService:
                 succeeded += 1
                 self._manager.record_success(venue)
 
-        await asyncio.gather(*(fetch(venue, symbol) for venue, symbol in targets))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(fetch(venue, symbol) for venue, symbol in targets)),
+                timeout=REFRESH_ROUND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "market_data_refresh_timeout",
+                extra={
+                    "kind": kind,
+                    "requested": len(targets),
+                    "ok": succeeded,
+                    "failed": len(failures),
+                    "timeout_seconds": REFRESH_ROUND_TIMEOUT_SECONDS,
+                },
+            )
 
         if failures:
+            sample = "; ".join(f"{venue}:{message[:120]}" for venue, message in failures[:5])
             logger.info(
                 "market_data_refresh_partial",
-                extra={"kind": kind, "failed": len(failures), "ok": succeeded},
+                extra={"kind": kind, "failed": len(failures), "ok": succeeded, "sample": sample},
             )
         return RefreshOutcome(requested=len(targets), succeeded=succeeded, failures=tuple(failures))
 

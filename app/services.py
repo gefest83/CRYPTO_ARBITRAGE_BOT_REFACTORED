@@ -546,7 +546,9 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     return services
 
 
-async def start_app(services: AppServices) -> None:
+async def start_app(
+    services: AppServices, *, start_telegram: bool = True, start_streams: bool = True
+) -> None:
     """Open adapters, prime market data, restore runtime flags and transfers."""
     await services.manager.open_all()
     # DEMO preflight: verify credentials/balances/fees/market data per venue
@@ -561,11 +563,25 @@ async def start_app(services: AppServices) -> None:
     await _init_paper_wallets(services)
     await _init_watchlist(services)
 
-    # Streams first (WebSocket-first policy), then a REST round for every
-    # pair no stream covers yet.
-    if services.settings.market_data.streams_enabled:
+    # REST-prime USDT pairs BEFORE starting WS streams: ccxt.pro clients
+    # share rate limits / connections between WS subscriptions and REST, so
+    # priming while 150 WS streams (re)subscribe — especially during an OKX
+    # poison-recovery wave — stalls REST for minutes. REST-first (10s, no WS
+    # contention), then WS streams take over live updates for the same pairs.
+    # Crosses (triangle-only) are fetched on demand by the first scan.
+    _base_ccy = services.settings.trading.base_currency
+    _prime_symbols = tuple(s for s in services.watch_symbols if s.quote == _base_ccy) or services.watch_symbols
+    await services.market.refresh_order_books(_prime_symbols)
+    # Long-running processes (telegram / start_auto) keep live WS streams;
+    # one-shot CLI commands (status/scan/...) use REST-only priming above and
+    # skip WS entirely — otherwise every short command pays WS subscribe,
+    # poison-recovery and close costs (minutes) just to print and exit.
+    if start_streams and services.settings.market_data.streams_enabled:
         await services.market.start_streams(services.watch_symbols)
-    await services.market.refresh_order_books(services.watch_symbols)
+        try:
+            await asyncio.wait_for(_wait_for_ws_warmup(services), timeout=8.0)
+        except TimeoutError:
+            pass
 
     if await services.auto_trading_enabled():
         services.guard.enable_trading(enabled=True)
@@ -585,7 +601,11 @@ async def start_app(services: AppServices) -> None:
 
     # Telegram operator interface: optional, fail-safe.  A startup failure
     # never blocks the bot (auto trading is unaffected) and never enables it.
-    await _start_telegram(services)
+    # One-shot CLI commands (status/scan/balances/...) skip it entirely —
+    # the Telegram getMe round-trip (often 60-90s to api.telegram.org from
+    # this network) would otherwise dominate every short command.
+    if start_telegram:
+        await _start_telegram(services)
 
 
 async def shutdown_app(services: AppServices) -> None:
@@ -642,8 +662,47 @@ async def _init_paper_wallets(services: AppServices) -> None:
                 wallet.__init__({"USDT": Decimal("10000")})
 
 
+async def _wait_for_ws_warmup(services: AppServices) -> None:
+    """Wait until WS streams cover a useful share of the watchlist.
+
+    Returns early once at least half of the supported (venue, symbol) book
+    pairs are delivering via WS, or after the caller's timeout. Prevents the
+    REST priming round from duplicating WS work on every boot.
+    """
+    from app.models.enums import StreamKind
+
+    watch = services.watch_symbols
+    if not watch:
+        return
+    supported_total = 0
+    for venue in services.manager.enabled_ids():
+        for symbol in watch:
+            if (venue.strip().lower(), symbol.name) not in services.market._unsupported_pairs:
+                supported_total += 1
+    if supported_total <= 0:
+        return
+    target = max(1, supported_total // 2)
+    for _ in range(80):  # up to ~8s at 0.1s polls; caller caps with wait_for
+        covered = services.market.get_stream_covered_pairs(StreamKind.ORDER_BOOK)
+        if len(covered) >= target:
+            logger.info(
+                "ws_warmup_covered",
+                extra={"covered": len(covered), "supported": supported_total},
+            )
+            return
+        await asyncio.sleep(0.1)
+
+
 async def _init_watchlist(services: AppServices) -> None:
-    """Build the watchlist: USDT pairs of the triangle assets + their crosses."""
+    """Build the watchlist: USDT pairs of all assets + triangle crosses.
+
+    USDT legs cover the full transfer universe (50 assets) plus triangular
+    legs. Cross pairs (X/Y) are only needed by the triangular scanner, which
+    walks cycles among `triangle_assets` (10 assets) — crosses among the
+    wider 50-asset transfer universe are never scanned, so including them
+    only burns WS slots / REST calls and widens the WS-poisoning surface
+    (e.g. OKX rejects ATOM/ETH over WS while REST lists it).
+    """
     assets = set(services.settings.arbitrage.triangle_assets)
     assets.update(services.settings.transfer.assets)
     quote = services.settings.trading.base_currency
@@ -666,11 +725,12 @@ async def _init_watchlist(services: AppServices) -> None:
             venue_listed.add(market.symbol.name)
             listed.add(market.symbol.name)
         listed_per_venue[venue] = venue_listed
-    # Cross pairs among the watched assets that at least one venue lists as active.
+    # Cross pairs among the TRIANGLE assets only (the scanner's cycle universe)
+    # that at least one venue lists as active.
     # The watch remains global (union), but scanner will filter per-venue via
     # _venue_spot_books, so a cross like AVAX/BNB that is only active on
     # binance will not be attempted on okx/bybit.
-    watched_assets = sorted(assets)
+    watched_assets = sorted(set(services.settings.arbitrage.triangle_assets))
     for i, quote_asset in enumerate(watched_assets):
         for base_asset in watched_assets[i + 1 :]:
             for name in (f"{base_asset}/{quote_asset}", f"{quote_asset}/{base_asset}"):
@@ -678,6 +738,29 @@ async def _init_watchlist(services: AppServices) -> None:
                     watch.append(Symbol.parse(name))
                     break
     services.watch_symbols = tuple(dict.fromkeys(watch))
+    # Pre-seed permanently-unsupported (venue, symbol) pairs from the
+    # load_markets active sets: a market no venue lists as active never
+    # enters the watch at all (cross filter above), but a market listed on
+    # one venue and missing on another must not burn WS retries + REST calls
+    # on the venue that lacks it. Seeding here makes both start_streams and
+    # refresh_order_books skip those pairs without any network attempt.
+    if listed_per_venue:
+        seeded = 0
+        for venue, venue_listed in listed_per_venue.items():
+            for symbol in services.watch_symbols:
+                if symbol.name not in venue_listed:
+                    try:
+                        services.market.mark_unsupported(
+                            venue, symbol.name, "not listed (load_markets)"
+                        )
+                        seeded += 1
+                    except Exception:
+                        pass
+        if seeded:
+            logger.info(
+                "watchlist_unsupported_seeded",
+                extra={"pairs": seeded, "symbols": len(services.watch_symbols)},
+            )
 
 
 async def _build_precision(manager) -> StaticPrecisionProvider:
