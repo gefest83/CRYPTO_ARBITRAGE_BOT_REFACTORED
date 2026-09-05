@@ -134,22 +134,497 @@ class TransferOrchestrator:
         source: str | None = None,
         dest: str | None = None,
     ) -> list[TransferPlan]:
-        """Scan venues for profitable transfer plans (no execution)."""
+        """Scan venues for profitable transfer plans (no execution).
+
+        Performance: per-cycle memoization + bounded concurrency.
+
+        * ``available_quote`` cached per venue (3 fetches / cycle, not 300)
+        * ``taker_fees`` cached per venue (3 fetches / cycle, not 600)
+        * ``withdrawal_networks`` cached per (asset, venue) (≤150 / cycle)
+        * stale books deduped: each (venue, symbol) refreshed at most once
+          via a single batched ``refresh_order_books`` before the scan, then
+          the scan uses a frozen snapshot (no per-route REST).
+        * independent routes evaluated concurrently with a bounded semaphore
+          derived from ``market_data.max_parallel_requests`` (default 16).
+        """
+        import time
+        from collections import Counter
+
+        t_start = time.monotonic()
         assets = [asset.strip().upper()] if asset else list(self._settings.transfer.assets)
         venues = list(self._manager.enabled_ids())
         sources = [source.strip().lower()] if source else venues
         dests = [dest.strip().lower()] if dest else venues
+
+        # Fast path for single-asset/single-route callers (tests, CLI) — keep
+        # sequential semantics to avoid overhead.
+        single_route = asset is not None and source is not None and dest is not None
+        if single_route:
+            # Still benefit from the stale-book dedup path below, but avoid
+            # concurrency machinery.
+            pass
+
+        # ---- per-cycle caches (scoped to this call) ----
+        balance_cache: dict[str, Decimal] = {}
+        fee_cache: dict[str, Decimal] = {}
+        network_cache: dict[tuple[str, str], tuple] = {}
+
+        # ---- deduplicated book refresh (at most once per (venue,symbol)) ----
+        # ``services.plan_transfers`` already called ``ensure_market_data`` for
+        # the whole watchlist, but that refresh can take >stale_after (2s) so
+        # books may be stale on entry.  We do one bounded batch for the
+        # transfer universe only, gathering per-venue missing/stale symbols and
+        # refreshing them concurrently.  After this point the scan freezes a
+        # snapshot and never triggers per-route REST.
+        base_quote = self._settings.trading.base_currency
+        symbol_by_asset: dict[str, Symbol] = {
+            a: Symbol(base=a, quote=base_quote) for a in assets
+        }
+        book_refresh_calls = 0
+        refreshed_keys: set[tuple[str, str]] = set()
+        if self._market is not None and getattr(self._market, "refresh_order_books", None):
+            # Collect stale/missing per venue
+            stale_by_venue: dict[str, list[Symbol]] = {v: [] for v in venues}
+            for a in assets:
+                sym = symbol_by_asset[a]
+                for v in venues:
+                    book = self._store.order_book(v, sym)
+                    if book is None or self._store.is_stale(self._store.age_ms(book)):
+                        # Deduplicate symbols per venue
+                        if sym not in stale_by_venue[v]:
+                            stale_by_venue[v].append(sym)
+            # Only refresh if we have work and the mode allows (DEMO LIVE both
+            # benefit, PAPER wallets don't need live books but we keep it safe)
+            need_refresh = any(stale_by_venue.values())
+            if need_refresh:
+                refreshed_keys = {(v, s.base) for v, syms in stale_by_venue.items() for s in syms}
+                # Bounded parallelism: one task per venue (≤3) – reuses the
+                # market service's own semaphores (max_parallel_requests 16)
+                async def _refresh_one_venue(venue: str, symbols: list[Symbol]) -> None:
+                    nonlocal book_refresh_calls
+                    try:
+                        await self._market.refresh_order_books(tuple(symbols), exchange_ids=[venue])
+                    except Exception:
+                        pass
+                    book_refresh_calls += 1
+
+                await asyncio.gather(
+                    *(_refresh_one_venue(v, syms) for v, syms in stale_by_venue.items() if syms),
+                    return_exceptions=True,
+                )
+
+        # Freeze snapshot after the single batch (no per-route refresh)
+        # Snapshot maps (venue, asset) -> OrderBook or None
+        book_snapshot: dict[tuple[str, str], object] = {}
+        for a in assets:
+            sym = symbol_by_asset[a]
+            for v in venues:
+                book_snapshot[(v, a)] = self._store.order_book(v, sym)
+
+        # ---- pre-warm per-venue caches concurrently (balances + fees) ----
+        # Balances: one fetch per unique venue (not per route)
+        balance_calls = 0
+        fee_calls = 0
+
+        async def _warm_balance(venue: str) -> None:
+            nonlocal balance_calls
+            try:
+                # _available_quote handles PAPER vs DEMO/LIVE and returns DEC0 on error
+                val = await self._available_quote(venue)
+                balance_cache[venue] = val
+                balance_calls += 1
+            except Exception:
+                balance_cache[venue] = DEC0
+
+        async def _warm_fee(venue: str) -> None:
+            nonlocal fee_calls
+            try:
+                # Use first asset's symbol as fee probe (fees are per venue in DEMO)
+                probe = symbol_by_asset[assets[0]] if assets else Symbol(base="BTC", quote=base_quote)
+                val = await self._taker_fees(venue, probe)
+                fee_cache[venue] = val
+                fee_calls += 1
+            except Exception:
+                fee_cache[venue] = Decimal("10")
+
+        # Only warm for venues that actually appear as source/dest in this scan
+        warm_venues = set(sources) | set(dests)
+        await asyncio.gather(
+            *(_warm_balance(v) for v in warm_venues),
+            *(_warm_fee(v) for v in warm_venues),
+            return_exceptions=True,
+        )
+
+        # Pre-warm networks for all needed (asset,venue) combos once (≤150)
+        # Simple, deterministic, bounded concurrency
+        network_calls = 0
+        unique_network_keys = {(a, v) for a in assets for v in venues}
+        # Bound concurrency for network fetches (reuse market_data limit)
+        net_sem = asyncio.Semaphore(max(1, self._settings.market_data.max_parallel_requests))
+
+        async def _warm_network(asset_code: str, venue: str) -> None:
+            nonlocal network_calls
+            async with net_sem:
+                try:
+                    nets = await self._manager.adapter(venue).fetch_withdrawal_networks(asset_code)
+                    network_cache[(asset_code, venue)] = nets
+                    network_calls += 1
+                except Exception:
+                    # Cache empty to avoid re-fetching failing pair repeatedly
+                    network_cache[(asset_code, venue)] = ()  # type: ignore
+
+        # Only warm networks for bulk scan; single-route caller avoids 150-call overhead
+        if not single_route:
+            await asyncio.gather(
+                *(_warm_network(a, v) for a, v in unique_network_keys),
+                return_exceptions=True,
+            )
+
+        # Helper that reads from pre-warmed cache
+        def _get_cached_networks(asset_code: str, venue: str):
+            return network_cache.get((asset_code, venue), ())
+
+        # ---- concurrent route evaluation ----
+        # Bound route workers to market_data.max_parallel_requests (default 16)
+        # This caps simultaneous CPU+cache reads without bursting the exchange.
+        route_concurrency = max(4, min(32, int(self._settings.market_data.max_parallel_requests)))
+        sem = asyncio.Semaphore(route_concurrency)
+
+        counters = Counter(
+            {
+                "total": 0,
+                "no_book": 0,
+                "stale": 0,
+                "invalid_book": 0,
+                "gross_divergence": 0,
+                "network": 0,
+                "sizing": 0,
+                "pricing": 0,
+                "below_threshold": 0,
+                "plans": 0,
+            }
+        )
         plans: list[TransferPlan] = []
+        # Keep track of best net for logging
+        best_net_bps = None
+
+        # Build task list
+        route_specs: list[tuple[Symbol, str, str]] = []
         for asset_code in assets:
-            symbol = Symbol(base=asset_code, quote=self._settings.trading.base_currency)
-            for source_id in sources:
-                for dest_id in dests:
-                    if source_id == dest_id:
+            sym = symbol_by_asset[asset_code]
+            for src in sources:
+                for dst in dests:
+                    if src == dst:
                         continue
-                    plan = await self._plan_pair(symbol, source_id, dest_id, amount)
-                    if plan is not None:
-                        plans.append(plan)
+                    route_specs.append((sym, src, dst))
+
+        counters["total"] = len(route_specs)
+
+        async def _eval_one(sym: Symbol, src: str, dst: str) -> TransferPlan | None:
+            asset = sym.base
+            # Snapshot lookup (no REST)
+            buy_book = book_snapshot.get((src, asset))
+            sell_book = book_snapshot.get((dst, asset))
+            # Also try direct store as fallback (in case snapshot missed due to symbol mismatch)
+            if buy_book is None:
+                buy_book = self._store.order_book(src, sym)
+            if sell_book is None:
+                sell_book = self._store.order_book(dst, sym)
+            if buy_book is None or sell_book is None:
+                counters["no_book"] += 1
+                return None
+            # Stale check against snapshot age (frozen at scan start + batch)
+            # Books refreshed in this cycle's batch are considered fresh for
+            # the rest of the scan (even if batch duration pushed their age
+            # just over stale_after).  Otherwise a long batch would never
+            # converge to an all-fresh snapshot.
+            try:
+                is_stale_src = self._store.is_stale(self._store.age_ms(buy_book)) and (src, asset) not in refreshed_keys  # type: ignore[arg-type]
+                is_stale_dst = self._store.is_stale(self._store.age_ms(sell_book)) and (dst, asset) not in refreshed_keys  # type: ignore[arg-type]
+                if is_stale_src or is_stale_dst:
+                    counters["stale"] += 1
+                    return None
+            except Exception:
+                counters["no_book"] += 1
+                return None
+
+            # Networks (cached)
+            try:
+                if single_route:
+                    # Lazy fetch for single route (avoid 150 pre-warm)
+                    # Direct fetch with cache
+                    key_src = (asset, src)
+                    key_dst = (asset, dst)
+                    if key_src not in network_cache:
+                        try:
+                            network_cache[key_src] = await self._manager.adapter(src).fetch_withdrawal_networks(asset)
+                        except Exception as exc:
+                            logger.debug(
+                                "transfer_network_lookup_failed",
+                                extra={"asset": asset, "from": src, "to": dst, "error": str(exc)[:160]},
+                            )
+                            counters["network"] += 1
+                            return None
+                    if key_dst not in network_cache:
+                        try:
+                            network_cache[key_dst] = await self._manager.adapter(dst).fetch_withdrawal_networks(asset)
+                        except Exception as exc:
+                            logger.debug(
+                                "transfer_network_lookup_failed",
+                                extra={"asset": asset, "from": src, "to": dst, "error": str(exc)[:160]},
+                            )
+                            counters["network"] += 1
+                            return None
+                    source_networks = network_cache[key_src]
+                    dest_networks = network_cache[key_dst]
+                else:
+                    source_networks = _get_cached_networks(asset, src)
+                    dest_networks = _get_cached_networks(asset, dst)
+                    if not source_networks or not dest_networks:
+                        # Distinguish empty due to fetch failure vs mismatch
+                        # Try to interpret as network failure
+                        # If cache has empty tuple from failed fetch, count as network
+                        counters["network"] += 1
+                        return None
+                route = self._selector.select(
+                    asset=asset, source_networks=source_networks, dest_networks=dest_networks
+                )
+            except NetworkMismatchError as exc:
+                logger.debug(
+                    "transfer_network_mismatch",
+                    extra={"asset": asset, "from": src, "to": dst, "reason": str(exc)},
+                )
+                counters["network"] += 1
+                return None
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "transfer_network_lookup_failed",
+                    extra={"asset": asset, "from": src, "to": dst, "error": str(exc)[:160]},
+                )
+                counters["network"] += 1
+                return None
+
+            # Guard (pure, no I/O) — must stay before pricing
+            from app.strategies.transfer.planner import validate_transfer_books
+
+            guard_reason = validate_transfer_books(
+                buy_book,  # type: ignore[arg-type]
+                sell_book,  # type: ignore[arg-type]
+                max_gross_divergence_bps=self._settings.transfer.max_transfer_gross_divergence_bps,
+            )
+            if guard_reason is not None:
+                if guard_reason == "invalid_book":
+                    counters["invalid_book"] += 1
+                elif guard_reason == "gross_divergence":
+                    counters["gross_divergence"] += 1
+                else:
+                    counters["invalid_book"] += 1
+                logger.debug(
+                    "transfer_sanity_rejected",
+                    extra={
+                        "asset": asset,
+                        "from": src,
+                        "to": dst,
+                        "reason": guard_reason,
+                        "buy_ask": str(buy_book.best_ask) if buy_book.best_ask is not None else None,  # type: ignore[union-attr]
+                        "sell_bid": str(sell_book.best_bid) if sell_book.best_bid is not None else None,  # type: ignore[union-attr]
+                    },
+                )
+                return None
+
+            # Cached balances/fees (no REST)
+            available_quote = balance_cache.get(src, DEC0)
+            buy_fees = fee_cache.get(src, Decimal("10"))
+            sell_fees = fee_cache.get(dst, Decimal("10"))
+            # If cache missed (e.g. single_route without warm), fallback fetch once
+            if src not in balance_cache:
+                try:
+                    available_quote = await self._available_quote(src)
+                    balance_cache[src] = available_quote
+                except Exception:
+                    available_quote = DEC0
+            if src not in fee_cache:
+                try:
+                    buy_fees = await self._taker_fees(src, sym)
+                    fee_cache[src] = buy_fees
+                except Exception:
+                    buy_fees = Decimal("10")
+            if dst not in fee_cache:
+                try:
+                    sell_fees = await self._taker_fees(dst, sym)
+                    fee_cache[dst] = sell_fees
+                except Exception:
+                    sell_fees = Decimal("10")
+
+            # Sizing + pricing (pure)
+            try:
+                if amount is not None:
+                    requested = amount
+                    max_notional = min(
+                        self._settings.transfer.max_notional_quote,
+                        self._settings.risk.max_trade_size,
+                    )
+                    probe = max(requested, route.withdrawal_min)
+                    prices = price_pair(buy_book, sell_book, probe)  # type: ignore[arg-type]
+                    executable = self._planner.executable_amount(
+                        requested_amount=requested,
+                        withdrawal_min=route.withdrawal_min,
+                        available_quote=available_quote,
+                        buy_price=prices.buy_price,
+                        max_amount=self._settings.transfer.max_amount,
+                        max_notional=max_notional,
+                    )
+                    if executable <= DEC0:
+                        counters["sizing"] += 1
+                        return None
+                    if executable != probe:
+                        prices = price_pair(buy_book, sell_book, executable)  # type: ignore[arg-type]
+                else:
+                    min_notional = self._settings.transfer.min_notional_quote
+                    max_notional = min(
+                        self._settings.transfer.max_notional_quote,
+                        self._settings.risk.max_trade_size,
+                    )
+                    max_notional = min(max_notional, available_quote)
+                    if max_notional < min_notional:
+                        counters["sizing"] += 1
+                        return None
+                    est_price = buy_book.asks[0].price if buy_book.asks else DEC0  # type: ignore[union-attr]
+                    if est_price <= DEC0:
+                        counters["pricing"] += 1
+                        return None
+                    est_amount = (max_notional / est_price).quantize(_QUANTUM)
+                    est_amount = max(est_amount, route.withdrawal_min)
+                    prices = price_pair(buy_book, sell_book, est_amount)  # type: ignore[arg-type]
+                    executable = self._planner.executable_amount_from_notional(
+                        min_notional=min_notional,
+                        max_notional=max_notional,
+                        available_quote=available_quote,
+                        buy_price=prices.buy_price,
+                        withdrawal_min=route.withdrawal_min,
+                        max_amount=self._settings.transfer.max_amount,
+                    )
+                    if executable <= DEC0:
+                        counters["sizing"] += 1
+                        return None
+                    if executable != est_amount:
+                        prices = price_pair(buy_book, sell_book, executable)  # type: ignore[arg-type]
+                        executable = self._planner.executable_amount_from_notional(
+                            min_notional=min_notional,
+                            max_notional=max_notional,
+                            available_quote=available_quote,
+                            buy_price=prices.buy_price,
+                            withdrawal_min=route.withdrawal_min,
+                            max_amount=self._settings.transfer.max_amount,
+                        )
+                        if executable <= DEC0:
+                            counters["sizing"] += 1
+                            return None
+                        if executable != est_amount:
+                            prices = price_pair(buy_book, sell_book, executable)  # type: ignore[arg-type]
+            except Exception:
+                counters["pricing"] += 1
+                return None
+
+            plan = self._planner.build(
+                source_exchange=src,
+                dest_exchange=dst,
+                asset=asset,
+                network=route.network,
+                amount=executable,
+                prices=prices,
+                buy_fee_bps=buy_fees,
+                sell_fee_bps=sell_fees,
+                withdrawal_fee=route.withdrawal_fee,
+            )
+            plan = plan.model_copy(
+                update={
+                    "data_age_ms": max(
+                        self._store.age_ms(buy_book),  # type: ignore[arg-type]
+                        self._store.age_ms(sell_book),  # type: ignore[arg-type]
+                    )
+                }
+            )
+            evaluated = self._planner.evaluate(plan)
+            if evaluated is None:
+                counters["below_threshold"] += 1
+                return None
+            counters["plans"] += 1
+            return evaluated
+
+        # Execute with bounded concurrency, isolate failures
+        async def _eval_guarded(sym: Symbol, src: str, dst: str):
+            async with sem:
+                try:
+                    return await _eval_one(sym, src, dst)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("transfer_route_eval_failed", extra={"asset": sym.base, "from": src, "to": dst, "error": str(exc)[:160]})
+                    return None
+
+        # For bulk scan use concurrent gather; for single route keep sequential (faster)
+        if single_route:
+            # Sequential single route (preserve original latency)
+            for sym, src, dst in route_specs:
+                res = await _eval_guarded(sym, src, dst)
+                if res is not None:
+                    plans.append(res)
+        else:
+            results = await asyncio.gather(*(_eval_guarded(s, src, dst) for s, src, dst in route_specs), return_exceptions=True)
+            for r in results:
+                if isinstance(r, BaseException):
+                    continue
+                if r is not None:
+                    plans.append(r)
+
         plans.sort(key=lambda p: p.net_profit_bps, reverse=True)
+
+        # ---- instrumentation ----
+        elapsed_ms = (time.monotonic() - t_start) * 1000.0
+        best_net = str(plans[0].net_profit_bps) if plans else None
+        # Single summary line at INFO (visible) — message carries the numbers,
+        # extra carries structured fields for log shipping.
+        summary_msg = (
+            f"transfer_plan_summary routes={counters['total']} plans={len(plans)} "
+            f"best_net_bps={best_net} elapsed_ms={round(elapsed_ms,1)} "
+            f"concurrency={route_concurrency} balance_calls={balance_calls} "
+            f"fee_calls={fee_calls} network_calls={network_calls} "
+            f"book_refresh_calls={book_refresh_calls} no_book={counters['no_book']} "
+            f"stale={counters['stale']} invalid_book={counters['invalid_book']} "
+            f"gross_divergence={counters['gross_divergence']} network={counters['network']} "
+            f"sizing={counters['sizing']} pricing={counters['pricing']} "
+            f"below_threshold={counters['below_threshold']}"
+        )
+        logger.info(
+            summary_msg,
+            extra={
+                "assets": len(assets),
+                "routes": counters["total"],
+                "plans": len(plans),
+                "best_net_bps": best_net,
+                "elapsed_ms": round(elapsed_ms, 1),
+                "concurrency": route_concurrency,
+                "balance_calls": balance_calls,
+                "fee_calls": fee_calls,
+                "network_calls": network_calls,
+                "book_refresh_calls": book_refresh_calls,
+                "no_book": counters["no_book"],
+                "stale": counters["stale"],
+                "invalid_book": counters["invalid_book"],
+                "gross_divergence": counters["gross_divergence"],
+                "network": counters["network"],
+                "sizing": counters["sizing"],
+                "pricing": counters["pricing"],
+                "below_threshold": counters["below_threshold"],
+            },
+        )
+        logger.debug(
+            "transfer_plan_details",
+            extra={
+                "counters": dict(counters),
+                "elapsed_ms": round(elapsed_ms, 1),
+                "best_net_bps": best_net,
+            },
+        )
         return plans
 
     async def _plan_pair(
