@@ -446,3 +446,55 @@ async def test_economics_unchanged(tmp_path: Path):
     assert settings.transfer.min_notional_quote == D("100")
     assert settings.transfer.max_notional_quote == D("500")
     assert settings.transfer.max_transfer_gross_divergence_bps == D("5000")
+
+
+@pytest.mark.asyncio
+async def test_bybit_ws_uses_50_rest_uses_25():
+    """Bybit WS must use 50 (allowed: 1/50/200/1000) while REST keeps 25."""
+    from app.exchanges.base import AdapterOptions, BaseExchangeAdapter
+    from app.exchanges.ccxt_adapter import CCXTAdapter
+    from app.models.exchange import Exchange
+    from app.models.symbol import Symbol
+
+    async def _check_ws_depth(exchange_id: str, expected_ws_depth: int):
+        exchange = Exchange(id=exchange_id, name=exchange_id, adapter="ccxt")
+        opts = AdapterOptions(order_book_depth=25, timeout_seconds=10)
+        adapter = CCXTAdapter(exchange, options=opts)
+        # Mock client
+        captured = {}
+
+        class FakeClient:
+            has = {"watchOrderBook": True, "fetchOrderBook": True}
+
+            async def watch_order_book(self, symbol, limit=None):
+                captured["ws_limit"] = limit
+                return {"bids": [[99, 1]], "asks": [[100, 1]], "timestamp": 1, "nonce": 1}
+
+            async def fetch_order_book(self, symbol, limit=None):
+                captured["rest_limit"] = limit
+                return {"bids": [[99, 1]], "asks": [[100, 1]], "timestamp": 1, "nonce": 1}
+
+        fake = FakeClient()
+        adapter._client = fake  # type: ignore
+        # Ensure capabilities allow WS
+        adapter._capabilities = adapter._detect_capabilities(fake)
+        sym = Symbol(base="BTC", quote="USDT")
+        # Check WS depth: iterate one event
+        gen = adapter.watch_order_book(sym)
+        try:
+            await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+        assert captured.get("ws_limit") == expected_ws_depth, f"{exchange_id} WS depth {captured.get('ws_limit')} != {expected_ws_depth}"
+        # Check REST depth still 25
+        await adapter.fetch_order_book(sym)
+        assert captured.get("rest_limit") == 25, f"{exchange_id} REST depth {captured.get('rest_limit')} != 25"
+
+    await _check_ws_depth("bybit", 50)
+    await _check_ws_depth("binance", 25)
+    await _check_ws_depth("okx", 25)

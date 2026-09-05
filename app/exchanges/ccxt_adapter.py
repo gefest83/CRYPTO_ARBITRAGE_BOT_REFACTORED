@@ -1052,8 +1052,10 @@ class CCXTAdapter(BaseExchangeAdapter):
         native = self._native_symbol(symbol)
         interval = max(0.1, self._options.timeout_seconds / 10)
         if self._capabilities.watch_order_book and hasattr(client, "watch_order_book"):
+            # Bybit spot WS allows only 1/50/200/1000 — REST depth 25 is invalid for WS.
+            ws_depth = 50 if self.id == "bybit" else self._options.order_book_depth
             while True:
-                raw = await client.watch_order_book(native, self._options.order_book_depth)
+                raw = await client.watch_order_book(native, ws_depth)
                 yield self._to_order_book(raw, symbol)
         else:
             while True:
