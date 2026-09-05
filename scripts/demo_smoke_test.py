@@ -1,9 +1,9 @@
 """Manual DEMO smoke test — market BUY 5 USDT BTC/USDT → verify → SELL.
 
 DEMO-only: refuses to run in LIVE (fail-closed).
-Does NOT run automatically in pytest — invoke manually:
+Does NOT run automatically in pytest — invoke manually (Python 3.13 required):
 
-    python scripts/demo_smoke_test.py --exchange binance --symbol BTC/USDT --quote 5
+    py -3.13 scripts/demo_smoke_test.py --exchange binance --symbol BTC/USDT --quote 5
 
 Requires:
 - CAT_TRADING__MODE=DEMO

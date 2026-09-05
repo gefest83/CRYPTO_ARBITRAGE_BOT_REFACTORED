@@ -24,13 +24,25 @@ python -m app telegram    # run the Telegram bot (same services)
 
 ## Quick start (PAPER, zero configuration)
 
+> **Python runtime:** this project requires **Python 3.13** (`requires-python =
+> ">=3.13,<3.14"`; verified on 3.13.14). On Windows with several interpreters
+> installed, invoke it explicitly with the `py` launcher — bare `python` may
+> resolve to an older interpreter (e.g. 3.12) that cannot run this project:
+>
+> ```bash
+> py -3.13 --version   # must print 3.13.x
+> ```
+>
+> All commands below assume `py -3.13 -m ...` (replace with `python3.13 -m ...`
+> on systems where that is the 3.13 interpreter).
+
 ```bash
-python -m pip install -e .            # + .[exchanges] for real venues
-python -m app status                  # builds the database, connects
-python -m app scan                    # finds simulated opportunities
-python -m app triangle                # executes one simulated cycle
-python -m app transfer --execute --wait   # full simulated transfer lifecycle
-pytest                                # 100+ tests, no network needed
+py -3.13 -m pip install -e .            # + .[exchanges] for real venues
+py -3.13 -m app status                  # builds the database, connects
+py -3.13 -m app scan                    # finds simulated opportunities
+py -3.13 -m app triangle                # executes one simulated cycle
+py -3.13 -m app transfer --execute --wait   # full simulated transfer lifecycle
+py -3.13 -m pytest                      # 100+ tests, no network needed
 ```
 
 PAPER mode runs on deterministic simulated venues by default: books, balances

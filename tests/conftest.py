@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import pathlib
 from collections.abc import AsyncIterator
 
@@ -116,8 +115,3 @@ async def demo_services(tmp_path: pathlib.Path) -> AsyncIterator[AppServices]:
         yield app
     finally:
         await shutdown_app(app)
-
-
-@pytest.fixture()
-def event_loop_policy():
-    return asyncio.DefaultEventLoopPolicy()

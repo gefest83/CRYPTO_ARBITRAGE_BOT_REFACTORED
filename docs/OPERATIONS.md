@@ -1,5 +1,10 @@
 # Operations Runbook
 
+> **Python runtime:** requires **Python 3.13** (verified on 3.13.14). On Windows
+> use `py -3.13 -m app ...` explicitly — bare `python` may resolve to 3.12,
+> which this project does not support. All `python -m app` commands below mean
+> the 3.13 interpreter.
+
 ## Daily operation
 
 ```bash

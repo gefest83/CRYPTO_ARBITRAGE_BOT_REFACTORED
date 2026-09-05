@@ -29,6 +29,7 @@ async def test_cross_not_in_watch_if_inactive_on_all_venues(tmp_path: pathlib.Pa
         assert "BNB/AVAX" not in watch_names
         # But AVAX/BTC is active on at least one venue, so it should be in watch
         assert "AVAX/BTC" in watch_names
+        await app.manager.close()
         await app.db.dispose()
 
 @pytest.mark.asyncio
