@@ -112,12 +112,21 @@ class ContextCollector:
         journal_limit: int = 20,
         memory_limit: int = 10,
     ) -> AgentContext:
-        """Gather a full context snapshot.
+        """Gather a full context snapshot — bounded and treated as untrusted.
 
         ``query`` is used to retrieve the most relevant knowledge / memory
         slices (substring search). When ``None`` the most recent items are
         returned instead.
+
+        Phase 3C hardening: all retrieval is hard-capped (trades 5, journal
+        5, memory/knowledge 3) and every free-text field is truncated to
+        500 chars. The raw stored text keeps provenance, but the in-context
+        copy is bounded so that no unrestricted dump reaches the LLM.
         """
+        # Hard caps — even if caller asks for more, we bound for LLM safety
+        trade_limit = min(int(trade_limit), 5)
+        journal_limit = min(int(journal_limit), 5)
+        memory_limit = min(int(memory_limit), 3)
         # Tool-sourced sections (read-only)
         recent_trades = await self._tools.get_recent_trades(limit=trade_limit)
         trade_stats = await self._tools.get_trade_statistics()
@@ -132,7 +141,7 @@ class ContextCollector:
             except Exception:
                 balances = {}
         recent_journal = await self._tools.get_recent_journal(limit=journal_limit)
-        previous_recs = await self._tools.get_previous_recommendations(limit=10)
+        previous_recs = await self._tools.get_previous_recommendations(limit=5)
 
         # Memory / KB slices (filtered by query when provided)
         experiences: list[dict[str, Any]] = []
@@ -166,7 +175,13 @@ class ContextCollector:
                     else await self._experiences.list_recent(limit=memory_limit)
                 )
                 experiences = [
-                    {"id": e.id, "situation": e.situation, "observation": e.observation, "lesson": e.lesson, "confidence": e.confidence}
+                    {
+                        "id": e.id,
+                        "situation": e.situation[:500],
+                        "observation": e.observation[:500],
+                        "lesson": (e.lesson[:500] if e.lesson else None),
+                        "confidence": e.confidence,
+                    }
                     for e in exps
                 ]
             except Exception:
@@ -180,7 +195,7 @@ class ContextCollector:
                     else await self._lessons.list_recent(limit=memory_limit)
                 )
                 lessons = [
-                    {"id": le.id, "title": le.title, "content": le.content, "confidence": le.confidence}
+                    {"id": le.id, "title": le.title[:200], "content": le.content[:500], "confidence": le.confidence}
                     for le in les
                 ]
             except Exception:

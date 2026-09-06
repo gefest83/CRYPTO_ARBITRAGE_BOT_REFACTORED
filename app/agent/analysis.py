@@ -28,7 +28,7 @@ from pydantic import Field
 
 from app.agent.context import AgentContext
 from app.agent.models import AgentRecommendation, DomainModel, ReflectionResult, utc_now
-from app.agent.providers.base import filter_secrets_from_text
+from app.agent.providers.base import filter_secrets_from_text, sanitize_untrusted_text
 from app.config.logging_config import get_logger
 
 __all__ = ["StructuredAnalysis", "AnalysisEngine", "BoundedContext"]
@@ -96,7 +96,9 @@ def _truncate(text: str, limit: int) -> str:
 def _bound_list(items: list[str], max_items: int, max_chars_per: int) -> tuple[str, ...]:
     bounded: list[str] = []
     for item in items[:max_items]:
-        bounded.append(_truncate(filter_secrets_from_text(item), max_chars_per))
+        # Treat every item as untrusted data: secret filter + injection sanitize + bound
+        sanitized = sanitize_untrusted_text(filter_secrets_from_text(item), max_chars=max_chars_per)
+        bounded.append(_truncate(sanitized, max_chars_per))
     return tuple(bounded)
 
 

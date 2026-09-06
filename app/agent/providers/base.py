@@ -38,6 +38,7 @@ __all__ = [
     "NullProvider",
     "EchoProvider",
     "filter_secrets_from_text",
+    "sanitize_untrusted_text",
     "SAFE_CONTENT_PATTERN",
 ]
 
@@ -71,6 +72,56 @@ _SENSITIVE_SUBSTRINGS = (
 )
 
 SAFE_CONTENT_PATTERN = re.compile(r".*")  # placeholder for external validation
+
+# Prompt-injection patterns — retrieved text is untrusted data, never authority.
+# We do not attempt to be exhaustive; we neutralise the most common jailbreak
+# carriers so that even if a repo doc or journal entry contains them, they are
+# rendered harmless before reaching the LLM.
+_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\bignore\s+previous\s+instructions\b"),
+    re.compile(r"(?i)\bignore\s+all\s+instructions\b"),
+    re.compile(r"(?i)\bcall\s+create_order\b"),
+    re.compile(r"(?i)\bwithdraw\b.*\bfunds\b"),
+    re.compile(r"(?i)\breveal\s+api\b"),
+    re.compile(r"(?i)\bprint\s+environment\b"),
+    re.compile(r"(?i)\bexecute\s+shell\b"),
+    re.compile(r"(?i)\bmodify\s+risk\b"),
+    re.compile(r"(?i)\bmodify\s+config\b"),
+    re.compile(r"(?i)\bexecute\s+sql\b"),
+    re.compile(r"(?i)\bdrop\s+table\b"),
+    re.compile(r"(?i)\byou\s+are\s+now\b"),
+    re.compile(r"(?i)^\s*system\s*:"),
+    re.compile(r"(?i)^\s*assistant\s*:"),
+    re.compile(r"(?i)\btool\s*:\b"),
+)
+
+MAX_UNTRUSTED_CHARS = 2000  # hard cap for any single untrusted field when rendered for LLM
+
+
+def sanitize_untrusted_text(text: str, *, max_chars: int = MAX_UNTRUSTED_CHARS) -> str:
+    """Treat ``text`` as untrusted data — never as instructions.
+
+    * Truncates to ``max_chars`` (bounded retrieval).
+    * Neutralises common prompt-injection carriers by replacing them with
+      ``[filtered]``.
+    * Also runs secret filtering so that even untrusted data with embedded
+      secrets is redacted.
+    * The function is idempotent and preserves provenance — the original
+      stored text is unchanged; only the rendered-for-LLM copy is filtered.
+    """
+    if not text:
+        return text
+    # First secret filtering (conservative)
+    cleaned = filter_secrets_from_text(text)
+    # Truncate early to avoid regex on huge blobs
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 20] + "... (truncated)"
+    # Neutralise injection patterns
+    for pat in _INJECTION_PATTERNS:
+        cleaned = pat.sub("[filtered]", cleaned)
+    # Escape markdown code fences that could be used to hide instructions
+    cleaned = cleaned.replace("```", "` `[filtered]` `")
+    return cleaned
 
 
 def filter_secrets_from_text(text: str, *, extra: tuple[str, ...] = ()) -> str:
