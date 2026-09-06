@@ -29,6 +29,7 @@ from app.models.enums import TradingMode
 from app.models.risk import RiskLimits
 
 __all__ = [
+    "AgentSettings",
     "AppSettings",
     "ArbitrageSettings",
     "DatabaseSettings",
@@ -414,6 +415,41 @@ class LoggingSettings(_Section):
         return str(value).strip().upper()
 
 
+class AgentSettings(_Section):
+    """AI Advisor LLM provider configuration.
+
+    The advisor is disabled by default (``provider="null"``). Enable it by
+    setting ``CAT_AGENT__PROVIDER=openrouter`` and providing the secrets
+    below. No network request is made at startup — the provider is only
+    contacted when the advisor pipeline calls ``complete()``.
+
+    Secrets are wrapped in :class:`SecretStr` so they never appear in logs.
+    The tables never store provider credentials.
+    """
+
+    enabled: bool = False
+    provider: Literal["null", "echo", "openrouter", "local"] = "null"
+    model: str = "openai/gpt-4o-mini"
+    api_key: SecretStr = SecretStr("")
+    base_url: str = "https://openrouter.ai/api/v1"
+    timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    max_retries: int = Field(default=1, ge=0, le=3)
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    max_tokens: int = Field(default=800, ge=0, le=8192)
+    referer: str | None = None
+    title: str | None = None
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _lower(cls, value: str) -> str:
+        return str(value).strip().lower() if value else "null"
+
+    @field_validator("model", "base_url", mode="before")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        return str(value).strip() if isinstance(value, str) else value
+
+
 class Settings(BaseSettings):
     """Root settings object; build via :func:`get_settings`."""
 
@@ -440,6 +476,7 @@ class Settings(BaseSettings):
     execution: ExecutionSettings = ExecutionSettings()
     telegram: TelegramSettings = TelegramSettings()
     logging: LoggingSettings = LoggingSettings()
+    agent: AgentSettings = AgentSettings()
 
     @property
     def mode(self) -> TradingMode:

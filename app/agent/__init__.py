@@ -60,6 +60,8 @@ from app.agent.models import (
     SourceType,
 )
 from app.agent.providers.base import LLMProvider, NullProvider, EchoProvider
+from app.agent.providers import create_provider as _create_provider  # lazy, no network
+
 from app.agent.recommendations import RecommendationRepository, RecommendationService
 from app.agent.reflection import ReflectionEngine
 from app.agent.tools import AgentTools
@@ -134,6 +136,13 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
         recommendation_repo=rec_repo,
     )
     reflection = ReflectionEngine()
-    core = AgentCore(collector=collector, reflection=reflection, llm=llm or NullProvider())
+    # Provider selection: explicit ``llm`` wins; otherwise derive from settings
+    # without performing any network I/O.
+    if llm is None:
+        try:
+            llm = _create_provider(getattr(services, "settings", None))
+        except Exception:
+            llm = NullProvider()
+    core = AgentCore(collector=collector, reflection=reflection, llm=llm)
 
     return core, knowledge_service, exp_repo, lesson_repo, rec_service, tools
