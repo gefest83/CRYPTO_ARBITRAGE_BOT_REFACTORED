@@ -90,7 +90,6 @@ COMMANDS: tuple[str, ...] = (
     "/stop_trading",
     "/language",
     "/strategy",
-    "/ai",
 )
 
 HELP_TEXT = (
