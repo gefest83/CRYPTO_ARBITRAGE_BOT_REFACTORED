@@ -102,6 +102,53 @@ def _bound_list(items: list[str], max_items: int, max_chars_per: int) -> tuple[s
     return tuple(bounded)
 
 
+def _format_journal_fact(entry: Any) -> str | None:
+    """Render one journal-analysis result as a labeled FACT line (or None)."""
+    if not isinstance(entry, dict):
+        return None
+    kind = str(entry.get("kind", "?"))
+    if kind == "trade_analysis":
+        if entry.get("status") == "insufficient_data":
+            return f"journal-fact [trade:{entry.get('trade_id', '?')}] insufficient_data: {entry.get('reason', '')[:120]}"
+        realized = entry.get("realized", {}) if isinstance(entry.get("realized"), dict) else {}
+        expected = entry.get("expected", {}) if isinstance(entry.get("expected"), dict) else {}
+        diff = entry.get("difference", {}) if isinstance(entry.get("difference"), dict) else {}
+        fees = entry.get("fees", {}) if isinstance(entry.get("fees"), dict) else {}
+        slip = entry.get("slippage", {}) if isinstance(entry.get("slippage"), dict) else {}
+        exp_txt = (
+            f"expected net={expected.get('net_profit')} ({expected.get('net_profit_bps')} bps)"
+            if expected.get("net_profit") is not None
+            else "expected=insufficient_data"
+        )
+        diff_txt = f"diff net={diff.get('net_profit')}" if diff and diff.get("net_profit") is not None else "diff=n/a"
+        return (
+            f"journal-fact [trade:{entry.get('trade_id', '?')}|{entry.get('strategy', '?')}|"
+            f"{entry.get('exchange_id', '?')}|{entry.get('status', '?')}] "
+            f"realized net={realized.get('net_profit')} ({realized.get('net_profit_bps')} bps); "
+            f"{exp_txt}; {diff_txt}; fees={fees.get('fees_quote')}; "
+            f"slippage={slip.get('slippage_bps')} bps; outcome={entry.get('outcome', '?')}"
+        )
+    if kind == "aggregation":
+        groups = entry.get("groups", {}) if isinstance(entry.get("groups"), dict) else {}
+        bits = []
+        for name in sorted(groups)[:4]:
+            g = groups[name]
+            bits.append(f"{name}: n={g.get('n', 0)} pnl={g.get('total_pnl', '0')} win={g.get('win_rate', '0')}%")
+        detail = "; ".join(bits) if bits else "no groups"
+        return f"journal-fact [aggregate by {entry.get('by', '?')} n={entry.get('total_n', 0)}] {detail}"
+    if kind == "period_comparison":
+        return (
+            f"journal-fact [periods {entry.get('label_a', 'a')} n={entry.get('n_a', 0)} vs "
+            f"{entry.get('label_b', 'b')} n={entry.get('n_b', 0)}] "
+            f"delta_pnl={entry.get('delta_total_pnl')} conclusion={entry.get('conclusion', '')[:100]}"
+        )
+    if kind == "missed_opportunities":
+        if entry.get("status") == "insufficient_data":
+            return f"journal-fact [missed] insufficient_data: {entry.get('reason', '')[:120]}"
+        return f"journal-fact [missed] n={entry.get('n', 0)}: {entry.get('reason', '')[:120]}"
+    return None
+
+
 class AnalysisEngine:
     """Builds :class:`StructuredAnalysis` from context + reflection + LLM.
 
@@ -145,6 +192,15 @@ class AnalysisEngine:
                     MAX_SINGLE_FACT_CHARS,
                 )
             )
+
+        # Journal-analysis facts — deterministic app computations (FACTS).
+        # Placed early so bounded truncation keeps computed answers over raw
+        # dumps. Hypotheses and recommendations never enter here; the LLM
+        # receives these lines as data it must explain, not override.
+        for entry in list(getattr(context, "journal_analysis", ()) or ())[:MAX_KNOWLEDGE_HITS]:
+            line = _format_journal_fact(entry)
+            if line:
+                raw_facts.append(_truncate(line, MAX_SINGLE_FACT_CHARS))
 
         # Parameters fact (already non-secret)
         cp = context.current_parameters or {}

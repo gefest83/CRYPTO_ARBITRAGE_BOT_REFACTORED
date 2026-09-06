@@ -38,6 +38,8 @@ class AgentContext:
     experiences: tuple[dict[str, Any], ...] = ()
     lessons: tuple[dict[str, Any], ...] = ()
     knowledge_hits: tuple[dict[str, Any], ...] = ()
+    # Phase 4: deterministic journal-analysis results (FACTS, computed by app code)
+    journal_analysis: tuple[dict[str, Any], ...] = ()
     # request metadata
     query: str | None = None
     language: str | None = None
@@ -56,6 +58,7 @@ class AgentContext:
             f"Experiences in context: {len(self.experiences)}",
             f"Lessons in context: {len(self.lessons)}",
             f"Knowledge hits: {len(self.knowledge_hits)}",
+            f"Journal analyses: {len(self.journal_analysis)}",
         ]
         if self.query:
             lines.append(f"Query: {self.query}")
@@ -75,6 +78,7 @@ class AgentContext:
             "experiences": list(self.experiences),
             "lessons": list(self.lessons),
             "knowledge_hits": list(self.knowledge_hits),
+            "journal_analysis": list(self.journal_analysis),
             "query": self.query,
         }
 
@@ -95,12 +99,14 @@ class ContextCollector:
         experience_repo: ExperienceRepository | None = None,
         lesson_repo: LessonRepository | None = None,
         recommendation_repo: RecommendationRepository | None = None,
+        journal_reader: Any | None = None,
     ) -> None:
         self._tools = tools
         self._knowledge = knowledge_service
         self._experiences = experience_repo
         self._lessons = lesson_repo
         self._recommendations = recommendation_repo
+        self._journal = journal_reader
 
     async def collect(
         self,
@@ -233,6 +239,18 @@ class ContextCollector:
             except Exception:
                 pass
 
+        # Phase 4: deterministic journal analysis (bounded, provenance-preserving).
+        # The LLM never queries the journal itself; the collector runs the
+        # read-only tools and stores computed FACTS for analysis/prompting.
+        journal_analysis: list[dict[str, Any]] = []
+        if self._journal is not None:
+            try:
+                journal_analysis = await _collect_journal_analyses(
+                    self._journal, query, limit=memory_limit
+                )
+            except Exception:
+                journal_analysis = []
+
         return AgentContext(
             recent_trades=tuple(recent_trades),
             trade_statistics=trade_stats,
@@ -246,6 +264,96 @@ class ContextCollector:
             experiences=tuple(experiences),
             lessons=tuple(lessons),
             knowledge_hits=tuple(knowledge_hits),
+            journal_analysis=tuple(journal_analysis),
             query=query,
             language=language,
         )
+
+
+_JOURNAL_STRATEGY_WORDS: frozenset[str] = frozenset({"strategy", "strategies", "triangle", "transfer", "performs best"})
+_JOURNAL_EXCHANGE_WORDS: frozenset[str] = frozenset({"exchange", "exchanges", "binance", "okx", "bybit", "venue"})
+_JOURNAL_TRADE_WORDS: frozenset[str] = frozenset(
+    {"trade", "order", "fee", "fees", "slippage", "fail", "failed", "failure", "execution", "profit", "loss", "pnl"}
+)
+_JOURNAL_PERIOD_WORDS: frozenset[str] = frozenset(
+    {"today", "yesterday", "week", "period", "compare", "comparison", "versus", "vs", "quality"}
+)
+_JOURNAL_MISSED_WORDS: frozenset[str] = frozenset({"missed", "miss", "opportunit"})
+
+
+async def _collect_journal_analyses(reader: Any, query: str | None, limit: int) -> list[dict[str, Any]]:
+    """Run bounded deterministic journal analyses triggered by ``query``."""
+    limit = max(1, min(int(limit), 3))
+    results: list[dict[str, Any]] = []
+    lowered = (query or "").lower()
+
+    def _has(words: frozenset[str]) -> bool:
+        return any(w in lowered for w in words)
+
+    # 1. Explicit trade IDs always resolve first (provenance preserved).
+    if query:
+        from app.agent.journal import TRADE_ID_RE
+
+        for trade_id in dict.fromkeys(TRADE_ID_RE.findall(query)):
+            try:
+                results.append(await reader.analyze_trade(trade_id))
+            except Exception:
+                continue
+            if len(results) >= limit:
+                return results
+
+    if not query:
+        return results
+
+    # 2. Period comparison ("today", "compare ...", "execution quality ...").
+    if _has(_JOURNAL_PERIOD_WORDS):
+        try:
+            results.append(await reader.compare_today_vs_yesterday())
+        except Exception:
+            pass
+        if len(results) >= limit:
+            return results[:limit]
+
+    # 3. Strategy / exchange performance ("which performs best ...").
+    if _has(_JOURNAL_STRATEGY_WORDS):
+        try:
+            results.append(await reader.strategy_performance())
+        except Exception:
+            pass
+        if len(results) >= limit:
+            return results[:limit]
+    if _has(_JOURNAL_EXCHANGE_WORDS):
+        try:
+            results.append(await reader.exchange_performance())
+        except Exception:
+            pass
+        if len(results) >= limit:
+            return results[:limit]
+
+    # 4. Missed opportunities (explicit insufficient_data when absent).
+    if _has(_JOURNAL_MISSED_WORDS):
+        try:
+            results.append(await reader.missed_opportunities())
+        except Exception:
+            pass
+        if len(results) >= limit:
+            return results[:limit]
+
+    # 5. Trade/fee/slippage/failure questions without an ID: analyze the
+    # most recent trade so the answer cites a concrete journal record.
+    if _has(_JOURNAL_TRADE_WORDS) and not results:
+        try:
+            recent = await reader.list_trades(limit=1)
+            if recent:
+                results.append(await reader.analyze_trade(str(recent[0]["id"])))
+            else:
+                results.append(
+                    {
+                        "kind": "trade_analysis",
+                        "status": "insufficient_data",
+                        "reason": "no journaled trades",
+                    }
+                )
+        except Exception:
+            pass
+    return results[:limit]

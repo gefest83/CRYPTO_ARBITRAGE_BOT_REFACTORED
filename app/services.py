@@ -108,6 +108,9 @@ class AppServices:
     agent_knowledge_service: Any = field(default=None)
     agent_approval_service: Any = field(default=None)
     agent_audit: Any = field(default=None)
+    #: Phase 4: read-only trading-journal access for the AI Agent (wired by
+    #: :func:`app.agent.build_agent`; ``None`` until then).
+    agent_journal: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

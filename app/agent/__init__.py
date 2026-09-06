@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from app.agent.context import AgentContext, ContextCollector
 from app.agent.core import AgentCore, AgentRequest, AgentResponse
+from app.agent.journal import JournalReader
 from app.agent.knowledge import KnowledgeRepository, KnowledgeService
 from app.agent.memory import ExperienceRepository, LessonRepository
 from app.agent.models import (
@@ -93,6 +94,7 @@ __all__ = [
     "KnowledgeDocument",
     "KnowledgeRepository",
     "KnowledgeService",
+    "JournalReader",
     "Lesson",
     "LessonRepository",
     "LLMProvider",
@@ -147,6 +149,10 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     services.agent_approval_service = approval_service  # type: ignore[attr-defined]
     services.agent_audit = audit_repo  # type: ignore[attr-defined]
 
+    # Phase 4: read-only journal access over the existing repositories.
+    journal_reader = JournalReader(services)
+    services.agent_journal = journal_reader  # type: ignore[attr-defined]
+
     tools = AgentTools(services)
     collector = ContextCollector(
         tools,
@@ -154,6 +160,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
         experience_repo=exp_repo,
         lesson_repo=lesson_repo,
         recommendation_repo=rec_repo,
+        journal_reader=journal_reader,
     )
     reflection = ReflectionEngine()
     # Provider selection: explicit ``llm`` wins; otherwise derive from settings
