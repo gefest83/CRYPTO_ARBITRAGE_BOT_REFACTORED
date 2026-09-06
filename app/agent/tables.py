@@ -1,16 +1,28 @@
 """SQLAlchemy tables for the AI Advisor subsystem.
 
-Four tables cover the advisor persistence surface:
+Nine tables cover the advisor persistence surface (Phase 5):
 
 * ``agent_knowledge``      — ingested documentation / research / knowledge docs
+* ``agent_knowledge_chunks`` — deterministic retrieval chunks (Phase 3)
 * ``agent_experiences``    — structured memory of situations & outcomes
 * ``agent_lessons``        — distilled patterns from experiences
 * ``agent_recommendations`` — advisor suggestions awaiting human approval
+* ``agent_audit``          — analysis / recommendation / reflection actions
+* ``agent_feedback``       — human feedback on lessons/recommendations (Phase 5)
+* ``agent_lesson_history`` — superseded lesson versions, auditable (Phase 5)
+* ``agent_memory_labels``  — learning-type / sample-size / direction overlay (Phase 5)
+
+Phase 5 store mapping: ``ai_memory`` → experiences+lessons; ``ai_experiences``
+→ agent_experiences; ``ai_lessons`` → agent_lessons; ``ai_recommendations`` →
+agent_recommendations; ``ai_knowledge_sources``/``ai_knowledge_documents`` →
+agent_knowledge(+chunks); ``ai_actions`` → agent_audit; ``ai_feedback`` →
+agent_feedback.
 
 All tables live in the SAME database as the trading bot (``trades``,
 ``transfers``, ``balances``, ``audit_log``, ``bot_state``). There is no
 second database — restarts use the same file and the same
-``Base.metadata.create_all`` path.
+``Base.metadata.create_all`` path. Phase 5 adds only NEW tables; existing
+tables are never altered, so upgrades never trigger schema-drift rebuilds.
 
 Every row carries provenance columns (``source_type``, ``source_id``,
 ``version``, ``status``, ``created_at``, ``updated_at``) so the advisor
@@ -32,9 +44,12 @@ from app.storage.base import UTC_DATETIME, Base
 
 __all__ = [
     "AgentExperienceRow",
+    "AgentFeedbackRow",
     "AgentKnowledgeChunkRow",
     "AgentKnowledgeRow",
+    "AgentLessonHistoryRow",
     "AgentLessonRow",
+    "AgentMemoryLabelRow",
     "AgentRecommendationRow",
 ]
 
@@ -174,4 +189,65 @@ class AgentRecommendationRow(Base):
         Index("ix_agent_recommendations_parameter", "parameter"),
         Index("ix_agent_recommendations_status", "status"),
         Index("ix_agent_recommendations_created_at", "created_at"),
+    )
+
+
+class AgentFeedbackRow(Base):
+    """Phase 5 ``ai_feedback`` — human-only feedback on agent artifacts."""
+
+    __tablename__ = "agent_feedback"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(32))  # lesson | recommendation
+    target_id: Mapped[str] = mapped_column(String(32))
+    rating: Mapped[int] = mapped_column(Integer)  # +1 | -1
+    comment: Mapped[str] = mapped_column(Text, default="")
+    approver: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+
+    __table_args__ = (
+        Index("ix_agent_feedback_target", "target_type", "target_id"),
+        Index("ix_agent_feedback_created_at", "created_at"),
+    )
+
+
+class AgentLessonHistoryRow(Base):
+    """Phase 5 lesson versioning — superseded snapshots stay auditable."""
+
+    __tablename__ = "agent_lesson_history"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    lesson_id: Mapped[str] = mapped_column(String(32))
+    version: Mapped[int] = mapped_column(Integer)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(SA_JSON)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    superseded_by: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+
+    __table_args__ = (
+        Index("ix_agent_lesson_history_lesson", "lesson_id", "version"),
+    )
+
+
+class AgentMemoryLabelRow(Base):
+    """Phase 5 learning-type overlay — no alterations to existing tables.
+
+    One row per experience/lesson carrying its :class:`LearningType`,
+    explicit sample size, outcome direction and optional supersession link.
+    Decay affects retrieval weight only; rows (and history) are never
+    deleted because of decay.
+    """
+
+    __tablename__ = "agent_memory_labels"
+
+    target_type: Mapped[str] = mapped_column(String(32), primary_key=True)  # experience | lesson
+    target_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    learning_type: Mapped[str] = mapped_column(String(32), default="observation")
+    sample_size: Mapped[int] = mapped_column(Integer, default=1)
+    direction: Mapped[str] = mapped_column(String(32), default="unknown")
+    supersedes: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+
+    __table_args__ = (
+        Index("ix_agent_memory_labels_type", "learning_type"),
     )

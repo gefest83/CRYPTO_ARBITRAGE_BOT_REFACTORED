@@ -111,6 +111,12 @@ class AppServices:
     #: Phase 4: read-only trading-journal access for the AI Agent (wired by
     #: :func:`app.agent.build_agent`; ``None`` until then).
     agent_journal: Any = field(default=None)
+    #: Phase 5: memory overlay stores + reflection scheduler (wired by
+    #: :func:`app.agent.build_agent`; ``None`` until then).
+    agent_feedback: Any = field(default=None)
+    agent_lesson_history: Any = field(default=None)
+    agent_memory_labels: Any = field(default=None)
+    agent_reflection: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

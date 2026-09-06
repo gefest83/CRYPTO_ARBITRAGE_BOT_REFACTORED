@@ -12,10 +12,18 @@ The engine answers:
 When evidence is insufficient it returns ``NO_ACTION`` — the advisor must
 not create a recommendation from thin air. No automatic trading decision is
 ever emitted.
+
+Phase 5 adds :class:`ReflectionScheduler` — deterministic reflection
+triggers (post-trade lightweight, N-trade aggregate, daily, weekly) driven
+by :class:`AgentSettings` intervals. The scheduler computes statistics and
+evidence first and never calls the LLM itself: trivial events stay cheap,
+and the LLM (if configured) only interprets validated evidence later
+through the normal :class:`AgentCore` pipeline.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -30,7 +38,7 @@ from app.agent.models import (
 )
 from app.config.logging_config import get_logger
 
-__all__ = ["ReflectionEngine"]
+__all__ = ["ReflectionEngine", "ReflectionScheduler"]
 
 logger = get_logger("agent.reflection")
 
@@ -432,3 +440,452 @@ def _get_param(params: dict[str, Any] | None, key: str) -> str | None:
     if isinstance(limits, dict) and key in limits:
         return str(limits[key])
     return None
+
+
+# ------------------------------------------------------------------ Phase 5 scheduler
+
+
+def _get_param(params: dict[str, Any] | None, key: str) -> str | None:
+    if not params or not isinstance(params, dict):
+        return None
+    # Try flat risk map first (tools.get_risk_state / status()["risk"]["limits"] style)
+    if key in params:
+        return str(params[key])
+    risk = params.get("risk") if isinstance(params.get("risk"), dict) else None
+    if risk is None:
+        # Try nested: current_parameters["risk"][key]
+        risk = params.get("risk", {})
+    if isinstance(risk, dict) and key in risk:
+        return str(risk[key])
+    # Also check limits sub-map
+    limits = risk.get("limits") if isinstance(risk, dict) else None
+    if isinstance(limits, dict) and key in limits:
+        return str(limits[key])
+    return None
+
+
+#: bot_state keys for scheduler cursors (restart-safe, no trading impact).
+CURSOR_POST_TRADE = "agent_reflection_cursor"
+CURSOR_N_MARK = "agent_reflection_n_mark"
+CURSOR_DAILY = "agent_reflection_last_daily"
+CURSOR_WEEKLY = "agent_reflection_last_weekly"
+
+_TERMINAL_TRADE_STATUSES: frozenset[str] = frozenset({"completed", "failed", "manual_review"})
+
+
+class ReflectionScheduler:
+    """Deterministic reflection triggers over the persisted journal.
+
+    Triggers (all configurable via :class:`AgentSettings`):
+
+    * post-trade — lightweight extraction for each new terminal trade
+      (bounded per run, no LLM);
+    * N-trade — aggregate reflection every ``reflection_n_trades`` new
+      terminal trades (lesson candidate via :class:`ReflectionEngine`);
+    * daily / weekly — aggregate reflection over the period window.
+
+    Statistics and evidence are computed first; the scheduler itself never
+    calls any LLM provider (it holds no provider reference). State lives in
+    ``bot_state`` so restarts resume cursors instead of duplicating work.
+    """
+
+    def __init__(self, engine: ReflectionEngine | None = None) -> None:
+        self._engine = engine or ReflectionEngine()
+
+    # ------------------------------------------------------------ entry point
+
+    async def run_due(self, services: Any, *, now: datetime | None = None) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+        """Run every due trigger once; returns a provenance-rich report."""
+        from app.agent.extraction import (  # local import: avoid cycle at module load
+            aggregate_to_lesson,
+            detect_contradiction,
+            extract_experience,
+            outcome_direction,
+            validate_experience,
+        )
+
+        now = now or _utcnow()
+        settings = getattr(getattr(services, "settings", None), "agent", None)
+        report: dict[str, Any] = {
+            "triggered": [],
+            "experiences_created": [],
+            "lessons_created": [],
+            "skipped": {},
+            "at": now.isoformat(),
+        }
+        if settings is not None and not bool(getattr(settings, "reflection_enabled", True)):
+            report["skipped"]["all"] = "reflection_enabled=false"
+            return report
+
+        journal = getattr(services, "agent_journal", None)
+        exp_repo = getattr(services, "agent_experiences", None)
+        lesson_repo = getattr(services, "agent_lessons", None)
+        label_repo = getattr(services, "agent_memory_labels", None)
+        audit_repo = getattr(services, "agent_audit", None)
+        bot_state = getattr(services, "bot_state", None)
+        if journal is None or exp_repo is None or lesson_repo is None or bot_state is None:
+            report["skipped"]["all"] = "agent not wired (journal/experiences/lessons/bot_state missing)"
+            return report
+
+        # 1. Post-trade lightweight reflection (always checked first).
+        try:
+            created = await self._run_post_trade(
+                services, journal, exp_repo, label_repo, audit_repo, bot_state,
+                extract_experience, validate_experience, now=now,
+            )
+            report["experiences_created"].extend(created)
+            if created:
+                report["triggered"].append("post_trade")
+            else:
+                report["skipped"]["post_trade"] = "no new terminal trades"
+        except Exception as exc:  # noqa: BLE001 - scheduler must never crash callers
+            logger.warning("reflection_post_trade_failed", extra={"error": str(exc)[:200]})
+            report["skipped"]["post_trade"] = f"error: {exc}"
+
+        # 2. N-trade aggregate reflection.
+        try:
+            lesson_id = await self._run_n_trade(
+                services, journal, exp_repo, lesson_repo, label_repo, audit_repo, bot_state,
+                aggregate_to_lesson, detect_contradiction, outcome_direction, now=now,
+            )
+            if lesson_id is not None:
+                report["triggered"].append("n_trade")
+                report["lessons_created"].append(lesson_id)
+            else:
+                report["skipped"].setdefault("n_trade", "threshold not reached or insufficient evidence")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reflection_n_trade_failed", extra={"error": str(exc)[:200]})
+            report["skipped"]["n_trade"] = f"error: {exc}"
+
+        # 3. Daily / weekly aggregate reflection.
+        for trigger, cursor_key, enabled_attr, hours_attr in (
+            ("daily", CURSOR_DAILY, "reflection_daily_enabled", "reflection_daily_hours"),
+            ("weekly", CURSOR_WEEKLY, "reflection_weekly_enabled", "reflection_weekly_hours"),
+        ):
+            try:
+                lesson_id = await self._run_periodic(
+                    services, journal, exp_repo, lesson_repo, label_repo, audit_repo, bot_state,
+                    aggregate_to_lesson, detect_contradiction, outcome_direction,
+                    trigger=trigger, cursor_key=cursor_key,
+                    enabled_attr=enabled_attr, hours_attr=hours_attr, now=now,
+                )
+                if lesson_id is not None:
+                    report["triggered"].append(trigger)
+                    report["lessons_created"].append(lesson_id)
+                else:
+                    report["skipped"].setdefault(trigger, "not due or insufficient evidence")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reflection_periodic_failed", extra={"trigger": trigger, "error": str(exc)[:200]})
+                report["skipped"][trigger] = f"error: {exc}"
+        return report
+
+    # ------------------------------------------------------------ triggers
+
+    async def _run_post_trade(  # type: ignore[no-untyped-def]
+        self, services: Any, journal: Any, exp_repo: Any, label_repo: Any,
+        audit_repo: Any, bot_state: Any, extract_experience: Any,
+        validate_experience: Any, *, now: datetime, limit: int = 10,
+    ) -> list[str]:
+        from app.agent.models import LearningType
+
+        cursor = await bot_state.get(CURSOR_POST_TRADE)
+        views = await journal.list_trades(limit=200)
+        fresh = [v for v in views if v.get("status") in _TERMINAL_TRADE_STATUSES]
+        # Cursor stores max processed created_at ISO; process only newer.
+        new = [v for v in fresh if not cursor or str(v.get("created_at", "")) > str(cursor)]
+        new.sort(key=lambda v: str(v.get("created_at", "")))
+        created: list[str] = []
+        processed_cursor = cursor
+        for view in new[:limit]:
+            plan = await journal.transfer_plan(view.get("transfer_id"))
+            exp = extract_experience(view, transfer_plan=plan)
+            if validate_experience(exp):
+                continue
+            await exp_repo.save(exp)
+            created.append(exp.id)
+            if label_repo is not None:
+                direction = _trade_direction(view)
+                is_fact = all(view.get(f) not in (None, "", "n/a") for f in ("net_profit", "fees_quote", "status"))
+                await label_repo.set_label(
+                    target_type="experience", target_id=exp.id,
+                    learning_type=LearningType.FACT if is_fact else LearningType.OBSERVATION,
+                    sample_size=1, direction=direction,
+                )
+            processed_cursor = view.get("created_at") or processed_cursor
+        if processed_cursor != cursor:
+            await bot_state.set(CURSOR_POST_TRADE, processed_cursor)
+        if audit_repo is not None and created:
+            from app.agent.audit import AgentAuditEvent
+
+            await audit_repo.log(AgentAuditEvent(
+                event_type="reflection_post_trade",
+                evidence_count=len(created),
+                action="REFLECTED",
+                details={"experience_ids": created[:10]},
+                source_type="reflection",
+                source_id="post_trade",
+            ))
+        # Keep the total counter for the N-trade trigger in sync.
+        total = await bot_state.get(CURSOR_N_MARK)
+        if total is None:
+            await bot_state.set(CURSOR_N_MARK, 0)
+        return created
+
+    async def _run_n_trade(  # type: ignore[no-untyped-def]
+        self, services: Any, journal: Any, exp_repo: Any, lesson_repo: Any,
+        label_repo: Any, audit_repo: Any, bot_state: Any, aggregate_to_lesson: Any,
+        detect_contradiction: Any, outcome_direction: Any, *, now: datetime,
+    ) -> str | None:
+        settings = getattr(getattr(services, "settings", None), "agent", None)
+        threshold = int(getattr(settings, "reflection_n_trades", 20) or 20)
+        mark = await bot_state.get(CURSOR_N_MARK)
+        mark = int(mark) if isinstance(mark, (int, float)) or (isinstance(mark, str) and mark.isdigit()) else 0
+        # Deterministic gate: reflect when the experience store grew
+        # by >= threshold since the last N-mark.
+        current_total = await exp_repo.count()
+        if current_total - mark < threshold:
+            return None
+        window = await exp_repo.list_recent(limit=threshold)
+        if len(window) < threshold:
+            return None
+        result = self._engine.reflect_on_experiences(window)
+        await bot_state.set(CURSOR_N_MARK, current_total)
+        if result.is_no_action or result.lesson is None:
+            if audit_repo is not None:
+                from app.agent.audit import AgentAuditEvent
+
+                await audit_repo.log(AgentAuditEvent(
+                    event_type="reflection_n_trade",
+                    evidence_count=len(window),
+                    action="NO_ACTION",
+                    details={"reason": result.reason},
+                    source_type="reflection",
+                    source_id="n_trade",
+                ))
+            return None
+        return await self._persist_lesson_candidate(
+            lesson_repo, label_repo, audit_repo, result.lesson, window,
+            aggregate_to_lesson, detect_contradiction, outcome_direction,
+            trigger="n_trade",
+        )
+
+    async def _run_periodic(  # type: ignore[no-untyped-def]
+        self, services: Any, journal: Any, exp_repo: Any, lesson_repo: Any,
+        label_repo: Any, audit_repo: Any, bot_state: Any, aggregate_to_lesson: Any,
+        detect_contradiction: Any, outcome_direction: Any, *, trigger: str,
+        cursor_key: str, enabled_attr: str, hours_attr: str, now: datetime,
+    ) -> str | None:
+        settings = getattr(getattr(services, "settings", None), "agent", None)
+        if settings is not None and not bool(getattr(settings, enabled_attr, True)):
+            return None
+        interval_hours = float(getattr(settings, hours_attr, 24.0) or 24.0)
+        last_raw = await bot_state.get(cursor_key)
+        if last_raw is not None:
+            try:
+                from datetime import datetime as _dt
+
+                last = _dt.fromisoformat(str(last_raw))
+                elapsed_h = (now - last).total_seconds() / 3600.0 if last.tzinfo else None
+                if elapsed_h is None:
+                    elapsed_h = 0.0
+                if elapsed_h < interval_hours:
+                    return None
+            except Exception:
+                pass
+        window_start = now - _timedelta_hours(interval_hours * (7 if trigger == "weekly" else 1))
+        experiences = await self._experiences_since(exp_repo, window_start)
+        await bot_state.set(cursor_key, now.isoformat())
+        if len(experiences) < _min_sample():
+            if audit_repo is not None:
+                from app.agent.audit import AgentAuditEvent
+
+                await audit_repo.log(AgentAuditEvent(
+                    event_type=f"reflection_{trigger}",
+                    evidence_count=len(experiences),
+                    action="NO_ACTION",
+                    details={"reason": f"insufficient evidence: {len(experiences)}"},
+                    source_type="reflection",
+                    source_id=trigger,
+                ))
+            return None
+        result = self._engine.reflect_on_experiences(experiences)
+        if result.is_no_action or result.lesson is None:
+            return None
+        return await self._persist_lesson_candidate(
+            lesson_repo, label_repo, audit_repo, result.lesson, experiences,
+            aggregate_to_lesson, detect_contradiction, outcome_direction,
+            trigger=trigger,
+        )
+
+    # ------------------------------------------------------------ helpers
+
+    async def _lesson_direction(self, lesson: Any, label_repo: Any) -> str:  # type: ignore[no-untyped-def]
+        """Stored direction for an existing lesson (label overlay, else unknown)."""
+        try:
+            if label_repo is not None:
+                label = await label_repo.get_label("lesson", getattr(lesson, "id", ""))
+                if label is not None and label.get("direction"):
+                    return str(label["direction"])
+        except Exception:
+            pass
+        return "unknown"
+
+    async def _recent_experience_ids(self, exp_repo: Any, *, limit: int) -> list[str]:  # type: ignore[no-untyped-def]
+        try:
+            return [e.id for e in await exp_repo.list_recent(limit=limit)]
+        except Exception:
+            return []
+
+    async def _experiences_since(self, exp_repo: Any, since: datetime) -> list[Any]:  # type: ignore[no-untyped-def]
+        try:
+            all_exps = await exp_repo.list_all()
+        except Exception:
+            try:
+                all_exps = await exp_repo.list_recent(limit=500)
+            except Exception:
+                return []
+        out = []
+        for exp in all_exps:
+            created = getattr(exp, "created_at", None)
+            try:
+                if created is not None and created >= since:
+                    out.append(exp)
+            except Exception:
+                continue
+        return out
+
+    async def _persist_lesson_candidate(  # type: ignore[no-untyped-def]
+        self, lesson_repo: Any, label_repo: Any, audit_repo: Any, lesson: Any,
+        experiences: list[Any], aggregate_to_lesson: Any, detect_contradiction: Any,
+        outcome_direction: Any, *, trigger: str,
+    ) -> str | None:
+        from app.agent.models import LearningType
+
+        # Re-derive direction deterministically from evidence trade outcomes.
+        trade_ids = [eid for e in experiences for eid in (e.evidence or ())]
+        direction = _direction_from_experiences(experiences)
+        # Contradiction check against same-theme active lessons (never overwrite).
+        try:
+            existing = await lesson_repo.list_all()
+        except Exception:
+            existing = []
+        theme = _theme_of_lesson_title(getattr(lesson, "title", ""))
+        for other in existing:
+            if _theme_of_lesson_title(getattr(other, "title", "")) != theme or other.id == lesson.id:
+                continue
+            other_dir = await self._lesson_direction(other, label_repo)
+            conflict = detect_contradiction(
+                existing_direction=other_dir,
+                new_avg_net_bps=_avg_bps_of_experiences(experiences),
+                new_fail_rate=_fail_rate_of_experiences(experiences),
+                existing_lesson_id=other.id,
+                new_evidence_ids=trade_ids,
+            )
+            if conflict is not None and audit_repo is not None:
+                from app.agent.audit import AgentAuditEvent
+
+                await audit_repo.log(AgentAuditEvent(
+                    event_type="contradiction",
+                    evidence_count=len(trade_ids),
+                    action="CONFLICT",
+                    details=conflict,
+                    source_type="reflection",
+                    source_id=trigger,
+                ))
+        await lesson_repo.save(lesson)
+        if label_repo is not None:
+            await label_repo.set_label(
+                target_type="lesson", target_id=lesson.id,
+                learning_type=LearningType.OBSERVATION,
+                sample_size=len(experiences), direction=direction,
+            )
+        if audit_repo is not None:
+            from app.agent.audit import AgentAuditEvent
+
+            await audit_repo.log(AgentAuditEvent(
+                event_type=f"reflection_{trigger}",
+                evidence_count=len(experiences),
+                confidence=float(getattr(lesson, "confidence", 0.0)),
+                action="INSIGHT",
+                details={"lesson_id": lesson.id, "theme": theme, "direction": direction},
+                source_type="reflection",
+                source_id=trigger,
+            ))
+        return lesson.id
+
+
+def _utcnow() -> datetime:
+    from app.models.base import utc_now
+
+    return utc_now()
+
+
+def _timedelta_hours(hours: float):  # type: ignore[no-untyped-def]
+    from datetime import timedelta
+
+    return timedelta(hours=float(hours))
+
+
+def _min_sample() -> int:
+    try:
+        from app.agent.journal import MIN_SAMPLE_FOR_CONCLUSIONS
+    except Exception:
+        return 5
+    return int(MIN_SAMPLE_FOR_CONCLUSIONS)
+
+
+def _trade_direction(view: dict[str, Any]) -> str:
+    status = str(view.get("status", ""))
+    try:
+        from decimal import Decimal as _D
+
+        bps = _D(str(view.get("net_profit_bps", "0") or "0"))
+    except Exception:
+        bps = _D("0")
+    if status in ("failed", "manual_review") or bps < 0:
+        return "negative"
+    if status == "completed" and bps > 0:
+        return "positive"
+    return "mixed"
+
+
+def _theme_of_lesson_title(title: str) -> str:
+    text = str(title or "")
+    if text.lower().startswith("pattern:"):
+        return text.split(":", 1)[1].strip().lower()
+    return text.strip().lower()[:80]
+
+
+def _fail_rate_of_experiences(experiences: list[Any]) -> float:  # type: ignore[no-untyped-def]
+    if not experiences:
+        return 0.0
+    failed = 0
+    for exp in experiences:
+        haystack = f"{getattr(exp, 'situation', '')} {getattr(exp, 'observation', '')} {getattr(exp, 'result', '')}".lower()
+        tags = [str(t).lower() for t in (getattr(exp, "tags", ()) or ())]
+        if "failed" in tags or "manual_review" in tags or "failed" in haystack or "manual review" in haystack:
+            failed += 1
+    return failed / len(experiences)
+
+
+def _avg_bps_of_experiences(experiences: list[Any]) -> float:  # type: ignore[no-untyped-def]
+    import re as _re
+
+    values: list[float] = []
+    for exp in experiences:
+        text = f"{getattr(exp, 'situation', '')} {getattr(exp, 'result', '')}"
+        match = _re.search(r"(-?\d+(?:\.\d+)?)\s*bps", text)
+        if match:
+            try:
+                values.append(float(match.group(1)))
+            except Exception:
+                continue
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _direction_from_experiences(experiences: list[Any]) -> str:  # type: ignore[no-untyped-def]
+    from app.agent.extraction import outcome_direction
+
+    return outcome_direction(_avg_bps_of_experiences(experiences), _fail_rate_of_experiences(experiences))

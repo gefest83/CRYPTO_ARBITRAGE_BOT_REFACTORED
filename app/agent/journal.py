@@ -507,6 +507,10 @@ class JournalReader:
             views = [v for v in views if v["exchange_id"] == exchange]
         return views
 
+    async def transfer_plan(self, transfer_id: str | None) -> dict[str, Any] | None:
+        """Public expected-edge source for extraction (read-only)."""
+        return await self._transfer_plan_for(transfer_id)
+
     async def _transfer_plan_for(self, transfer_id: str | None) -> dict[str, Any] | None:
         if not transfer_id:
             return None

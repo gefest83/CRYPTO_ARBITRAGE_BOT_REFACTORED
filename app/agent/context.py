@@ -100,6 +100,7 @@ class ContextCollector:
         lesson_repo: LessonRepository | None = None,
         recommendation_repo: RecommendationRepository | None = None,
         journal_reader: Any | None = None,
+        label_repository: Any | None = None,
     ) -> None:
         self._tools = tools
         self._knowledge = knowledge_service
@@ -107,6 +108,7 @@ class ContextCollector:
         self._lessons = lesson_repo
         self._recommendations = recommendation_repo
         self._journal = journal_reader
+        self._labels = label_repository
 
     async def collect(
         self,
@@ -212,16 +214,8 @@ class ContextCollector:
                     if query
                     else await self._experiences.list_recent(limit=memory_limit)
                 )
-                experiences = [
-                    {
-                        "id": e.id,
-                        "situation": e.situation[:500],
-                        "observation": e.observation[:500],
-                        "lesson": (e.lesson[:500] if e.lesson else None),
-                        "confidence": e.confidence,
-                    }
-                    for e in exps
-                ]
+                label_map = await _labels_for(self._labels, "experience", [e.id for e in exps])
+                experiences = _rerank_by_decay([_enrich_experience(e, label_map) for e in exps])[:memory_limit]
             except Exception:
                 pass
 
@@ -232,10 +226,8 @@ class ContextCollector:
                     if query
                     else await self._lessons.list_recent(limit=memory_limit)
                 )
-                lessons = [
-                    {"id": le.id, "title": le.title[:200], "content": le.content[:500], "confidence": le.confidence}
-                    for le in les
-                ]
+                label_map = await _labels_for(self._labels, "lesson", [le.id for le in les])
+                lessons = _rerank_by_decay([_enrich_lesson(le, label_map) for le in les])[:memory_limit]
             except Exception:
                 pass
 
@@ -279,6 +271,72 @@ _JOURNAL_PERIOD_WORDS: frozenset[str] = frozenset(
     {"today", "yesterday", "week", "period", "compare", "comparison", "versus", "vs", "quality"}
 )
 _JOURNAL_MISSED_WORDS: frozenset[str] = frozenset({"missed", "miss", "opportunit"})
+
+
+async def _labels_for(label_repo: Any, target_type: str, ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Batch label lookup (best-effort, empty map when unwired)."""
+    if label_repo is None or not ids:
+        return {}
+    try:
+        return await label_repo.labels_for(target_type, ids)
+    except Exception:
+        return {}
+
+
+def _enrich_experience(exp: Any, label_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Experience dict + Phase 5 provenance: type, sample size, freshness."""
+    from app.agent.memory import memory_freshness
+
+    label = label_map.get(getattr(exp, "id", ""), {})
+    freshness = memory_freshness(getattr(exp, "created_at", None), float(getattr(exp, "confidence", 0.5)))
+    return {
+        "id": exp.id,
+        "situation": exp.situation[:500],
+        "observation": exp.observation[:500],
+        "lesson": (exp.lesson[:500] if exp.lesson else None),
+        "confidence": exp.confidence,
+        "learning_type": label.get("learning_type", "observation"),
+        "sample_size": int(label.get("sample_size", 1)),
+        "freshness": freshness,
+        "decayed_confidence": freshness["decayed_confidence"],
+        "source_id": exp.source_id,
+        "source_type": exp.source_type,
+        "evidence": list(getattr(exp, "evidence", ()) or ()),
+        "created_at": exp.created_at.isoformat() if getattr(exp, "created_at", None) else None,
+    }
+
+
+def _enrich_lesson(lesson: Any, label_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Lesson dict + Phase 5 provenance: type, sample size, freshness."""
+    from app.agent.memory import memory_freshness
+
+    label = label_map.get(getattr(lesson, "id", ""), {})
+    related = list(getattr(lesson, "related_experience_ids", ()) or ())
+    freshness = memory_freshness(getattr(lesson, "created_at", None), float(getattr(lesson, "confidence", 0.5)))
+    return {
+        "id": lesson.id,
+        "title": lesson.title[:200],
+        "content": lesson.content[:500],
+        "confidence": lesson.confidence,
+        "learning_type": label.get("learning_type", "observation"),
+        "sample_size": int(label.get("sample_size", len(related))),
+        "freshness": freshness,
+        "decayed_confidence": freshness["decayed_confidence"],
+        "source_id": lesson.source_id,
+        "source_type": lesson.source_type,
+        "evidence": list(getattr(lesson, "evidence", ()) or ()),
+        "related_experience_ids": related,
+        "version": getattr(lesson, "version", 1),
+        "created_at": lesson.created_at.isoformat() if getattr(lesson, "created_at", None) else None,
+    }
+
+
+def _rerank_by_decay(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-rank memories by decayed confidence (stable: score desc, id asc).
+
+    Decay affects relevance only — no record is dropped for being old.
+    """
+    return sorted(items, key=lambda d: (-float(d.get("decayed_confidence", 0.0)), str(d.get("id", ""))))
 
 
 async def _collect_journal_analyses(reader: Any, query: str | None, limit: int) -> list[dict[str, Any]]:

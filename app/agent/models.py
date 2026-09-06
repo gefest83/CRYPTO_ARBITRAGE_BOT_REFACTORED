@@ -21,6 +21,7 @@ from pydantic import Field, field_validator
 from app.models.base import DomainModel, utc_now
 
 __all__ = [
+    "AgentFeedback",
     "AgentRecommendation",
     "BOT_KNOWLEDGE",
     "EXCHANGE_KNOWLEDGE",
@@ -29,6 +30,7 @@ __all__ = [
     "KnowledgeCategory",
     "KnowledgeChunk",
     "KnowledgeDocument",
+    "LearningType",
     "Lesson",
     "RESEARCH_KNOWLEDGE",
     "RecommendationStatus",
@@ -103,6 +105,24 @@ class RecommendationStatus(StrEnum):
     DISMISSED = "dismissed"
     EXPIRED = "expired"
     SUPERSEDED = "superseded"
+
+
+class LearningType(StrEnum):
+    """Phase 5 learning-item types — every persisted learning item has one.
+
+    * FACT — deterministic data computed by application code from the journal
+      (trade outcomes, aggregates, period deltas). Never authored by the LLM.
+    * OBSERVATION — a recorded market/execution observation (experiences,
+      reflection observations). Deterministic or human-recorded.
+    * HYPOTHESIS — LLM-proposed interpretation. Stored only as audit events,
+      never auto-promoted to FACT (no promotion path exists by design).
+    * RECOMMENDATION — a gated suggestion awaiting human approval.
+    """
+
+    FACT = "fact"
+    OBSERVATION = "observation"
+    HYPOTHESIS = "hypothesis"
+    RECOMMENDATION = "recommendation"
 
 
 # ------------------------------------------------------------------ helpers
@@ -321,6 +341,49 @@ class Lesson(DomainModel):
         if not value or not str(value).strip():
             raise ValueError("field must be non-empty")
         return str(value).strip()
+
+
+# ------------------------------------------------------------------ feedback (Phase 5)
+
+
+class AgentFeedback(DomainModel):
+    """Human operator feedback on an agent artifact (lesson/recommendation).
+
+    ``ai_feedback`` store. Only a non-empty human ``approver`` may submit;
+    the LLM can never author feedback (no code path passes LLM text here).
+    ``rating`` is +1 (useful) / -1 (wrong); ``comment`` is free text.
+    """
+
+    id: str = Field(default_factory=lambda: f"fdb-{uuid.uuid4().hex[:12]}")
+    target_type: str = Field(description="lesson | recommendation")
+    target_id: str = Field(description="Id of the lesson/recommendation reviewed")
+    rating: int = Field(description="+1 useful, -1 wrong")
+    comment: str = Field(default="")
+    approver: str = Field(description="Non-empty human identifier")
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("target_type", "target_id", "approver")
+    @classmethod
+    def _non_empty_feedback(cls, value: str) -> str:
+        if not value or not str(value).strip():
+            raise ValueError("field must be non-empty")
+        return str(value).strip()
+
+    @field_validator("target_type", mode="before")
+    @classmethod
+    def _coerce_target(cls, value: Any) -> str:
+        text = str(value).strip().lower()
+        if text not in ("lesson", "recommendation"):
+            raise ValueError("target_type must be 'lesson' or 'recommendation'")
+        return text
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def _coerce_rating(cls, value: Any) -> int:
+        rating = int(value)
+        if rating not in (1, -1):
+            raise ValueError("rating must be +1 or -1")
+        return rating
 
 
 # ------------------------------------------------------------------ recommendation

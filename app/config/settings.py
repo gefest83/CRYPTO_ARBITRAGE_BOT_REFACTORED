@@ -446,6 +446,16 @@ class AgentSettings(_Section):
     budget_max_requests_per_day: int = Field(default=200, ge=1, le=1000)
     circuit_failure_threshold: int = Field(default=5, ge=1, le=20)
     circuit_cooldown_seconds: float = Field(default=60.0, ge=5, le=600)
+    # --- Reflection triggers (Phase 5 — Memory / Reflection) ---
+    # The scheduler is deterministic and LLM-free: statistics and evidence
+    # are computed first; the LLM (if configured) only interprets validated
+    # evidence later through the normal AgentCore pipeline.
+    reflection_enabled: bool = True
+    reflection_n_trades: int = Field(default=20, ge=1, le=1000)
+    reflection_daily_enabled: bool = True
+    reflection_weekly_enabled: bool = True
+    reflection_daily_hours: float = Field(default=24.0, gt=0, le=168)
+    reflection_weekly_hours: float = Field(default=168.0, gt=0, le=720)
 
     @field_validator("provider", mode="before")
     @classmethod

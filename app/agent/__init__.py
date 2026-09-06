@@ -46,19 +46,34 @@ from __future__ import annotations
 
 from app.agent.context import AgentContext, ContextCollector
 from app.agent.core import AgentCore, AgentRequest, AgentResponse
+from app.agent.extraction import (
+    aggregate_to_lesson,
+    detect_contradiction,
+    extract_experience,
+    record_llm_hypothesis,
+)
 from app.agent.journal import JournalReader
 from app.agent.knowledge import KnowledgeRepository, KnowledgeService
-from app.agent.memory import ExperienceRepository, LessonRepository
+from app.agent.memory import (
+    ExperienceRepository,
+    FeedbackRepository,
+    LessonHistoryRepository,
+    LessonRepository,
+    MemoryLabelRepository,
+    memory_freshness,
+)
 from app.agent.models import (
     BOT_KNOWLEDGE,
     EXCHANGE_KNOWLEDGE,
     RESEARCH_KNOWLEDGE,
     TRADING_KNOWLEDGE,
+    AgentFeedback,
     AgentRecommendation,
     Experience,
     KnowledgeCategory,
     KnowledgeChunk,
     KnowledgeDocument,
+    LearningType,
     Lesson,
     RecommendationStatus,
     ReflectionObservation,
@@ -72,13 +87,14 @@ from app.agent.providers.base import LLMProvider, NullProvider, EchoProvider
 from app.agent.providers import create_provider as _create_provider  # lazy, no network
 
 from app.agent.recommendations import RecommendationRepository, RecommendationService
-from app.agent.reflection import ReflectionEngine
+from app.agent.reflection import ReflectionEngine, ReflectionScheduler
 from app.agent.tools import AgentTools
 
 __all__ = [
     "AgentAuditRepository",
     "AgentContext",
     "AgentCore",
+    "AgentFeedback",
     "AgentRecommendation",
     "AgentRequest",
     "AgentResponse",
@@ -89,15 +105,19 @@ __all__ = [
     "EchoProvider",
     "Experience",
     "ExperienceRepository",
+    "FeedbackRepository",
+    "JournalReader",
     "KnowledgeCategory",
     "KnowledgeChunk",
     "KnowledgeDocument",
     "KnowledgeRepository",
     "KnowledgeService",
-    "JournalReader",
+    "LearningType",
     "Lesson",
+    "LessonHistoryRepository",
     "LessonRepository",
     "LLMProvider",
+    "MemoryLabelRepository",
     "NullProvider",
     "RESEARCH_KNOWLEDGE",
     "RecommendationApprovalService",
@@ -107,10 +127,16 @@ __all__ = [
     "ReflectionEngine",
     "ReflectionObservation",
     "ReflectionResult",
+    "ReflectionScheduler",
     "SourceType",
     "TRADING_KNOWLEDGE",
+    "aggregate_to_lesson",
     "build_agent",
+    "detect_contradiction",
+    "extract_experience",
+    "memory_freshness",
     "normalize_knowledge_category",
+    "record_llm_hypothesis",
 ]
 
 
@@ -153,6 +179,16 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     journal_reader = JournalReader(services)
     services.agent_journal = journal_reader  # type: ignore[attr-defined]
 
+    # Phase 5: memory overlay stores + deterministic reflection scheduler.
+    feedback_repo = FeedbackRepository(db)
+    history_repo = LessonHistoryRepository(db)
+    label_repo = MemoryLabelRepository(db)
+    services.agent_feedback = feedback_repo  # type: ignore[attr-defined]
+    services.agent_lesson_history = history_repo  # type: ignore[attr-defined]
+    services.agent_memory_labels = label_repo  # type: ignore[attr-defined]
+    scheduler = ReflectionScheduler()
+    services.agent_reflection = scheduler  # type: ignore[attr-defined]
+
     tools = AgentTools(services)
     collector = ContextCollector(
         tools,
@@ -161,6 +197,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
         lesson_repo=lesson_repo,
         recommendation_repo=rec_repo,
         journal_reader=journal_reader,
+        label_repository=label_repo,
     )
     reflection = ReflectionEngine()
     # Provider selection: explicit ``llm`` wins; otherwise derive from settings

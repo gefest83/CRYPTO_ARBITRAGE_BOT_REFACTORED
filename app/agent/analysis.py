@@ -102,6 +102,21 @@ def _bound_list(items: list[str], max_items: int, max_chars_per: int) -> tuple[s
     return tuple(bounded)
 
 
+def _format_memory_fact(prefix: str, item: dict[str, Any]) -> str | None:
+    """Render one retrieved memory as a labeled line (never a journal-fact)."""
+    freshness = item.get("freshness") if isinstance(item.get("freshness"), dict) else {}
+    age = freshness.get("age_days", "?")
+    decayed = item.get("decayed_confidence", item.get("confidence", "?"))
+    title = str(item.get("title") or item.get("situation") or "")[:100]
+    evidence = item.get("evidence") or []
+    ev_txt = ",".join(str(e)[:12] for e in list(evidence)[:3]) if evidence else str(item.get("source_id", "?"))[:16]
+    return (
+        f"{prefix} [{item.get('id', '?')}|{item.get('learning_type', 'observation')}|"
+        f"conf={item.get('confidence', '?')}|decayed={decayed}|n={item.get('sample_size', '?')}|"
+        f"age={age}d|src={ev_txt}] {title}"
+    )
+
+
 def _format_journal_fact(entry: Any) -> str | None:
     """Render one journal-analysis result as a labeled FACT line (or None)."""
     if not isinstance(entry, dict):
@@ -199,6 +214,23 @@ class AnalysisEngine:
         # receives these lines as data it must explain, not override.
         for entry in list(getattr(context, "journal_analysis", ()) or ())[:MAX_KNOWLEDGE_HITS]:
             line = _format_journal_fact(entry)
+            if line:
+                raw_facts.append(_truncate(line, MAX_SINGLE_FACT_CHARS))
+
+        # Memory facts — labeled distinctly from authoritative journal facts:
+        # memories are past observations/lessons with decayed confidence, never
+        # current journal truth. Provenance, confidence, sample size and
+        # freshness ride on every line.
+        for exp in list(getattr(context, "experiences", ()) or ())[:2]:
+            if not isinstance(exp, dict):
+                continue
+            line = _format_memory_fact("memory-observation", exp)
+            if line:
+                raw_facts.append(_truncate(line, MAX_SINGLE_FACT_CHARS))
+        for les in list(getattr(context, "lessons", ()) or ())[:2]:
+            if not isinstance(les, dict):
+                continue
+            line = _format_memory_fact("memory-lesson", les)
             if line:
                 raw_facts.append(_truncate(line, MAX_SINGLE_FACT_CHARS))
 
