@@ -120,6 +120,9 @@ class AppServices:
     #: Phase 6: event-driven operator notifications (wired by
     #: :func:`app.agent.build_agent`; ``None`` until then; explicit scan only).
     agent_notifications: Any = field(default=None)
+    #: Phase 7: evidence-based recommendation engine (wired by
+    #: :func:`app.agent.build_agent`; ``None`` until then; persistence only).
+    agent_recommender: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

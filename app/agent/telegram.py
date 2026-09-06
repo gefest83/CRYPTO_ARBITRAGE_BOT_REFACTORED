@@ -364,11 +364,14 @@ class AgentTelegramAdapter:
             recs = await self._tools.get_previous_recommendations(limit=10)
         except Exception:
             return _finalize_telegram(_ai_t("ai_recommendations_empty", effective))
-        pending = [r for r in recs if str(r.get("status", "")).lower() in ("pending", "draft")]
+        pending = [r for r in recs if str(r.get("status", "")).lower() in ("pending", "draft", "reviewed")]
         if not pending:
             return _finalize_telegram(_ai_t("ai_recommendations_empty", effective))
         lines: list[str] = [_ai_t("ai_recommendations_header", effective, count=len(pending))]
         for rec in pending[:5]:
+            # Phase 7: surface lifecycle status + evidence sample size (n).
+            evidence = rec.get("evidence") or ()
+            status = str(rec.get("status", "pending")).lower()
             lines.append(
                 _ai_t(
                     "ai_recommendations_line",
@@ -379,6 +382,7 @@ class AgentTelegramAdapter:
                     reason=(rec.get("reason", "") or "")[:80],
                     confidence=float(rec.get("confidence", 0.5)),
                 )
+                + f" [n={len(evidence)} {status}]"
             )
         return _finalize_telegram("\n".join(lines))
 

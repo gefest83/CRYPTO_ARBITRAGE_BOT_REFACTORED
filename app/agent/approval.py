@@ -1,14 +1,18 @@
-"""Human-gated recommendation lifecycle — PENDING -> APPROVE -> VALIDATE -> APPLY -> AUDIT.
+"""Human-gated recommendation lifecycle — CREATED -> REVIEWED -> APPROVED/REJECTED.
 
-Critical invariants (must remain true after Phase 2):
+Critical invariants (must remain true after Phase 7):
 
-* AI never calls APPROVE / APPLY / CONFIG MUTATION / RISK LIMIT MUTATION / ORDER EXECUTION.
-* Only an explicit human operator (Telegram allow-list or CLI operator) may approve.
+* AI never calls REVIEW / APPROVE / APPLY / CONFIG MUTATION / RISK LIMIT MUTATION / ORDER EXECUTION.
+* Only an explicit human operator (Telegram allow-list or CLI operator) may review/approve/reject.
 * Approval is explicit and allowlisted — no generic ``set_config(key, value)``.
 * Risk limits have a separate explicit validation path (stricter bounds).
-* Every approval is audited and idempotent; duplicate approvals are rejected.
+* Every transition is audited and idempotent; duplicate transitions are rejected.
 * Fail-closed on any uncertainty (stale current value, invalid param/value,
   already applied, concurrent race).
+
+Phase 7 adds the REVIEWED step between creation and decision: a human marks
+a PENDING recommendation as reviewed without deciding it. Approve/reject
+accept PENDING or REVIEWED (Phase 8 approval workflow itself is NOT added).
 
 The service never executes trades.
 """
@@ -95,8 +99,15 @@ def _validate_bounds(param: str, value: Any) -> None:
 # ------------------------------------------------------------------ service
 
 
+#: Reviewable/decidable states for approve/reject (Phase 7 lifecycle).
+_ACTIONABLE_STATES: tuple[str, str] = (
+    RecommendationStatus.PENDING.value,
+    RecommendationStatus.REVIEWED.value,
+)
+
+
 class RecommendationApprovalService:
-    """Human-only approval and application of advisor recommendations."""
+    """Human-only review, approval and application of advisor recommendations."""
 
     def __init__(self, db, *, services: Any | None = None) -> None:  # type: ignore[no-untyped-def]
         self._db = db
@@ -232,6 +243,88 @@ class RecommendationApprovalService:
     # Public: human approval + apply (session-based, atomic)
     # ------------------------------------------------------------------
 
+    async def review(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
+        """Mark a PENDING recommendation as REVIEWED (human triage, no decision).
+
+        Idempotent-fail-closed: only PENDING rows transition; anything else
+        raises :class:`ApprovalError`. Audited like every other transition.
+        """
+        if not approver or not str(approver).strip():
+            raise ApprovalError("approver must be a non-empty human identifier")
+        if not recommendation_id or not str(recommendation_id).strip():
+            raise ApprovalError("recommendation_id required")
+        async with self._db.session() as session:
+            result = await session.execute(select(AgentRecommendationRow).where(AgentRecommendationRow.id == recommendation_id))
+            row = result.scalars().first()
+            if row is None:
+                raise ApprovalError(f"recommendation not found: {recommendation_id}")
+            if row.status != RecommendationStatus.PENDING.value:
+                raise ApprovalError(f"recommendation not PENDING (status={row.status}) — only PENDING can be reviewed")
+            update_result = await session.execute(
+                AgentRecommendationRow.__table__.update()
+                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status == RecommendationStatus.PENDING.value)
+                .values(
+                    status=RecommendationStatus.REVIEWED.value,
+                    operator_decision=f"reviewed by {approver}",
+                    decision_reason=reason[:500] if reason else None,
+                    version=row.version + 1,
+                )
+            )
+            if update_result.rowcount == 0:
+                raise ApprovalError("recommendation not PENDING (concurrent modification) — duplicate")
+            returned = AgentRecommendation(
+                id=row.id,
+                parameter=row.parameter,
+                current_value=row.current_value,
+                old_value=row.old_value,
+                proposed_value=row.proposed_value,
+                reason=row.reason,
+                evidence=tuple(row.evidence or ()),
+                confidence=row.confidence,
+                expected_impact=row.expected_impact,
+                risk=row.risk,
+                status=RecommendationStatus.REVIEWED,
+                operator_decision=f"reviewed by {approver}",
+                decision_reason=reason[:500] if reason else None,
+                result=row.result,
+                source_type=row.source_type,
+                source_id=row.source_id,
+                version=row.version + 1,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+        await self._audit_transition(
+            "AGENT_RECOMMENDATION_REVIEWED",
+            returned,
+            approver=approver,
+            reason=reason,
+            event_type="recommendation_reviewed",
+        )
+        return returned  # type: ignore[no-any-return]
+
+    async def _audit_transition(  # type: ignore[no-untyped-def]
+        self, action: str, rec: AgentRecommendation, *, approver: str, reason: str = "",
+        event_type: str | None = None,
+    ) -> None:
+        """Best-effort dual audit (app log + agent audit); never rolls back."""
+        try:
+            audit = getattr(self._services, "audit", None) if self._services is not None else None
+            if audit is not None and hasattr(audit, "log"):
+                await audit.log(
+                    action,
+                    f"{rec.parameter} {rec.current_value} -> {rec.proposed_value} by {approver}",
+                    {"recommendation_id": rec.id, "parameter": rec.parameter,
+                     "proposed_value": rec.proposed_value, "approver": approver},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("transition_audit_failed", extra={"recommendation_id": rec.id, "error": str(exc)[:200]})
+        try:
+            agent_audit = getattr(self._services, "agent_audit", None) if self._services is not None else None
+            if agent_audit is not None and hasattr(agent_audit, "log_recommendation"):
+                await agent_audit.log_recommendation(rec, event_type=event_type or "recommendation_created")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("transition_agent_audit_failed", extra={"recommendation_id": rec.id, "error": str(exc)[:200]})
+
     async def approve(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
         if not approver or not str(approver).strip():
             raise ApprovalError("approver must be a non-empty human identifier")
@@ -246,8 +339,8 @@ class RecommendationApprovalService:
             row = result.scalars().first()
             if row is None:
                 raise ApprovalError(f"recommendation not found: {recommendation_id}")
-            if row.status != RecommendationStatus.PENDING.value:
-                raise ApprovalError(f"recommendation not PENDING (status={row.status}) — duplicate or already handled")
+            if row.status not in _ACTIONABLE_STATES:
+                raise ApprovalError(f"recommendation not PENDING/REVIEWED (status={row.status}) — duplicate or already handled")
             param = str(row.parameter).strip()
             proposed_raw = str(row.proposed_value).strip()
             if not param or not proposed_raw:
@@ -273,10 +366,10 @@ class RecommendationApprovalService:
             except Exception as exc:
                 raise ApprovalError(f"apply failed for {param}: {exc}") from exc
 
-            # Atomic status transition — succeeds only if still pending (concurrent guard)
+            # Atomic status transition — succeeds only if still actionable (concurrent guard)
             update_result = await session.execute(
                 AgentRecommendationRow.__table__.update()
-                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status == RecommendationStatus.PENDING.value)
+                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status.in_(_ACTIONABLE_STATES))
                 .values(
                     status=RecommendationStatus.APPROVED.value,
                     operator_decision=f"approved by {approver}",
@@ -286,7 +379,7 @@ class RecommendationApprovalService:
                 )
             )
             if update_result.rowcount == 0:
-                raise ApprovalError(f"recommendation not PENDING (concurrent modification) — duplicate")
+                raise ApprovalError(f"recommendation not PENDING/REVIEWED (concurrent modification) — duplicate")
             # Build returned model directly (avoid stale identity-map reload)
             returned = AgentRecommendation(
                 id=row.id,
@@ -347,11 +440,11 @@ class RecommendationApprovalService:
             row = result.scalars().first()
             if row is None:
                 raise ApprovalError(f"recommendation not found: {recommendation_id}")
-            if row.status != RecommendationStatus.PENDING.value:
-                raise ApprovalError(f"not PENDING (status={row.status})")
+            if row.status not in _ACTIONABLE_STATES:
+                raise ApprovalError(f"not PENDING/REVIEWED (status={row.status})")
             update_result = await session.execute(
                 AgentRecommendationRow.__table__.update()
-                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status == RecommendationStatus.PENDING.value)
+                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status.in_(_ACTIONABLE_STATES))
                 .values(
                     status=RecommendationStatus.REJECTED.value,
                     operator_decision=f"rejected by {approver}",

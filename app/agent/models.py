@@ -100,6 +100,7 @@ class SourceType(StrEnum):
 class RecommendationStatus(StrEnum):
     DRAFT = "draft"
     PENDING = "pending"
+    REVIEWED = "reviewed"
     APPROVED = "approved"
     REJECTED = "rejected"
     DISMISSED = "dismissed"
@@ -442,6 +443,11 @@ class AgentRecommendation(DomainModel):
         data["status"] = status
         data["updated_at"] = utc_now()
         return self.model_copy(update=data)
+
+    @property
+    def sample_size(self) -> int:
+        """Evidence sample size (number of supporting trade/experience/knowledge ids)."""
+        return len(self.evidence or ())
 
 
 # ------------------------------------------------------------------ reflection

@@ -88,6 +88,7 @@ from app.agent.providers.base import LLMProvider, NullProvider, EchoProvider
 from app.agent.providers import create_provider as _create_provider  # lazy, no network
 
 from app.agent.recommendations import RecommendationRepository, RecommendationService
+from app.agent.recommender import RecommendationEngine
 from app.agent.reflection import ReflectionEngine, ReflectionScheduler
 from app.agent.tools import AgentTools
 
@@ -124,6 +125,7 @@ __all__ = [
     "NullProvider",
     "RESEARCH_KNOWLEDGE",
     "RecommendationApprovalService",
+    "RecommendationEngine",
     "RecommendationRepository",
     "RecommendationService",
     "RecommendationStatus",
@@ -195,6 +197,10 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     # Phase 6: event-driven operator notifications (explicit scan, never auto).
     notifier = NotificationService(services)
     services.agent_notifications = notifier  # type: ignore[attr-defined]
+
+    # Phase 7: evidence-based recommendation engine (persistence only).
+    recommender = RecommendationEngine(services)
+    services.agent_recommender = recommender  # type: ignore[attr-defined]
 
     tools = AgentTools(services)
     collector = ContextCollector(
