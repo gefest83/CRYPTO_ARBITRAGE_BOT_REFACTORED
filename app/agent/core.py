@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.agent.analysis import AnalysisEngine, StructuredAnalysis
 from app.agent.context import AgentContext, ContextCollector
 from app.agent.models import AgentRecommendation, ReflectionResult
 from app.agent.providers.base import LLMProvider, NullProvider, filter_secrets_from_text
@@ -46,7 +47,12 @@ class AgentRequest:
 
 @dataclass(frozen=True, slots=True)
 class AgentResponse:
-    """Outbound response from the advisor — analytical, never executive."""
+    """Outbound response from the advisor — analytical, never executive.
+
+    Phase 2 adds :attr:`analysis` which explicitly separates FACTS,
+    OBSERVATIONS, HYPOTHESES, and RECOMMENDATIONS. The LLM text is a
+    hypothesis, never a fact.
+    """
 
     query: str
     context: AgentContext
@@ -56,6 +62,7 @@ class AgentResponse:
     language: str | None = None
     # Convenience flag
     is_no_action: bool = False
+    analysis: StructuredAnalysis | None = None
 
     def summary(self, lang: str | None = None) -> str:
         """Human-readable summary (respects requested language if provided)."""
@@ -88,10 +95,13 @@ class AgentCore:
         collector: ContextCollector,
         reflection: ReflectionEngine | None = None,
         llm: LLMProvider | None = None,
+        *,
+        analysis_engine: AnalysisEngine | None = None,
     ) -> None:
         self._collector = collector
         self._reflection = reflection or ReflectionEngine()
         self._llm = llm or NullProvider()
+        self._analysis = analysis_engine or AnalysisEngine()
 
     @property
     def llm_provider(self) -> LLMProvider:
@@ -100,6 +110,10 @@ class AgentCore:
     @property
     def reflection_engine(self) -> ReflectionEngine:
         return self._reflection
+
+    @property
+    def analysis_engine(self) -> AnalysisEngine:
+        return self._analysis
 
     # ------------------------------------------------------------------ pipeline
 
@@ -164,22 +178,64 @@ class AgentCore:
                 logger.warning("recommendation_synthesis_failed", extra={"error": str(exc)[:300]})
 
         # 5. LLM analysis — safe boundary (prompt filtered for secrets, response filtered too)
-        # Only call LLM when there is something to analyse; skip on pure NO_ACTION to save calls
+        # Treat LLM output as HYPOTHESIS, never as fact. Deterministic gates decide
+        # whether any recommendation can be surfaced.
+        llm_malformed = False
         if reflection is not None and not reflection.is_no_action:
             try:
                 prompt = _build_llm_prompt(query, context, reflection, recommendation)
                 safe_prompt = filter_secrets_from_text(prompt)
+                # Bounded prompt for safety
+                safe_prompt = safe_prompt[:6000]
                 from app.agent.providers.base import LLMRequest, LLMMessage
 
                 response = await self._llm.complete(
                     LLMRequest(messages=(LLMMessage(role="user", content=safe_prompt),))
                 )
                 llm_output = filter_secrets_from_text(response.content)
+                # Malformed: empty or suspiciously short but claims high certainty
+                if llm_output is None or len(llm_output.strip()) < 5:
+                    llm_malformed = True
             except Exception as exc:  # noqa: BLE001 - LLM failures are non-fatal
-                logger.warning("llm_analysis_failed", extra={"error": str(exc)[:300]})
+                logger.warning("llm_analysis_failed", extra={"error": str(filter_secrets_from_text(str(exc))[:300])})
                 llm_output = None
+                llm_malformed = True
 
-        is_no_action = reflection is None or reflection.is_no_action
+        # 6. Structured analysis — FACTS / OBSERVATIONS / HYPOTHESES / RECOMMENDATIONS
+        # Deterministic gates (evidence_count<5, confidence<0.45) are re-enforced here
+        # so that even hallucinated LLM content cannot bypass them.
+        try:
+            analysis = self._analysis.build(
+                context=context,
+                reflection=reflection,
+                llm_output=llm_output,
+                previous_recommendations=list(context.previous_recommendations) if context.previous_recommendations else None,
+                llm_malformed=llm_malformed,
+            )
+            # Gate recommendation via analysis (not via LLM)
+            if recommendation is not None:
+                analysis = self._analysis.attach_recommendation(analysis, recommendation)
+                # If analysis gated to NO_ACTION, drop the recommendation (LLM cannot override)
+                if analysis.is_no_action:
+                    recommendation = None
+                else:
+                    # Use the gated attachment (may still be empty if gates failed)
+                    if analysis.recommendations:
+                        recommendation = analysis.recommendations[0]
+                    else:
+                        recommendation = None
+            # Re-derive is_no_action from deterministic analysis, not just reflection
+            is_no_action = analysis.is_no_action
+            # If analysis says NO_ACTION but reflection said INSIGHT, honour the gate
+            if is_no_action:
+                recommendation = None
+        except Exception as exc:  # noqa: BLE001 - analysis must never break pipeline
+            logger.warning("analysis_build_failed", extra={"error": str(exc)[:300]})
+            # Fallback: honour reflection's gate
+            is_no_action = reflection is None or reflection.is_no_action
+            analysis = None
+            if is_no_action:
+                recommendation = None
 
         return AgentResponse(
             query=query,
@@ -189,6 +245,7 @@ class AgentCore:
             llm_output=llm_output,
             language=request.language,
             is_no_action=is_no_action,
+            analysis=analysis,
         )
 
     async def status(self, language: str | None = None) -> dict[str, Any]:

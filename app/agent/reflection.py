@@ -77,6 +77,9 @@ class ReflectionEngine:
             return ReflectionResult(
                 action="NO_ACTION",
                 reason=f"insufficient evidence: {len(experiences)} experiences, need {self._min_evidence}",
+                evidence_count=len(experiences),
+                confidence=0.0,
+                has_enough_evidence=False,
             )
 
         # Simple pattern detection: count how often observation mentions
@@ -91,6 +94,9 @@ class ReflectionEngine:
             return ReflectionResult(
                 action="NO_ACTION",
                 reason=f"low confidence: avg {avg_conf:.2f} and no explicit lessons",
+                evidence_count=total,
+                confidence=avg_conf,
+                has_enough_evidence=False,
             )
 
         # Determine dominant theme (naïve keyword scan)
@@ -110,14 +116,23 @@ class ReflectionEngine:
             return ReflectionResult(
                 action="NO_ACTION",
                 reason=f"evidence threshold not met (count={total}, confidence={confidence:.2f})",
+                evidence_count=total,
+                confidence=confidence,
+                has_enough_evidence=False,
             )
 
         evidence_ids = [e.id for e in experiences[:5]]
+        # Phase 2: probable_cause and recurring_pattern are deterministic derivations
+        probable_cause = _infer_probable_cause(theme, experiences)
+        recurring = pattern  # same deterministic pattern counted as recurring
         obs = ReflectionObservation(
             what_happened=observations or situations,
             what_expected=expected,
             what_differed=differed,
             possible_pattern=pattern,
+            probable_cause=probable_cause,
+            recurring_pattern=recurring,
+            evidence_count=total,
             confidence=confidence,
             has_enough_evidence=True,
             evidence=tuple(evidence_ids),
@@ -144,6 +159,9 @@ class ReflectionEngine:
             observation=obs,
             lesson=lesson,
             reason=f"insight from {total} experiences (theme={theme})",
+            evidence_count=total,
+            confidence=confidence,
+            has_enough_evidence=True,
         )
 
     def reflect_on_trades(
@@ -161,6 +179,9 @@ class ReflectionEngine:
             return ReflectionResult(
                 action="NO_ACTION",
                 reason=f"insufficient trade evidence: {len(trades)} trades, need {self._min_evidence}",
+                evidence_count=len(trades),
+                confidence=0.0,
+                has_enough_evidence=False,
             )
 
         # Compute aggregate signals
@@ -192,6 +213,9 @@ class ReflectionEngine:
             return ReflectionResult(
                 action="NO_ACTION",
                 reason=f"trade evidence not confident enough (fail_rate={fail_rate:.2f}, confidence={confidence:.2f})",
+                evidence_count=total,
+                confidence=confidence,
+                has_enough_evidence=False,
             )
 
         if has_pattern and fail_rate >= 0.5:
@@ -206,12 +230,17 @@ class ReflectionEngine:
 
         expected = extra_context.get("expected", "consistent profitable execution") if extra_context else "consistent profitable execution"
         happened = f"{total} trades: {completed} completed, {failed} failed/manual_review, avg profit {avg_profit}"
-
+        # Phase 2 additional detail
+        probable_cause = _infer_trade_probable_cause(fail_rate, avg_profit)
+        recurring = pattern if has_pattern else None
         obs = ReflectionObservation(
             what_happened=happened,
             what_expected=expected,
             what_differed=differed,
             possible_pattern=pattern,
+            probable_cause=probable_cause,
+            recurring_pattern=recurring,
+            evidence_count=total,
             confidence=confidence,
             has_enough_evidence=True,
             evidence=tuple(str(t.get("id", "")) for t in trades[:5]),
@@ -219,10 +248,23 @@ class ReflectionEngine:
             source_id="reflection:trades",
         )
 
+        if has_pattern:
+            return ReflectionResult(
+                action="INSIGHT",
+                observation=obs,
+                reason=differed,
+                evidence_count=total,
+                confidence=confidence,
+                has_enough_evidence=True,
+            )
+        # NO_ACTION must still carry evidence_count/confidence for gating visibility
         return ReflectionResult(
-            action="INSIGHT" if has_pattern else "NO_ACTION",
-            observation=obs if has_pattern else None,
-            reason=differed if has_pattern else f"no strong pattern (fail_rate={fail_rate:.2f})",
+            action="NO_ACTION",
+            observation=None,
+            reason=f"no strong pattern (fail_rate={fail_rate:.2f})",
+            evidence_count=total,
+            confidence=confidence,
+            has_enough_evidence=False,
         )
 
     # ------------------------------------------------------------------
@@ -309,6 +351,28 @@ def _infer_pattern(theme: str, experiences: list[Experience]) -> str:
         "general": "Execution outcomes show variance from plan — collect more evidence before tuning.",
     }
     return mapping.get(theme, mapping["general"])
+
+
+def _infer_probable_cause(theme: str, experiences: list[Experience]) -> str:
+    mapping = {
+        "slippage": "slippage tolerance miscalibrated or books stale at execution",
+        "profit": "fee model or scanner notional misaligned with realised costs",
+        "stale": "market-data freshness gate not strict enough",
+        "failure": "venue rejection / recovery path triggered repeatedly",
+        "liquidity": "VWAP overestimates available depth",
+        "general": "unidentified execution variance — more evidence needed",
+    }
+    return mapping.get(theme, mapping["general"])
+
+
+def _infer_trade_probable_cause(fail_rate: float, avg_profit: Decimal) -> str:
+    if fail_rate >= 0.5:
+        return "high venue failure rate — connectivity, balance, or risk rejection"
+    if avg_profit < 0:
+        return "negative expectancy — scanner threshold vs fees imbalance"
+    if fail_rate >= 0.3:
+        return "intermittent failures — depth or staleness likely"
+    return "mixed outcomes — insufficient signal for single cause"
 
 
 def _suggest_parameter(

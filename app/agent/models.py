@@ -250,12 +250,20 @@ class AgentRecommendation(DomainModel):
 
 
 class ReflectionObservation(DomainModel):
-    """One structured insight produced by the Reflection Engine."""
+    """One structured insight produced by the Reflection Engine (V2).
+
+    Phase 2 adds ``probable_cause``, ``recurring_pattern``, ``evidence_count``
+    so that analysis can distinguish facts vs hypotheses.
+    """
 
     what_happened: str
     what_expected: str
     what_differed: str
     possible_pattern: str | None = None
+    # Phase 2 additions (with defaults for backward compat)
+    probable_cause: str | None = None
+    recurring_pattern: str | None = None
+    evidence_count: int = Field(default=0, ge=0)
     confidence: float = Field(ge=0.0, le=1.0)
     has_enough_evidence: bool = True
     evidence: tuple[str, ...] = ()
@@ -270,6 +278,9 @@ class ReflectionResult(DomainModel):
     When :attr:`action` is ``"NO_ACTION"`` the engine concluded there is
     insufficient evidence for a useful insight. Callers must not create
     recommendations from NO_ACTION results.
+
+    Phase 2 exposes ``evidence_count`` / ``confidence`` at the top level for
+    deterministic gating that the LLM cannot bypass.
     """
 
     action: str = Field(description="NO_ACTION or INSIGHT")
@@ -277,6 +288,10 @@ class ReflectionResult(DomainModel):
     lesson: Lesson | None = None
     recommendation: AgentRecommendation | None = None
     reason: str = ""
+    # Phase 2 explicit fields (mirrors observation when present)
+    evidence_count: int = Field(default=0, ge=0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    has_enough_evidence: bool = False
 
     @property
     def is_no_action(self) -> bool:
