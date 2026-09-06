@@ -97,11 +97,13 @@ class AgentCore:
         llm: LLMProvider | None = None,
         *,
         analysis_engine: AnalysisEngine | None = None,
+        audit_repo: Any | None = None,
     ) -> None:
         self._collector = collector
         self._reflection = reflection or ReflectionEngine()
         self._llm = llm or NullProvider()
         self._analysis = analysis_engine or AnalysisEngine()
+        self._audit = audit_repo
 
     @property
     def llm_provider(self) -> LLMProvider:
@@ -236,6 +238,34 @@ class AgentCore:
             analysis = None
             if is_no_action:
                 recommendation = None
+
+        # 7. Audit persistence — record provider/model, timestamps, evidence, never credentials
+        # Fail-closed on audit error (best-effort, never blocks analysis or trading)
+        if self._audit is not None:
+            try:
+                provider_name = getattr(self._llm, "name", "unknown")
+                model_name = getattr(self._llm, "model", None) or getattr(self._llm, "_model_default", None)
+                # Never log raw query with secrets — filtered
+                filtered_query = filter_secrets_from_text(query)[:500]
+                await self._audit.log_analysis(
+                    provider=provider_name,
+                    model=model_name,
+                    query=filtered_query,
+                    evidence_count=getattr(analysis, "evidence_count", None) if analysis else getattr(reflection, "evidence_count", None),
+                    confidence=getattr(analysis, "confidence", None) if analysis else getattr(reflection, "confidence", None),
+                    action=getattr(analysis, "action", None) if analysis else getattr(reflection, "action", None),
+                    facts_count=len(analysis.facts) if analysis else None,
+                    hypotheses_count=len(analysis.hypotheses) if analysis else None,
+                    recommendation_id=recommendation.id if recommendation else None,
+                )
+                # Also audit recommendation creation if one was synthesised (provenance intact)
+                if recommendation is not None and analysis is not None and not is_no_action:
+                    try:
+                        await self._audit.log_recommendation(recommendation, event_type="recommendation_created")
+                    except Exception:
+                        pass
+            except Exception as exc:  # noqa: BLE001 - audit must not block
+                logger.warning("agent_audit_failed", extra={"error": str(exc)[:200]})
 
         return AgentResponse(
             query=query,

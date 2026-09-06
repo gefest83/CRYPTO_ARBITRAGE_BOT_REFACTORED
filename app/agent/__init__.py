@@ -60,6 +60,7 @@ from app.agent.models import (
     SourceType,
 )
 from app.agent.approval import RecommendationApprovalService
+from app.agent.audit import AgentAuditRepository
 from app.agent.providers.base import LLMProvider, NullProvider, EchoProvider
 from app.agent.providers import create_provider as _create_provider  # lazy, no network
 
@@ -68,6 +69,7 @@ from app.agent.reflection import ReflectionEngine
 from app.agent.tools import AgentTools
 
 __all__ = [
+    "AgentAuditRepository",
     "AgentContext",
     "AgentCore",
     "AgentRecommendation",
@@ -118,6 +120,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     lesson_repo = LessonRepository(db)
     rec_repo = RecommendationRepository(db)
     rec_service = RecommendationService(rec_repo)
+    audit_repo = AgentAuditRepository(db)
     approval_service = RecommendationApprovalService(db, services=services)
 
     # Expose advisor repos on services for tool access (non-intrusive, optional)
@@ -130,6 +133,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     services.agent_recommendation_service = rec_service  # type: ignore[attr-defined]
     services.agent_knowledge_service = knowledge_service  # type: ignore[attr-defined]
     services.agent_approval_service = approval_service  # type: ignore[attr-defined]
+    services.agent_audit = audit_repo  # type: ignore[attr-defined]
 
     tools = AgentTools(services)
     collector = ContextCollector(
@@ -147,6 +151,6 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
             llm = _create_provider(getattr(services, "settings", None))
         except Exception:
             llm = NullProvider()
-    core = AgentCore(collector=collector, reflection=reflection, llm=llm)
+    core = AgentCore(collector=collector, reflection=reflection, llm=llm, audit_repo=audit_repo)
 
     return core, knowledge_service, exp_repo, lesson_repo, rec_service, tools

@@ -90,6 +90,7 @@ class Database:
         # metadata. Importing them here ensures create_all sees all tables.
         try:
             import app.agent.tables  # noqa: F401  (registers advisor tables)
+            import app.agent.audit  # noqa: F401  (registers audit table)
 
         except Exception:
             pass
