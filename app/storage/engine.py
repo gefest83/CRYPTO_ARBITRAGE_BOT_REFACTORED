@@ -85,6 +85,14 @@ class Database:
         abandon in-flight funds.  Startup refuses instead.
         """
         from app.storage import tables  # noqa: F401  (import registers the mappers)
+
+        # AI Advisor tables live in app.agent but share the same database &
+        # metadata. Importing them here ensures create_all sees all tables.
+        try:
+            import app.agent.tables  # noqa: F401  (registers advisor tables)
+
+        except Exception:
+            pass
         from app.storage.base import Base
 
         engine = self.start()

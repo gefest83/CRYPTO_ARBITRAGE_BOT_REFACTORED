@@ -97,6 +97,15 @@ class AppServices:
     #: refresh this guarantees the MaxOpenTransfersRule always sees the true
     #: open-transfer count, so concurrent starts cannot race past the cap.
     _transfer_start_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # --- AI Advisor (optional, isolated subsystem — analytical only, never executive) ---
+    # The advisor shares ``db``; no second database. ``None`` when the advisor
+    # has not been wired via :func:`app.agent.build_agent`.
+    agent_knowledge: Any = field(default=None)
+    agent_experiences: Any = field(default=None)
+    agent_lessons: Any = field(default=None)
+    agent_recommendations: Any = field(default=None)
+    agent_recommendation_service: Any = field(default=None)
+    agent_knowledge_service: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):
