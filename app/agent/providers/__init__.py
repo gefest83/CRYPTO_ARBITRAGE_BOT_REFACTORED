@@ -69,6 +69,13 @@ def create_provider(settings: Any | None = None, *, http_client: Any | None = No
         max_tokens = int(getattr(agent_cfg, "max_tokens", 800) or 800)
         referer = getattr(agent_cfg, "referer", None)
         title = getattr(agent_cfg, "title", None)
+        max_prompt_chars = int(getattr(agent_cfg, "max_prompt_chars", 6000) or 6000)
+        max_response_chars = int(getattr(agent_cfg, "max_response_chars", 4000) or 4000)
+        rate_limit_per_minute = int(getattr(agent_cfg, "rate_limit_per_minute", 10) or 10)
+        rate_limit_per_hour = int(getattr(agent_cfg, "rate_limit_per_hour", 60) or 60)
+        budget_max = int(getattr(agent_cfg, "budget_max_requests_per_day", 200) or 200)
+        circuit_threshold = int(getattr(agent_cfg, "circuit_failure_threshold", 5) or 5)
+        circuit_cooldown = float(getattr(agent_cfg, "circuit_cooldown_seconds", 60.0) or 60.0)
         return OpenRouterProvider(
             api_key=api_key,
             model=model,
@@ -80,6 +87,13 @@ def create_provider(settings: Any | None = None, *, http_client: Any | None = No
             referer=referer,
             title=title,
             http_client=http_client,
+            max_prompt_chars=max_prompt_chars,
+            max_response_chars=max_response_chars,
+            rate_limit_per_minute=rate_limit_per_minute,
+            rate_limit_per_hour=rate_limit_per_hour,
+            budget_max_requests_per_day=budget_max,
+            circuit_failure_threshold=circuit_threshold,
+            circuit_cooldown_seconds=circuit_cooldown,
         )
     if provider_name == "local":
         # Future local provider — currently behaves as null (no network)

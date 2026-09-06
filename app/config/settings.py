@@ -438,6 +438,14 @@ class AgentSettings(_Section):
     max_tokens: int = Field(default=800, ge=0, le=8192)
     referer: str | None = None
     title: str | None = None
+    # --- Provider safety (Phase 3A) ---
+    max_prompt_chars: int = Field(default=6000, ge=500, le=20000)
+    max_response_chars: int = Field(default=4000, ge=500, le=20000)
+    rate_limit_per_minute: int = Field(default=10, ge=1, le=100)
+    rate_limit_per_hour: int = Field(default=60, ge=1, le=500)
+    budget_max_requests_per_day: int = Field(default=200, ge=1, le=1000)
+    circuit_failure_threshold: int = Field(default=5, ge=1, le=20)
+    circuit_cooldown_seconds: float = Field(default=60.0, ge=5, le=600)
 
     @field_validator("provider", mode="before")
     @classmethod

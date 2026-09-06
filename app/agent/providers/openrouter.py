@@ -5,9 +5,12 @@ All prompts and responses are filtered via :func:`filter_secrets_from_text`
 before leaving/entering the process. Credentials are never stored in
 agent tables and never appear in logs/exceptions/telegram.
 
-Bounded behaviour:
+Bounded behaviour (Phase 3A hardened):
 * ``timeout_seconds`` caps each HTTP call.
 * ``max_retries`` caps transient retries (429 / 502-504 / timeout / network).
+* Prompt/response sizes capped (``max_prompt_chars`` / ``max_response_chars``).
+* Rate limiting per minute/hour and daily budget.
+* Circuit breaker after ``circuit_failure_threshold`` consecutive failures.
 * Fail-closed: any error returns via exception that ``AgentCore`` catches;
   trading execution is unaffected.
 
@@ -18,7 +21,8 @@ called.
 from __future__ import annotations
 
 import asyncio
-import json
+import time
+from collections import deque
 from typing import Any
 
 from pydantic import SecretStr
@@ -27,7 +31,7 @@ from app.agent.providers.base import LLMProvider, LLMRequest, LLMResponse, filte
 from app.config.logging_config import get_logger
 from app.exchanges.sanitize import redact_secrets
 
-__all__ = ["OpenRouterProvider", "OpenRouterError"]
+__all__ = ["OpenRouterProvider", "OpenRouterError", "CircuitBreaker", "RateLimiter"]
 
 logger = get_logger("agent.provider.openrouter")
 
@@ -39,6 +43,107 @@ class OpenRouterError(Exception):
 
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+# ------------------------------------------------------------------ helpers: rate limiter & circuit breaker (Phase 3A)
+
+class RateLimiter:
+    """Sliding-window rate limiter / budget.
+
+    Simple in-memory, per-process. Suitable for DEMO — production would use
+    Redis, but for the bot the in-process limiter is sufficient and does not
+    require new dependencies.
+    """
+
+    def __init__(self, per_minute: int = 10, per_hour: int = 60, per_day: int = 200):
+        self._per_minute = per_minute
+        self._per_hour = per_hour
+        self._per_day = per_day
+        self._minute_ts: deque[float] = deque()
+        self._hour_ts: deque[float] = deque()
+        self._day_ts: deque[float] = deque()
+
+    def _prune(self, now: float) -> None:
+        while self._minute_ts and now - self._minute_ts[0] > 60:
+            self._minute_ts.popleft()
+        while self._hour_ts and now - self._hour_ts[0] > 3600:
+            self._hour_ts.popleft()
+        while self._day_ts and now - self._day_ts[0] > 86400:
+            self._day_ts.popleft()
+
+    def check(self) -> None:
+        now = time.monotonic()
+        self._prune(now)
+        if len(self._minute_ts) >= self._per_minute:
+            raise OpenRouterError(f"rate limit exceeded: {self._per_minute}/minute")
+        if len(self._hour_ts) >= self._per_hour:
+            raise OpenRouterError(f"rate limit exceeded: {self._per_hour}/hour")
+        if len(self._day_ts) >= self._per_day:
+            raise OpenRouterError(f"budget exceeded: {self._per_day}/day")
+
+    def record(self) -> None:
+        now = time.monotonic()
+        self._minute_ts.append(now)
+        self._hour_ts.append(now)
+        self._day_ts.append(now)
+        self._prune(now)
+
+    def reset(self) -> None:
+        self._minute_ts.clear()
+        self._hour_ts.clear()
+        self._day_ts.clear()
+
+
+class CircuitBreaker:
+    """Consecutive-failure circuit breaker.
+
+    * Closed: requests pass.
+    * Open: after ``threshold`` failures, all requests fail fast for
+      ``cooldown_seconds``.
+    * Half-open: after cooldown, one trial is allowed; success closes,
+      failure re-opens.
+    """
+
+    def __init__(self, threshold: int = 5, cooldown_seconds: float = 60.0):
+        self._threshold = threshold
+        self._cooldown = cooldown_seconds
+        self._failures = 0
+        self._state = "closed"  # closed | open | half_open
+        self._opened_at: float | None = None
+
+    @property
+    def state(self) -> str:
+        # Evaluate half-open transition lazily
+        if self._state == "open" and self._opened_at is not None:
+            if time.monotonic() - self._opened_at >= self._cooldown:
+                self._state = "half_open"
+        return self._state
+
+    def before_request(self) -> None:
+        st = self.state
+        if st == "open":
+            raise OpenRouterError(f"circuit breaker open (cooldown {self._cooldown}s)")
+        # half_open and closed pass (half_open allows one trial)
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+        self._opened_at = None
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= self._threshold:
+            self._state = "open"
+            self._opened_at = time.monotonic()
+        elif self._state == "half_open":
+            # Trial failed -> re-open
+            self._state = "open"
+            self._opened_at = time.monotonic()
+
+    def reset(self) -> None:
+        self._failures = 0
+        self._state = "closed"
+        self._opened_at = None
 
 
 class OpenRouterProvider(LLMProvider):
@@ -64,6 +169,16 @@ class OpenRouterProvider(LLMProvider):
         referer: str | None = None,
         title: str | None = None,
         http_client: Any | None = None,
+        # Phase 3A safety
+        max_prompt_chars: int = 6000,
+        max_response_chars: int = 4000,
+        rate_limit_per_minute: int = 10,
+        rate_limit_per_hour: int = 60,
+        budget_max_requests_per_day: int = 200,
+        circuit_failure_threshold: int = 5,
+        circuit_cooldown_seconds: float = 60.0,
+        rate_limiter: RateLimiter | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         # Never store raw key in plain attribute name that could be dumped
         self._api_key = api_key if isinstance(api_key, SecretStr) else SecretStr(str(api_key))
@@ -77,6 +192,10 @@ class OpenRouterProvider(LLMProvider):
         self._title = title
         # Optional injected client for tests (must expose ``post`` async)
         self._http_client = http_client
+        self._max_prompt_chars = int(max_prompt_chars)
+        self._max_response_chars = int(max_response_chars)
+        self._limiter = rate_limiter or RateLimiter(per_minute=rate_limit_per_minute, per_hour=rate_limit_per_hour, per_day=budget_max_requests_per_day)
+        self._breaker = circuit_breaker or CircuitBreaker(threshold=circuit_failure_threshold, cooldown_seconds=circuit_cooldown_seconds)
 
     @property
     def model(self) -> str:
@@ -88,11 +207,33 @@ class OpenRouterProvider(LLMProvider):
         if not raw_key:
             raise OpenRouterError("missing API key — provider not configured")
 
-        # Filter outbound messages before any network
+        # Phase 3A: circuit breaker and rate limiting (fail-closed, never blocks trading thread beyond exception)
+        try:
+            self._breaker.before_request()
+        except OpenRouterError:
+            raise
+        try:
+            self._limiter.check()
+        except OpenRouterError:
+            # Circuit remains closed on rate limit (not a provider failure)
+            raise
+
+        # Filter outbound messages before any network and bound sizes
         safe_messages = []
         for msg in request.messages:
             safe_content = filter_secrets_from_text(msg.content)
+            # Bounded prompt: truncate each message to max_prompt_chars
+            if len(safe_content) > self._max_prompt_chars:
+                safe_content = safe_content[: self._max_prompt_chars - 20] + "... (truncated)"
             safe_messages.append({"role": msg.role, "content": safe_content})
+
+        # Also enforce overall prompt budget: if combined still too large, truncate again
+        total_chars = sum(len(m["content"]) for m in safe_messages)
+        if total_chars > self._max_prompt_chars:
+            # Keep first message truncated to budget
+            combined = "\n".join(m["content"] for m in safe_messages)
+            truncated = combined[: self._max_prompt_chars - 20] + "... (truncated)"
+            safe_messages = [{"role": safe_messages[0]["role"], "content": truncated}]
 
         # Use request model override or default
         model = request.model or self._model_default
@@ -120,13 +261,30 @@ class OpenRouterProvider(LLMProvider):
 
         url = f"{self._base_url}/chat/completions"
 
+        # Phase 3A: enforce budget (record once per complete call)
+        self._limiter.record()
+
         # Retry loop for transient failures
         last_exc: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
                 response_content = await self._post(url, headers, payload)
-                # Parse successful response
-                return self._parse_response(response_content, model)
+                # Parse successful response and bound response size
+                parsed = self._parse_response(response_content, model)
+                # Bounded response: truncate to max_response_chars
+                if len(parsed.content) > self._max_response_chars:
+                    truncated = parsed.content[: self._max_response_chars - 20] + "... (truncated)"
+                    # Re-filter after truncation (still safe)
+                    truncated = filter_secrets_from_text(truncated)
+                    parsed = LLMResponse(
+                        content=truncated,
+                        model=parsed.model,
+                        finish_reason=parsed.finish_reason,
+                        usage=parsed.usage,
+                        raw=parsed.raw,
+                    )
+                self._breaker.record_success()
+                return parsed
             except OpenRouterError as exc:
                 # Non-retryable (e.g. missing key, malformed) -> fail immediately
                 last_exc = exc
@@ -135,6 +293,7 @@ class OpenRouterProvider(LLMProvider):
                     backoff = 0.2 * (2**attempt)
                     await asyncio.sleep(backoff)
                     continue
+                self._breaker.record_failure()
                 raise
             except Exception as exc:  # noqa: BLE001 - network/timeout
                 last_exc = exc
@@ -148,9 +307,11 @@ class OpenRouterProvider(LLMProvider):
                 safe_msg = redact_secrets(str(exc))
                 safe_msg = filter_secrets_from_text(safe_msg)
                 logger.warning("openrouter_provider_failed", extra={"attempt": attempt, "error": safe_msg[:300]})
+                self._breaker.record_failure()
                 raise OpenRouterError(f"provider failure: {safe_msg[:200]}") from exc
 
         # Should not reach here
+        self._breaker.record_failure()
         raise OpenRouterError(f"provider failed after retries: {last_exc}")
 
     async def _post(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
