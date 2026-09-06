@@ -42,6 +42,8 @@ AI_COMMANDS: tuple[str, ...] = (
     "/ai recommendations",
     "/ai memory",
     "/ai balance",
+    "/ai approve",
+    "/ai reject",
 )
 
 # Additional translations for AI Advisor (English / Russian).
@@ -57,6 +59,8 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "/ai recommendations - pending recommendations (human approval required)\n"
             "/ai memory          - recent experiences & lessons\n"
             "/ai balance         - balances per venue (via bot services)\n"
+            "/ai approve <id>    - approve and apply a recommendation (human-only, allowlisted)\n"
+            "/ai reject <id>     - reject a pending recommendation\n"
             "\n"
             "The advisor can READ, ANALYZE, REMEMBER, REFLECT and RECOMMEND. "
             "It cannot execute trades, withdraw funds, or modify configuration directly."
@@ -87,6 +91,12 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_balance_empty": "No balances available.",
         "ai_unknown_subcommand": "Unknown /ai subcommand. Try /ai for help.",
         "ai_not_configured": "AI Advisor is not configured.",
+        "ai_approve_ok": "Approved {parameter}: {old} -> {proposed} (by {approver})",
+        "ai_approve_fail": "Approve failed: {error}",
+        "ai_reject_ok": "Rejected {id} (by {approver})",
+        "ai_reject_fail": "Reject failed: {error}",
+        "ai_approve_usage": "Usage: /ai approve <recommendation_id>",
+        "ai_reject_usage": "Usage: /ai reject <recommendation_id>",
     },
     "ru": {
         "ai_help": (
@@ -96,6 +106,8 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "/ai recommendations - ожидающие рекомендации (требуют подтверждения)\n"
             "/ai memory          - недавние опыты и уроки\n"
             "/ai balance         - балансы по площадкам\n"
+            "/ai approve <id>    - подтвердить и применить рекомендацию (только оператор, allowlist)\n"
+            "/ai reject <id>     - отклонить ожидующую рекомендацию\n"
             "\n"
             "Советник может ЧИТАТЬ, АНАЛИЗИРОВАТЬ, ЗАПОМИНАТЬ, РЕФЛЕКСИРОВАТЬ и РЕКОМЕНДОВАТЬ. "
             "Он не исполняет сделки, не выводит средства и не меняет конфигурацию напрямую."
@@ -126,6 +138,12 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_balance_empty": "Балансы недоступны.",
         "ai_unknown_subcommand": "Неизвестная подкоманда /ai. Попробуйте /ai для справки.",
         "ai_not_configured": "AI-советник не настроен.",
+        "ai_approve_ok": "Одобрено {parameter}: {old} -> {proposed} (кем {approver})",
+        "ai_approve_fail": "Ошибка подтверждения: {error}",
+        "ai_reject_ok": "Отклонено {id} (кем {approver})",
+        "ai_reject_fail": "Ошибка отклонения: {error}",
+        "ai_approve_usage": "Использование: /ai approve <id>",
+        "ai_reject_usage": "Использование: /ai reject <id>",
     },
 }
 
@@ -155,7 +173,13 @@ def _ai_t(key: str, lang: str | None, **kwargs: Any) -> str:
 
 
 class AgentTelegramAdapter:
-    """Read-only Telegram-facing facade over :class:`AgentCore`.
+    """Telegram-facing facade over :class:`AgentCore` + approval.
+
+    * Read-only paths (``/ai status`` etc.) go via ``AgentCore`` /
+      ``AgentTools`` and never mutate config.
+    * Human-gated paths (``/ai approve`` / ``/ai reject``) go via the
+      explicit ``RecommendationApprovalService`` with allowlist + audit.
+      AI output can never invoke them.
 
     Every public method is ``async`` and returns a *localized* string ready
     to be sent via :meth:`TelegramClient.send_message`. No Telegram-specific
@@ -167,11 +191,11 @@ class AgentTelegramAdapter:
 
     .. code-block:: python
 
-        adapter = AgentTelegramAdapter(core, tools, lang_getter)
+        adapter = AgentTelegramAdapter(core, tools, approval_service)
         # inside TelegramBot.handle_update:
         if text.startswith("/ai"):
             lang = await lang_getter(user_id)
-            reply = await adapter.dispatch(text, lang=lang)
+            reply = await adapter.dispatch(text, lang=lang, approver=str(user_id))
             await self._safe_send(chat_id, reply)
     """
 
@@ -179,11 +203,13 @@ class AgentTelegramAdapter:
         self,
         core: AgentCore | None,
         tools: AgentTools | None = None,
+        approval_service: Any | None = None,
     ) -> None:
         self._core = core
         self._tools = tools
+        self._approval = approval_service
 
-    async def dispatch(self, text: str, *, lang: str | None = None) -> str:
+    async def dispatch(self, text: str, *, lang: str | None = None, approver: str | None = None) -> str:
         """Route ``/ai*`` text to the appropriate sub-handler.
 
         ``text`` is expected to be the full message (e.g. ``"/ai status"``).
@@ -211,6 +237,16 @@ class AgentTelegramAdapter:
             return await self.memory(lang=effective)
         if sub == "balance":
             return await self.balance(lang=effective)
+        if sub == "approve":
+            rec_id = parts[2].strip() if len(parts) > 2 else ""
+            if not rec_id:
+                return _ai_t("ai_approve_usage", effective)
+            return await self.approve(rec_id, lang=effective, approver=approver)
+        if sub == "reject":
+            rec_id = parts[2].strip() if len(parts) > 2 else ""
+            if not rec_id:
+                return _ai_t("ai_reject_usage", effective)
+            return await self.reject(rec_id, lang=effective, approver=approver)
 
         return _ai_t("ai_unknown_subcommand", effective)
 
@@ -348,3 +384,48 @@ class AgentTelegramAdapter:
             assets = ", ".join(f"{b.get('asset')} {b.get('free')}" for b in bals[:5]) if bals else "-"
             lines.append(_ai_t("ai_balance_line", effective, venue=venue, assets=assets))
         return "\n".join(lines)
+
+    async def approve(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._approval is None:
+            return _ai_t("ai_not_configured", effective)
+        if not approver:
+            # Must be human — fail-closed if approver missing
+            return _ai_t("ai_approve_fail", effective, error="approver required")
+        try:
+            # Redact rec_id (no secret, but still defensive)
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            rec_id = _redact(rec_id).strip()
+            result = await self._approval.approve(rec_id, approver=str(approver), reason=f"telegram /ai approve by {approver}")
+            return _ai_t(
+                "ai_approve_ok",
+                effective,
+                parameter=result.parameter,
+                old=result.old_value or result.current_value or "-",
+                proposed=result.proposed_value,
+                approver=approver,
+            )
+        except Exception as exc:  # noqa: BLE001 - telegram must not leak internal details
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            safe = _redact(str(exc))[:200]
+            return _ai_t("ai_approve_fail", effective, error=safe)
+
+    async def reject(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._approval is None:
+            return _ai_t("ai_not_configured", effective)
+        if not approver:
+            return _ai_t("ai_reject_fail", effective, error="approver required")
+        try:
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            rec_id = _redact(rec_id).strip()
+            await self._approval.reject(rec_id, approver=str(approver), reason=f"telegram /ai reject by {approver}")
+            return _ai_t("ai_reject_ok", effective, id=rec_id[:12], approver=approver)
+        except Exception as exc:  # noqa: BLE001
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            safe = _redact(str(exc))[:200]
+            return _ai_t("ai_reject_fail", effective, error=safe)

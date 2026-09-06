@@ -405,7 +405,7 @@ class TelegramBot:
                         reply_ai = t("internal_error", lang)
                     await self._safe_send(int(chat_id), reply_ai)
                     return
-                reply_ai = await adapter.dispatch(text, lang=lang)
+                reply_ai = await adapter.dispatch(text, lang=lang, approver=str(user_id) if user_id is not None else None)
                 # Bounded response length is enforced by _safe_send (3500 chars)
                 await self._safe_send(int(chat_id), reply_ai)
             except Exception as exc:  # noqa: BLE001 - adapter failure must never crash telegram
@@ -489,7 +489,10 @@ class TelegramBot:
             # ``build_agent`` is the single composition root for the advisor;
             # it shares ``self._services.db`` and wires read-only tools.
             core, _kb, _exp, _les, _rec_svc, tools = build_agent(self._services)
-            self._agent_adapter = AgentTelegramAdapter(core, tools)
+            # Approval service is human-gated; expose it to the adapter for
+            # ``/ai approve`` / ``/ai reject`` (authorized users only).
+            approval = getattr(self._services, "agent_approval_service", None)
+            self._agent_adapter = AgentTelegramAdapter(core, tools, approval_service=approval)
             return self._agent_adapter
         except Exception as exc:  # noqa: BLE001 - telegram must never crash on advisor build
             logger.warning(

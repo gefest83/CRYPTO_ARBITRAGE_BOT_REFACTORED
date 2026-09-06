@@ -106,6 +106,7 @@ class AppServices:
     agent_recommendations: Any = field(default=None)
     agent_recommendation_service: Any = field(default=None)
     agent_knowledge_service: Any = field(default=None)
+    agent_approval_service: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

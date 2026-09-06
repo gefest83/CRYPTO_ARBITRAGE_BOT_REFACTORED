@@ -59,6 +59,7 @@ from app.agent.models import (
     ReflectionResult,
     SourceType,
 )
+from app.agent.approval import RecommendationApprovalService
 from app.agent.providers.base import LLMProvider, NullProvider, EchoProvider
 from app.agent.providers import create_provider as _create_provider  # lazy, no network
 
@@ -85,6 +86,7 @@ __all__ = [
     "LessonRepository",
     "LLMProvider",
     "NullProvider",
+    "RecommendationApprovalService",
     "RecommendationRepository",
     "RecommendationService",
     "RecommendationStatus",
@@ -116,6 +118,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     lesson_repo = LessonRepository(db)
     rec_repo = RecommendationRepository(db)
     rec_service = RecommendationService(rec_repo)
+    approval_service = RecommendationApprovalService(db, services=services)
 
     # Expose advisor repos on services for tool access (non-intrusive, optional)
     # Tools will probe for these attributes; setting them makes get_memory /
@@ -126,6 +129,7 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     services.agent_recommendations = rec_repo  # type: ignore[attr-defined]
     services.agent_recommendation_service = rec_service  # type: ignore[attr-defined]
     services.agent_knowledge_service = knowledge_service  # type: ignore[attr-defined]
+    services.agent_approval_service = approval_service  # type: ignore[attr-defined]
 
     tools = AgentTools(services)
     collector = ContextCollector(

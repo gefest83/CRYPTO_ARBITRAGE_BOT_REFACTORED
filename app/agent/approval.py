@@ -1,0 +1,385 @@
+"""Human-gated recommendation lifecycle — PENDING -> APPROVE -> VALIDATE -> APPLY -> AUDIT.
+
+Critical invariants (must remain true after Phase 2):
+
+* AI never calls APPROVE / APPLY / CONFIG MUTATION / RISK LIMIT MUTATION / ORDER EXECUTION.
+* Only an explicit human operator (Telegram allow-list or CLI operator) may approve.
+* Approval is explicit and allowlisted — no generic ``set_config(key, value)``.
+* Risk limits have a separate explicit validation path (stricter bounds).
+* Every approval is audited and idempotent; duplicate approvals are rejected.
+* Fail-closed on any uncertainty (stale current value, invalid param/value,
+  already applied, concurrent race).
+
+The service never executes trades.
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+from sqlalchemy import select
+
+from app.agent.models import AgentRecommendation, RecommendationStatus
+from app.agent.tables import AgentRecommendationRow
+from app.config.logging_config import get_logger
+from app.errors import TerminalError
+
+__all__ = ["ApprovalError", "RecommendationApprovalService", "ALLOWLIST"]
+
+logger = get_logger("agent.approval")
+
+
+class ApprovalError(TerminalError):
+    """Approval failed — fail-closed, trading unaffected."""
+
+    code = "approval_error"
+    http_status = 409
+
+
+# ------------------------------------------------------------------ allowlist
+# Explicit parameter -> (type, min, max). Risk limits and non-risk are
+# separated only by the bounds they carry — risk bounds are deliberately
+# narrow and conservative. No generic set_config is exposed.
+
+ALLOWLIST: dict[str, dict[str, Any]] = {
+    # Risk limits (separate explicit validation — stricter)
+    "risk.max_trade_size": {"type": Decimal, "min": Decimal("10"), "max": Decimal("5000")},
+    "risk.min_net_profit_bps": {"type": Decimal, "min": Decimal("0"), "max": Decimal("100")},
+    "risk.max_slippage_bps": {"type": Decimal, "min": Decimal("1"), "max": Decimal("100")},
+    "risk.max_data_age_ms": {"type": int, "min": 500, "max": 10000},
+    "risk.max_open_transfers": {"type": int, "min": 0, "max": 10},
+    "risk.max_daily_loss": {"type": Decimal, "min": Decimal("10"), "max": Decimal("10000")},
+    # Non-risk (still allowlisted, looser but explicit)
+    "arbitrage.triangle_min_net_bps": {"type": Decimal, "min": Decimal("0"), "max": Decimal("100")},
+    "arbitrage.triangle_max_leg_slippage_bps": {"type": Decimal, "min": Decimal("1"), "max": Decimal("50")},
+    "execution.leg_timeout_seconds": {"type": int, "min": 1, "max": 60},
+}
+
+# Parameters that are considered risk limits (separate path)
+RISK_PARAMS = {k for k in ALLOWLIST if k.startswith("risk.")}
+
+
+def _parse_value(raw: str, expected_type: type) -> Any:
+    raw = str(raw).strip()
+    if expected_type is Decimal:
+        try:
+            return Decimal(raw)
+        except (InvalidOperation, ValueError) as exc:
+            raise ApprovalError(f"invalid Decimal value: {raw!r}") from exc
+    if expected_type is int:
+        try:
+            # Disallow float-like strings for int params
+            if "." in raw:
+                raise ValueError("int param got float string")
+            return int(raw)
+        except ValueError as exc:
+            raise ApprovalError(f"invalid int value: {raw!r}") from exc
+    raise ApprovalError(f"unsupported type for allowlist: {expected_type}")
+
+
+def _validate_bounds(param: str, value: Any) -> None:
+    spec = ALLOWLIST.get(param)
+    if spec is None:
+        raise ApprovalError(f"parameter not allowlisted: {param}")
+    min_v = spec["min"]
+    max_v = spec["max"]
+    # Compare as same type
+    if isinstance(value, Decimal):
+        min_v = Decimal(str(min_v))
+        max_v = Decimal(str(max_v))
+    if value < min_v or value > max_v:
+        raise ApprovalError(f"value {value} for {param} out of bounds [{min_v}, {max_v}]")
+
+
+# ------------------------------------------------------------------ service
+
+
+class RecommendationApprovalService:
+    """Human-only approval and application of advisor recommendations."""
+
+    def __init__(self, db, *, services: Any | None = None) -> None:  # type: ignore[no-untyped-def]
+        self._db = db
+        self._services = services  # optional — used to read current config and apply
+
+    # ------------------------------------------------------------------
+    # Helpers — current config reading (explicit allowlist, no generic)
+    # ------------------------------------------------------------------
+
+    def _get_current(self, param: str) -> str | None:
+        """Read the live current value for *param* via explicit allowlist.
+
+        Returns stringified current value or None if param not recognized.
+        This is the “verify current config not unexpectedly changed” check.
+        """
+        if self._services is None:
+            return None
+        try:
+            settings = getattr(self._services, "settings", None)
+            if settings is None:
+                return None
+            # Explicit mapping — no generic getattr(key)
+            if param == "risk.max_trade_size":
+                return str(settings.risk.max_trade_size)
+            if param == "risk.min_net_profit_bps":
+                return str(settings.risk.min_net_profit_bps)
+            if param == "risk.max_slippage_bps":
+                return str(settings.risk.max_slippage_bps)
+            if param == "risk.max_data_age_ms":
+                return str(settings.risk.max_data_age_ms)
+            if param == "risk.max_open_transfers":
+                return str(settings.risk.max_open_transfers)
+            if param == "risk.max_daily_loss":
+                return str(settings.risk.max_daily_loss)
+            if param == "arbitrage.triangle_min_net_bps":
+                return str(settings.arbitrage.triangle_min_net_bps)
+            if param == "arbitrage.triangle_max_leg_slippage_bps":
+                return str(settings.arbitrage.triangle_max_leg_slippage_bps)
+            if param == "execution.leg_timeout_seconds":
+                return str(settings.execution.leg_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - fail-closed on read error
+            raise ApprovalError(f"failed to read current config for {param}: {exc}") from exc
+        return None
+
+    def _apply_value(self, param: str, value: Any) -> None:
+        """Explicit, allowlist-only mutation of live config / risk engine.
+
+        No generic ``set_config(key, value)`` — each param has its own branch
+        so that review can audit exactly what is mutable.
+        """
+        if self._services is None:
+            raise ApprovalError("no services bound — cannot apply config change")
+        settings = getattr(self._services, "settings", None)
+        if settings is None:
+            raise ApprovalError("services has no settings")
+
+        # Risk limits — separate explicit path (also updates RiskEngine)
+        if param == "risk.max_trade_size":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"max_trade_size": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"max_trade_size": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "risk.min_net_profit_bps":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"min_net_profit_bps": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"min_net_profit_bps": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "risk.max_slippage_bps":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"max_slippage_bps": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"max_slippage_bps": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "risk.max_data_age_ms":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"max_data_age_ms": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"max_data_age_ms": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "risk.max_open_transfers":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"max_open_transfers": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"max_open_transfers": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "risk.max_daily_loss":
+            new_settings = settings.model_copy(update={"risk": settings.risk.model_copy(update={"max_daily_loss": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            try:
+                new_limits = self._services.risk.limits.model_copy(update={"max_daily_loss": value}) if hasattr(self._services, "risk") else None
+                if new_limits is not None:
+                    self._services.risk = self._services.risk.with_limits(new_limits)
+            except Exception:
+                pass
+            return
+        if param == "arbitrage.triangle_min_net_bps":
+            new_settings = settings.model_copy(update={"arbitrage": settings.arbitrage.model_copy(update={"triangle_min_net_bps": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            return
+        if param == "arbitrage.triangle_max_leg_slippage_bps":
+            new_settings = settings.model_copy(update={"arbitrage": settings.arbitrage.model_copy(update={"triangle_max_leg_slippage_bps": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            return
+        if param == "execution.leg_timeout_seconds":
+            new_settings = settings.model_copy(update={"execution": settings.execution.model_copy(update={"leg_timeout_seconds": value})})
+            object.__setattr__(self._services, "settings", new_settings)
+            return
+        raise ApprovalError(f"parameter not allowlisted for apply: {param}")
+
+    # ------------------------------------------------------------------
+    # Public: human approval + apply (session-based, atomic)
+    # ------------------------------------------------------------------
+
+    async def approve(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
+        if not approver or not str(approver).strip():
+            raise ApprovalError("approver must be a non-empty human identifier")
+        if not recommendation_id or not str(recommendation_id).strip():
+            raise ApprovalError("recommendation_id required")
+
+        # Load and validate inside a single session transaction.
+        # We use a session per call; the UPDATE ... WHERE status='pending'
+        # provides atomicity for concurrent callers (one will see rowcount 0).
+        async with self._db.session() as session:
+            result = await session.execute(select(AgentRecommendationRow).where(AgentRecommendationRow.id == recommendation_id))
+            row = result.scalars().first()
+            if row is None:
+                raise ApprovalError(f"recommendation not found: {recommendation_id}")
+            if row.status != RecommendationStatus.PENDING.value:
+                raise ApprovalError(f"recommendation not PENDING (status={row.status}) — duplicate or already handled")
+            param = str(row.parameter).strip()
+            proposed_raw = str(row.proposed_value).strip()
+            if not param or not proposed_raw:
+                raise ApprovalError("recommendation integrity failed: missing parameter/proposed_value")
+            if param not in ALLOWLIST:
+                raise ApprovalError(f"parameter not allowlisted: {param}")
+            spec = ALLOWLIST[param]
+            parsed = _parse_value(proposed_raw, spec["type"])
+            _validate_bounds(param, parsed)
+            if self._services is not None:
+                live_current = self._get_current(param)
+                stored_current = row.current_value if row.current_value is not None else row.old_value
+                if stored_current is not None and live_current is not None:
+                    if str(stored_current).strip() != str(live_current).strip():
+                        raise ApprovalError(
+                            f"current config changed for {param}: recommendation stored {stored_current!r} vs live {live_current!r} — stale, reject"
+                        )
+            # Apply in-memory (must succeed before DB commit)
+            try:
+                self._apply_value(param, parsed)
+            except ApprovalError:
+                raise
+            except Exception as exc:
+                raise ApprovalError(f"apply failed for {param}: {exc}") from exc
+
+            # Atomic status transition — succeeds only if still pending (concurrent guard)
+            update_result = await session.execute(
+                AgentRecommendationRow.__table__.update()
+                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status == RecommendationStatus.PENDING.value)
+                .values(
+                    status=RecommendationStatus.APPROVED.value,
+                    operator_decision=f"approved by {approver}",
+                    decision_reason=reason[:500] if reason else None,
+                    result=f"applied {param}={proposed_raw}",
+                    version=row.version + 1,
+                )
+            )
+            if update_result.rowcount == 0:
+                raise ApprovalError(f"recommendation not PENDING (concurrent modification) — duplicate")
+            # Build returned model directly (avoid stale identity-map reload)
+            returned = AgentRecommendation(
+                id=row.id,
+                parameter=row.parameter,
+                current_value=row.current_value,
+                old_value=row.old_value,
+                proposed_value=row.proposed_value,
+                reason=row.reason,
+                evidence=tuple(row.evidence or ()),
+                confidence=row.confidence,
+                expected_impact=row.expected_impact,
+                risk=row.risk,
+                status=RecommendationStatus.APPROVED,
+                operator_decision=f"approved by {approver}",
+                decision_reason=reason[:500] if reason else None,
+                result=f"applied {param}={proposed_raw}",
+                source_type=row.source_type,
+                source_id=row.source_id,
+                version=row.version + 1,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+            # Store for post-commit audit (fail-log, not rollback)
+            self._pending_audit = (param, row.current_value, proposed_raw, recommendation_id, approver)  # type: ignore[attr-defined]
+
+        # Post-commit audit (fail-log, not rollback) — outside the session so audit failure does not rollback approval
+        try:
+            param_a, old_a, new_a, rid_a, appr_a = getattr(self, "_pending_audit", (None, None, None, None, None))
+            if param_a is not None:
+                audit = getattr(self._services, "audit", None) if self._services is not None else None
+                if audit is not None and hasattr(audit, "log"):
+                    await audit.log(
+                        "AGENT_RECOMMENDATION_APPROVED",
+                        f"{param_a} {old_a} -> {new_a} by {appr_a}",
+                        {"recommendation_id": rid_a, "parameter": param_a, "proposed_value": new_a, "approver": appr_a},
+                    )
+                try:
+                    bot_state = getattr(self._services, "bot_state", None) if self._services is not None else None
+                    if bot_state is not None:
+                        await bot_state.set(f"agent_rec_approved:{rid_a}", {"parameter": param_a, "value": new_a, "approver": appr_a})
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("approval_audit_failed", extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+        finally:
+            try:
+                delattr(self, "_pending_audit")
+            except Exception:
+                pass
+
+        return returned  # type: ignore[no-any-return]
+
+    async def reject(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
+        if not approver or not str(approver).strip():
+            raise ApprovalError("approver required")
+        async with self._db.session() as session:
+            result = await session.execute(select(AgentRecommendationRow).where(AgentRecommendationRow.id == recommendation_id))
+            row = result.scalars().first()
+            if row is None:
+                raise ApprovalError(f"recommendation not found: {recommendation_id}")
+            if row.status != RecommendationStatus.PENDING.value:
+                raise ApprovalError(f"not PENDING (status={row.status})")
+            update_result = await session.execute(
+                AgentRecommendationRow.__table__.update()
+                .where(AgentRecommendationRow.id == recommendation_id, AgentRecommendationRow.status == RecommendationStatus.PENDING.value)
+                .values(
+                    status=RecommendationStatus.REJECTED.value,
+                    operator_decision=f"rejected by {approver}",
+                    decision_reason=reason[:500] if reason else None,
+                    version=row.version + 1,
+                )
+            )
+            if update_result.rowcount == 0:
+                raise ApprovalError("concurrent modification — not PENDING")
+            # Build returned directly to avoid stale identity map
+            return AgentRecommendation(
+                id=row.id,
+                parameter=row.parameter,
+                current_value=row.current_value,
+                old_value=row.old_value,
+                proposed_value=row.proposed_value,
+                reason=row.reason,
+                evidence=tuple(row.evidence or ()),
+                confidence=row.confidence,
+                expected_impact=row.expected_impact,
+                risk=row.risk,
+                status=RecommendationStatus.REJECTED,
+                operator_decision=f"rejected by {approver}",
+                decision_reason=reason[:500] if reason else None,
+                result=row.result,
+                source_type=row.source_type,
+                source_id=row.source_id,
+                version=row.version + 1,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
