@@ -172,6 +172,25 @@ def _ai_t(key: str, lang: str | None, **kwargs: Any) -> str:
     return template
 
 
+def _finalize_telegram(text: str) -> str:
+    """Bound and sanitize Telegram output — no secret leakage, never exceeds 3000 chars.
+
+    All adapter outputs go through this so that even a malicious DB value
+    cannot produce an unbounded or secret-leaking Telegram message.
+    """
+    from app.agent.providers.base import filter_secrets_from_text, sanitize_untrusted_text
+    from app.exchanges.sanitize import redact_secrets as _redact
+
+    # Layered defense: redact, secret filter, injection sanitize, then bound
+    cleaned = _redact(text)
+    cleaned = filter_secrets_from_text(cleaned)
+    # Note: we do not fully sanitize the whole translated template (it is trusted),
+    # but we bound the final length strictly.
+    if len(cleaned) > 3000:
+        cleaned = cleaned[:2980] + "... (truncated)"
+    return cleaned
+
+
 class AgentTelegramAdapter:
     """Telegram-facing facade over :class:`AgentCore` + approval.
 
@@ -217,11 +236,11 @@ class AgentTelegramAdapter:
         """
         effective = lang if lang in ("en", "ru") else "en"
         if self._core is None and self._tools is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
 
         parts = text.strip().split()
         if not parts or parts[0].lower() != "/ai":
-            return _ai_t("ai_help", effective)
+            return _finalize_telegram(_ai_t("ai_help", effective))
 
         sub = parts[1].lower() if len(parts) > 1 else ""
         # Legacy: bare /ai is help
@@ -240,19 +259,19 @@ class AgentTelegramAdapter:
         if sub == "approve":
             rec_id = parts[2].strip() if len(parts) > 2 else ""
             if not rec_id:
-                return _ai_t("ai_approve_usage", effective)
+                return _finalize_telegram(_ai_t("ai_approve_usage", effective))
             return await self.approve(rec_id, lang=effective, approver=approver)
         if sub == "reject":
             rec_id = parts[2].strip() if len(parts) > 2 else ""
             if not rec_id:
-                return _ai_t("ai_reject_usage", effective)
+                return _finalize_telegram(_ai_t("ai_reject_usage", effective))
             return await self.reject(rec_id, lang=effective, approver=approver)
 
-        return _ai_t("ai_unknown_subcommand", effective)
+        return _finalize_telegram(_ai_t("ai_unknown_subcommand", effective))
 
     async def help(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
-        return _ai_t("ai_help", effective)
+        return _finalize_telegram(_ai_t("ai_help", effective))
 
     async def status(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
@@ -279,7 +298,7 @@ class AgentTelegramAdapter:
                 lines[-1] = _ai_t("ai_status_recommendations", effective, count=pending)
             except Exception:
                 pass
-        return "\n".join(lines)
+        return _finalize_telegram("\n".join(lines))
 
     async def report(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
@@ -288,34 +307,66 @@ class AgentTelegramAdapter:
         try:
             resp = await self._core.handle(AgentRequest(query="report", language=effective))
         except Exception as exc:  # noqa: BLE001 - telegram must never propagate exceptions
-            return f"{_ai_t('ai_report_no_action', effective, reason=str(exc)[:120])}"
+            from app.exchanges.sanitize import redact_secrets as _redact
+            from app.agent.providers.base import filter_secrets_from_text as _filt, sanitize_untrusted_text as _san
+
+            safe = _san(_filt(_redact(str(exc)[:200])))
+            return _finalize_telegram(f"{_ai_t('ai_report_no_action', effective, reason=safe[:120])}")
+        # Use structured analysis if available for richer report (Phase 3D)
+        # Graceful LLM failure: if analysis is None, fall back to reflection
         if resp.is_no_action or resp.reflection is None or resp.reflection.is_no_action:
             reason = resp.reflection.reason if resp.reflection else "no data"
-            return _ai_t("ai_report_no_action", effective, reason=reason)
+            # Sanitize reason (untrusted)
+            from app.agent.providers.base import sanitize_untrusted_text as _san
+
+            safe_reason = _san(reason)[:200]
+            return _finalize_telegram(_ai_t("ai_report_no_action", effective, reason=safe_reason))
+        # Prefer analysis for evidence_count/action when present
+        analysis = getattr(resp, "analysis", None)
         obs = resp.reflection.observation
         if obs is None:
-            return _ai_t("ai_report_no_action", effective, reason=resp.reflection.reason if resp.reflection else "empty")
-        return _ai_t(
+            return _finalize_telegram(_ai_t("ai_report_no_action", effective, reason=resp.reflection.reason if resp.reflection else "empty"))
+        # Build structured report with Phase 3D fields
+        from app.agent.providers.base import sanitize_untrusted_text as _san, filter_secrets_from_text as _filt
+        from app.exchanges.sanitize import redact_secrets as _redact
+
+        def _safe(s: str, n: int) -> str:
+            return _san(_filt(_redact(str(s))))[:n]
+
+        # Include evidence_count, probable_cause, recurring_pattern for usefulness
+        evidence_cnt = getattr(obs, "evidence_count", 0) or getattr(resp, "analysis", None) and getattr(resp.analysis, "evidence_count", 0) or 0
+        action = getattr(analysis, "action", resp.reflection.action) if analysis else resp.reflection.action
+        probable = getattr(obs, "probable_cause", None) or "-"
+        recurring = getattr(obs, "recurring_pattern", None) or obs.possible_pattern or "-"
+        # Bounded, sanitized
+        result = _ai_t(
             "ai_report_insight",
             effective,
             confidence=obs.confidence,
-            happened=obs.what_happened[:120],
-            expected=obs.what_expected[:120],
-            differed=obs.what_differed[:180],
-            pattern=(obs.possible_pattern or "-")[:180],
+            happened=_safe(obs.what_happened, 120),
+            expected=_safe(obs.what_expected, 120),
+            differed=_safe(obs.what_differed, 180),
+            pattern=_safe(recurring, 180),
         )
+        # Append structured footer (bounded, never exceeds telegram limit)
+        footer = f"\n  evidence: {evidence_cnt} | action: {action} | cause: {_safe(probable, 80)}"
+        combined = result + footer
+        # Hard bound: ensure telegram output never exceeds 3000 chars (Phase 3D)
+        if len(combined) > 3000:
+            combined = combined[:2980] + "... (truncated)"
+        return _finalize_telegram(combined)
 
     async def recommendations(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._tools is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
         try:
             recs = await self._tools.get_previous_recommendations(limit=10)
         except Exception:
-            return _ai_t("ai_recommendations_empty", effective)
+            return _finalize_telegram(_ai_t("ai_recommendations_empty", effective))
         pending = [r for r in recs if str(r.get("status", "")).lower() in ("pending", "draft")]
         if not pending:
-            return _ai_t("ai_recommendations_empty", effective)
+            return _finalize_telegram(_ai_t("ai_recommendations_empty", effective))
         lines: list[str] = [_ai_t("ai_recommendations_header", effective, count=len(pending))]
         for rec in pending[:5]:
             lines.append(
@@ -329,20 +380,20 @@ class AgentTelegramAdapter:
                     confidence=float(rec.get("confidence", 0.5)),
                 )
             )
-        return "\n".join(lines)
+        return _finalize_telegram("\n".join(lines))
 
     async def memory(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._tools is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
         try:
             mem = await self._tools.get_memory(limit=5)
         except Exception:
-            return _ai_t("ai_memory_empty", effective)
+            return _finalize_telegram(_ai_t("ai_memory_empty", effective))
         exps = mem.get("experiences", []) if isinstance(mem, dict) else []
         les = mem.get("lessons", []) if isinstance(mem, dict) else []
         if not exps and not les:
-            return _ai_t("ai_memory_empty", effective)
+            return _finalize_telegram(_ai_t("ai_memory_empty", effective))
         lines: list[str] = [_ai_t("ai_memory_header", effective, count=len(exps) + len(les))]
         for exp in exps[:3]:
             lines.append(
@@ -366,66 +417,68 @@ class AgentTelegramAdapter:
                     confidence=float(lesson.get("confidence", 0.5)),
                 )
             )
-        return "\n".join(lines)
+        return _finalize_telegram("\n".join(lines))
 
     async def balance(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._tools is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
         try:
             snaps = await self._tools.get_balances()
         except Exception:
-            return _ai_t("ai_balance_empty", effective)
+            return _finalize_telegram(_ai_t("ai_balance_empty", effective))
         if not snaps:
-            return _ai_t("ai_balance_empty", effective)
+            return _finalize_telegram(_ai_t("ai_balance_empty", effective))
         lines: list[str] = [_ai_t("ai_balance_title", effective)]
         for venue, data in snaps.items():
             bals = data.get("balances", []) if isinstance(data, dict) else []
             assets = ", ".join(f"{b.get('asset')} {b.get('free')}" for b in bals[:5]) if bals else "-"
             lines.append(_ai_t("ai_balance_line", effective, venue=venue, assets=assets))
-        return "\n".join(lines)
+        return _finalize_telegram("\n".join(lines))
 
     async def approve(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._approval is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
         if not approver:
             # Must be human — fail-closed if approver missing
-            return _ai_t("ai_approve_fail", effective, error="approver required")
+            return _finalize_telegram(_ai_t("ai_approve_fail", effective, error="approver required"))
         try:
             # Redact rec_id (no secret, but still defensive)
             from app.exchanges.sanitize import redact_secrets as _redact
 
             rec_id = _redact(rec_id).strip()
             result = await self._approval.approve(rec_id, approver=str(approver), reason=f"telegram /ai approve by {approver}")
-            return _ai_t(
-                "ai_approve_ok",
-                effective,
-                parameter=result.parameter,
-                old=result.old_value or result.current_value or "-",
-                proposed=result.proposed_value,
-                approver=approver,
+            return _finalize_telegram(
+                _ai_t(
+                    "ai_approve_ok",
+                    effective,
+                    parameter=result.parameter,
+                    old=result.old_value or result.current_value or "-",
+                    proposed=result.proposed_value,
+                    approver=approver,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - telegram must not leak internal details
             from app.exchanges.sanitize import redact_secrets as _redact
 
             safe = _redact(str(exc))[:200]
-            return _ai_t("ai_approve_fail", effective, error=safe)
+            return _finalize_telegram(_ai_t("ai_approve_fail", effective, error=safe))
 
     async def reject(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._approval is None:
-            return _ai_t("ai_not_configured", effective)
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
         if not approver:
-            return _ai_t("ai_reject_fail", effective, error="approver required")
+            return _finalize_telegram(_ai_t("ai_reject_fail", effective, error="approver required"))
         try:
             from app.exchanges.sanitize import redact_secrets as _redact
 
             rec_id = _redact(rec_id).strip()
             await self._approval.reject(rec_id, approver=str(approver), reason=f"telegram /ai reject by {approver}")
-            return _ai_t("ai_reject_ok", effective, id=rec_id[:12], approver=approver)
+            return _finalize_telegram(_ai_t("ai_reject_ok", effective, id=rec_id[:12], approver=approver))
         except Exception as exc:  # noqa: BLE001
             from app.exchanges.sanitize import redact_secrets as _redact
 
             safe = _redact(str(exc))[:200]
-            return _ai_t("ai_reject_fail", effective, error=safe)
+            return _finalize_telegram(_ai_t("ai_reject_fail", effective, error=safe))
