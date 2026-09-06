@@ -117,6 +117,9 @@ class AppServices:
     agent_lesson_history: Any = field(default=None)
     agent_memory_labels: Any = field(default=None)
     agent_reflection: Any = field(default=None)
+    #: Phase 6: event-driven operator notifications (wired by
+    #: :func:`app.agent.build_agent`; ``None`` until then; explicit scan only).
+    agent_notifications: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

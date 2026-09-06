@@ -54,6 +54,7 @@ from app.agent.extraction import (
 )
 from app.agent.journal import JournalReader
 from app.agent.knowledge import KnowledgeRepository, KnowledgeService
+from app.agent.notifications import EVENT_TYPES, NotificationEvent, NotificationService
 from app.agent.memory import (
     ExperienceRepository,
     FeedbackRepository,
@@ -118,6 +119,8 @@ __all__ = [
     "LessonRepository",
     "LLMProvider",
     "MemoryLabelRepository",
+    "NotificationEvent",
+    "NotificationService",
     "NullProvider",
     "RESEARCH_KNOWLEDGE",
     "RecommendationApprovalService",
@@ -188,6 +191,10 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     services.agent_memory_labels = label_repo  # type: ignore[attr-defined]
     scheduler = ReflectionScheduler()
     services.agent_reflection = scheduler  # type: ignore[attr-defined]
+
+    # Phase 6: event-driven operator notifications (explicit scan, never auto).
+    notifier = NotificationService(services)
+    services.agent_notifications = notifier  # type: ignore[attr-defined]
 
     tools = AgentTools(services)
     collector = ContextCollector(

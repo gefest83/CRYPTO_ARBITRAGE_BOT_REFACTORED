@@ -456,6 +456,30 @@ class AgentSettings(_Section):
     reflection_weekly_enabled: bool = True
     reflection_daily_hours: float = Field(default=24.0, gt=0, le=168)
     reflection_weekly_hours: float = Field(default=168.0, gt=0, le=720)
+    # --- Event notifications (Phase 6 — Telegram Notifications) ---
+    # Disabled by default (fail-quiet): the operator opts in explicitly.
+    # ``notifications_events`` empty = all event types enabled; otherwise only
+    # the listed types are sent. Names are lowercased; unknown names dropped.
+    notifications_enabled: bool = False
+    notifications_events: tuple[str, ...] = ()
+    notifications_max_per_hour: int = Field(default=20, ge=1, le=200)
+    notifications_daily_enabled: bool = True
+
+    @field_validator("notifications_events", mode="before")
+    @classmethod
+    def _split_notification_events(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
+    @field_validator("notifications_events", mode="after")
+    @classmethod
+    def _normalise_notification_events(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        from app.agent.notifications import EVENT_TYPES
+
+        return tuple(dict.fromkeys(
+            v.strip().lower() for v in values if v.strip() and v.strip().lower() in EVENT_TYPES
+        ))
 
     @field_validator("provider", mode="before")
     @classmethod
