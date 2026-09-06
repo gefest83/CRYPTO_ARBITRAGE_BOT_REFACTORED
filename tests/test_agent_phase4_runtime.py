@@ -635,23 +635,24 @@ async def test_phase4_human_approval_mandatory(tmp_path):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_phase4_real_openrouter_conditional():
-    """Real OpenRouter request — only when CAT_AGENT__API_KEY is non-empty.
+    """Real OpenRouter request — only when .env CAT_AGENT__API_KEY is non-empty.
 
-    Skipped (reported as pending) when the key is empty. Never logs the key.
+    Reads via Settings (which loads local .env), NOT via os.getenv, so the
+    existing .env credentials are honoured. Skipped (pending) when empty.
+    Never logs the key. Exactly one bounded call.
     """
-    import os
+    from app.config.settings import reload_settings
 
-    key = (os.getenv("CAT_AGENT__API_KEY") or "").strip()
+    s = reload_settings()
+    key = (s.agent.api_key.get_secret_value() or "").strip()
     if not key:
-        pytest.skip("real OpenRouter pending: CAT_AGENT__API_KEY empty")
+        pytest.skip("real OpenRouter pending: CAT_AGENT__API_KEY empty (.env)")
     # Non-empty key present — make one bounded real call, fail-closed on error.
-    from pydantic import SecretStr as _SS
-
     from app.agent.providers.base import LLMMessage, LLMRequest
     from app.agent.providers.openrouter import OpenRouterProvider
 
-    model = (os.getenv("CAT_AGENT__MODEL") or "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
-    p = OpenRouterProvider(api_key=_SS(key), model=model, timeout_seconds=15, max_retries=0)
+    model = (s.agent.model or "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
+    p = OpenRouterProvider(api_key=s.agent.api_key, model=model, timeout_seconds=15, max_retries=0)
     resp = await p.complete(LLMRequest(messages=(LLMMessage(role="user", content="Say OK in one word."),)))
     assert resp.content and len(resp.content.strip()) > 0
     assert len(resp.content) <= 4000
