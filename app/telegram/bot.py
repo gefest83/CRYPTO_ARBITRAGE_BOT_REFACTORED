@@ -90,6 +90,7 @@ COMMANDS: tuple[str, ...] = (
     "/stop_trading",
     "/language",
     "/strategy",
+    "/ai",
 )
 
 HELP_TEXT = (
@@ -105,6 +106,7 @@ HELP_TEXT = (
     "/stop_trading  - stop the auto-trading loop (idempotent)\n"
     "/language     - choose language (English / Русский)\n"
     "/strategy     - choose strategy (Triangle / Transfer)\n"
+    "/ai           - AI Advisor (read-only: /ai status/report/recommendations/memory/balance)\n"
     "\n"
     "Order placement, transfers and withdrawals are NOT exposed here — "
     "use the CLI for any execution that moves funds."
@@ -140,6 +142,9 @@ class TelegramBot:
         self._services = services
         self._client = client
         self._auto_task: asyncio.Task | None = None
+        # AI Advisor adapter — lazily built so that telegram startup never blocks
+        # on agent wiring and never pulls LLM credentials at import time.
+        self._agent_adapter: Any | None = None
 
     # ---------------------------------------------------------------- language
     async def _get_lang(self, user_id: int | None) -> str | None:
@@ -380,6 +385,42 @@ class TelegramBot:
             await self._send_picker(int(chat_id))
             return
 
+        # ------------------------------------------------------------------
+        # AI Advisor — thin, read-only layer (no trading, no mutation)
+        # Architecture: Telegram -> AgentTelegramAdapter -> AgentCore ->
+        # read-only context / memory / knowledge / analysis
+        # ------------------------------------------------------------------
+        if command == "/ai":
+            # Authorized and language-checked above; delegate full text so that
+            # "/ai status", "/ai report", etc. are handled by the adapter.
+            try:
+                adapter = await self._get_agent_adapter()
+                if adapter is None:
+                    # Advisor not wired — graceful, localized empty-state handling
+                    try:
+                        from app.agent.telegram import _ai_t  # type: ignore[import-not-found]
+
+                        reply_ai = _ai_t("ai_not_configured", lang)
+                    except Exception:
+                        reply_ai = t("internal_error", lang)
+                    await self._safe_send(int(chat_id), reply_ai)
+                    return
+                reply_ai = await adapter.dispatch(text, lang=lang)
+                # Bounded response length is enforced by _safe_send (3500 chars)
+                await self._safe_send(int(chat_id), reply_ai)
+            except Exception as exc:  # noqa: BLE001 - adapter failure must never crash telegram
+                logger.error(
+                    "telegram_ai_failed",
+                    extra={
+                        "command": text[:80],
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "error": redact_secrets(str(exc))[:300],
+                    },
+                )
+                await self._safe_send(int(chat_id), t("internal_error", lang))
+            return
+
         # DEMO strategy gate for /start_trading
         if command == "/start_trading":
             from app.models.enums import TradingMode
@@ -431,6 +472,31 @@ class TelegramBot:
         """
         cfg = self._services.settings.telegram
         return user_id is not None and user_id in cfg.allowed_user_ids
+
+    async def _get_agent_adapter(self) -> Any | None:
+        """Lazy, fail-closed construction of the AI advisor adapter.
+
+        No network I/O is performed here — only in-memory wiring. The
+        provider itself is only contacted when the adapter dispatches an
+        ``/ai`` request to ``AgentCore``.
+        """
+        if self._agent_adapter is not None:
+            return self._agent_adapter
+        try:
+            from app.agent import build_agent
+            from app.agent.telegram import AgentTelegramAdapter
+
+            # ``build_agent`` is the single composition root for the advisor;
+            # it shares ``self._services.db`` and wires read-only tools.
+            core, _kb, _exp, _les, _rec_svc, tools = build_agent(self._services)
+            self._agent_adapter = AgentTelegramAdapter(core, tools)
+            return self._agent_adapter
+        except Exception as exc:  # noqa: BLE001 - telegram must never crash on advisor build
+            logger.warning(
+                "telegram_agent_adapter_build_failed",
+                extra={"error": redact_secrets(str(exc))[:200]},
+            )
+            return None
 
     # ---------------------------------------------------------------- commands
     async def _cmd_start(self, lang: str) -> str:
