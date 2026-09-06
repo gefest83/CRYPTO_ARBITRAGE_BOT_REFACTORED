@@ -160,6 +160,22 @@ class AnalysisEngine:
             raw_facts.append(_truncate(f"previous_recommendations: {len(previous_recommendations)}", MAX_SINGLE_FACT_CHARS))
         elif context.previous_recommendations:
             raw_facts.append(_truncate(f"previous_recommendations: {len(context.previous_recommendations)}", MAX_SINGLE_FACT_CHARS))
+        # Knowledge facts — repository vs external stay labeled; assumptions/
+        # hypotheses/recommendations never enter facts (separation enforced).
+        for hit in list(context.knowledge_hits)[:MAX_KNOWLEDGE_HITS]:
+            if not isinstance(hit, dict):
+                continue
+            source_type = str(hit.get("source_type", "repository") or "repository")
+            source_id = str(hit.get("source_id", "?") or "?")[:120]
+            section = str(hit.get("section", "") or "")[:80]
+            verification = str(hit.get("verification_status", "unverified") or "unverified")[:16]
+            title = str(hit.get("title", "") or "")[:80]
+            summary = str(hit.get("summary") or hit.get("excerpt") or "")[:200]
+            label = "repo-fact" if source_type == "repository" else "external-fact"
+            where = f"{source_id}#{section}" if section else source_id
+            raw_facts.append(
+                _truncate(f"{label} [{where}|{verification}] {title}: {summary}", MAX_SINGLE_FACT_CHARS)
+            )
 
         facts = _bound_list(raw_facts, MAX_FACTS, MAX_SINGLE_FACT_CHARS)
 

@@ -22,15 +22,21 @@ from app.models.base import DomainModel, utc_now
 
 __all__ = [
     "AgentRecommendation",
+    "BOT_KNOWLEDGE",
+    "EXCHANGE_KNOWLEDGE",
     "EvidenceRef",
     "Experience",
     "KnowledgeCategory",
+    "KnowledgeChunk",
     "KnowledgeDocument",
     "Lesson",
+    "RESEARCH_KNOWLEDGE",
     "RecommendationStatus",
     "ReflectionObservation",
     "ReflectionResult",
     "SourceType",
+    "TRADING_KNOWLEDGE",
+    "normalize_knowledge_category",
 ]
 
 
@@ -42,6 +48,39 @@ class KnowledgeCategory(StrEnum):
     EXCHANGE = "exchange"
     TRADING = "trading"
     RESEARCH = "research"
+
+
+# Phase 3 aliases: project plan names for the same four categories.
+# Repository knowledge uses these; external knowledge uses the same
+# categories but a non-repository ``source_type`` so the two stay distinct.
+BOT_KNOWLEDGE: KnowledgeCategory = KnowledgeCategory.BOT
+EXCHANGE_KNOWLEDGE: KnowledgeCategory = KnowledgeCategory.EXCHANGE
+TRADING_KNOWLEDGE: KnowledgeCategory = KnowledgeCategory.TRADING
+RESEARCH_KNOWLEDGE: KnowledgeCategory = KnowledgeCategory.RESEARCH
+
+_CATEGORY_ALIASES: dict[str, KnowledgeCategory] = {
+    "bot": KnowledgeCategory.BOT,
+    "bot_knowledge": KnowledgeCategory.BOT,
+    "exchange": KnowledgeCategory.EXCHANGE,
+    "exchange_knowledge": KnowledgeCategory.EXCHANGE,
+    "trading": KnowledgeCategory.TRADING,
+    "trading_knowledge": KnowledgeCategory.TRADING,
+    "research": KnowledgeCategory.RESEARCH,
+    "research_knowledge": KnowledgeCategory.RESEARCH,
+}
+
+
+def normalize_knowledge_category(value: Any) -> KnowledgeCategory:
+    """Normalize ``BOT`` / ``BOT_KNOWLEDGE`` (any case) to :class:`KnowledgeCategory`.
+
+    Raises ``ValueError`` for unknown categories.
+    """
+    if isinstance(value, KnowledgeCategory):
+        return value
+    key = str(value).strip().lower()
+    if key in _CATEGORY_ALIASES:
+        return _CATEGORY_ALIASES[key]
+    raise ValueError(f"unknown knowledge category: {value!r}")
 
 
 class SourceType(StrEnum):
@@ -91,6 +130,16 @@ class KnowledgeDocument(DomainModel):
     * EXCHANGE — Binance / OKX / Bybit venue specifics
     * TRADING — strategy, risk, execution, recovery
     * RESEARCH — market-data, analysis notes
+
+    Phase 3 record metadata (all persisted; new fields live in the row's
+    ``extra_metadata`` JSON so no schema migration is required):
+
+    * ``id`` — knowledge ID
+    * ``source_type`` / ``source_id`` — source / provenance (repository vs external)
+    * ``document_path`` — explicit document/path (defaults to ``source_id``)
+    * ``section`` — section within the document (markdown header or "")
+    * ``verification_status`` — ``unverified`` / ``verified``
+    * ``confidence`` — 0.0..1.0 trust in the record
     """
 
     id: str = Field(default_factory=lambda: f"kd-{uuid.uuid4().hex[:12]}")
@@ -99,6 +148,11 @@ class KnowledgeDocument(DomainModel):
     content: str
     summary: str | None = None
     tags: tuple[str, ...] = ()
+    # Phase 3 metadata (defaults keep Phase 1 constructors working)
+    section: str = Field(default="")
+    document_path: str | None = Field(default=None, description="Explicit document/path; defaults to source_id")
+    verification_status: str = Field(default="unverified")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     # provenance (mandatory — every record preserves its source)
     source_type: str = Field(default=SourceType.DOCUMENT.value)
     source_id: str = Field(description="File path / URL / repo identifier")
@@ -117,8 +171,89 @@ class KnowledgeDocument(DomainModel):
     @field_validator("category", mode="before")
     @classmethod
     def _coerce_category(cls, value: Any) -> Any:
+        if isinstance(value, KnowledgeCategory):
+            return value
         if isinstance(value, str):
-            return value.strip().lower()
+            key = value.strip().lower()
+            if key in _CATEGORY_ALIASES:
+                return _CATEGORY_ALIASES[key]
+            return key
+        return value
+
+    @field_validator("section", mode="before")
+    @classmethod
+    def _coerce_section(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @field_validator("document_path", mode="before")
+    @classmethod
+    def _coerce_doc_path(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("verification_status", mode="before")
+    @classmethod
+    def _coerce_verification(cls, value: Any) -> str:
+        text = str(value).strip().lower() if value is not None else "unverified"
+        if text not in ("unverified", "verified"):
+            raise ValueError("verification_status must be 'unverified' or 'verified'")
+        return text
+
+    @property
+    def source(self) -> str:
+        """Unified ``source_type:source_id`` provenance string."""
+        return f"{self.source_type}:{self.source_id}"
+
+    @property
+    def effective_document_path(self) -> str:
+        """Explicit document path, falling back to ``source_id``."""
+        return self.document_path or self.source_id
+
+
+class KnowledgeChunk(DomainModel):
+    """One deterministic chunk of a knowledge document.
+
+    Chunks are the retrieval unit: the AI receives relevant chunks instead
+    of entire documents. Every chunk preserves document provenance plus its
+    own ``chunk_index`` / ``section`` so answers can cite the exact source.
+    """
+
+    id: str = Field(default_factory=lambda: f"kc-{uuid.uuid4().hex[:12]}")
+    doc_id: str
+    chunk_index: int = Field(ge=0)
+    section: str = Field(default="")
+    content: str
+    # denormalized provenance (mirrors the parent document at index time)
+    title: str = Field(default="")
+    category: KnowledgeCategory = KnowledgeCategory.RESEARCH
+    source_type: str = Field(default=SourceType.DOCUMENT.value)
+    source_id: str = Field(description="Parent document source_id")
+    document_path: str | None = None
+    verification_status: str = Field(default="unverified")
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("doc_id", "content", "source_id")
+    @classmethod
+    def _non_empty_chunk(cls, value: str) -> str:
+        if not value or not str(value).strip():
+            raise ValueError("field must be non-empty")
+        return str(value).strip()
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _coerce_chunk_category(cls, value: Any) -> Any:
+        if isinstance(value, KnowledgeCategory):
+            return value
+        if isinstance(value, str):
+            key = value.strip().lower()
+            if key in _CATEGORY_ALIASES:
+                return _CATEGORY_ALIASES[key]
+            return key
         return value
 
 

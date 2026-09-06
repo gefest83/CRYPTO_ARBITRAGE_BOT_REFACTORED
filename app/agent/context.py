@@ -150,18 +150,50 @@ class ContextCollector:
 
         if query and self._knowledge is not None:
             try:
-                hits = await self._knowledge.search(query, limit=memory_limit)
-                knowledge_hits = [
-                    {"id": h.id, "title": h.title, "category": str(h.category), "summary": h.summary, "source_id": h.source_id}
-                    for h in hits
-                ]
+                # Phase 3: chunk-level relevance retrieval with provenance.
+                # Falls back to document search when chunks are unavailable.
+                chunk_hits = []
+                try:
+                    chunk_hits = await self._knowledge.search_chunks(query, limit=memory_limit)
+                except Exception:
+                    chunk_hits = []
+                if chunk_hits:
+                    knowledge_hits = chunk_hits
+                else:
+                    hits = await self._knowledge.search(query, limit=memory_limit)
+                    knowledge_hits = [
+                        {
+                            "id": h.id,
+                            "title": h.title,
+                            "category": str(h.category),
+                            "summary": h.summary,
+                            "source_id": h.source_id,
+                            "source_type": h.source_type,
+                            "document_path": h.effective_document_path,
+                            "section": h.section,
+                            "verification_status": h.verification_status,
+                            "confidence": h.confidence,
+                        }
+                        for h in hits
+                    ]
             except Exception:
                 pass
         elif self._knowledge is not None:
             try:
                 recent = await self._knowledge.get_recent(limit=memory_limit)
                 knowledge_hits = [
-                    {"id": h.id, "title": h.title, "category": str(h.category), "summary": h.summary}
+                    {
+                        "id": h.id,
+                        "title": h.title,
+                        "category": str(h.category),
+                        "summary": h.summary,
+                        "source_id": h.source_id,
+                        "source_type": h.source_type,
+                        "document_path": h.effective_document_path,
+                        "section": h.section,
+                        "verification_status": h.verification_status,
+                        "confidence": h.confidence,
+                    }
                     for h in recent
                 ]
             except Exception:

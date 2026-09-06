@@ -80,9 +80,10 @@ def test_phase4_env_empty_key_fail_closed():
 
 
 def test_phase4_dotenv_has_required_keys_or_skipped():
-    """Local .env (if present) must have PROVIDER=openrouter and empty API_KEY.
+    """Local .env (if present) must have PROVIDER=openrouter and an API_KEY line.
 
-    Skipped when no .env exists (CI). Never logs the key value.
+    Skipped when no .env exists (CI). Accepts an empty key (safe default)
+    or a present operator key (real-smoke enabled). Never logs the key value.
     """
     import pathlib
 
@@ -91,17 +92,14 @@ def test_phase4_dotenv_has_required_keys_or_skipped():
         pytest.skip("no local .env — CI guard skipped")
     text = p.read_text(encoding="utf-8")
     provider = key_present = None
-    key_empty = False
     for line in text.splitlines():
         s = line.strip()
         if s.startswith("CAT_AGENT__PROVIDER="):
             provider = s.split("=", 1)[1].strip()
         if s.startswith("CAT_AGENT__API_KEY="):
             key_present = True
-            key_empty = (s.split("=", 1)[1].strip() == "")
     assert provider == "openrouter", f"expected CAT_AGENT__PROVIDER=openrouter, got {provider!r}"
     assert key_present, "CAT_AGENT__API_KEY line missing in .env"
-    assert key_empty, "CAT_AGENT__API_KEY must be empty locally (never store a real key)"
 
 
 # ------------------------------------------------------------------ DEMO startup

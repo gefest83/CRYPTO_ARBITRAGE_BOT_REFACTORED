@@ -32,6 +32,7 @@ from app.storage.base import UTC_DATETIME, Base
 
 __all__ = [
     "AgentExperienceRow",
+    "AgentKnowledgeChunkRow",
     "AgentKnowledgeRow",
     "AgentLessonRow",
     "AgentRecommendationRow",
@@ -60,6 +61,39 @@ class AgentKnowledgeRow(Base):
         Index("ix_agent_knowledge_category", "category"),
         Index("ix_agent_knowledge_source_id", "source_id"),
         Index("ix_agent_knowledge_created_at", "created_at"),
+    )
+
+
+class AgentKnowledgeChunkRow(Base):
+    """Phase 3 retrieval unit — one deterministic chunk of a knowledge doc.
+
+    New table (``create_all`` creates it on fresh DBs; existing DBs gain it
+    without touching ``agent_knowledge``). Every chunk denormalizes its
+    parent provenance so retrieval never loses the source.
+    """
+
+    __tablename__ = "agent_knowledge_chunks"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    doc_id: Mapped[str] = mapped_column(String(32))
+    chunk_index: Mapped[int] = mapped_column(Integer, default=0)
+    section: Mapped[str] = mapped_column(String(256), default="")
+    content: Mapped[str] = mapped_column(Text)
+    char_count: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(256), default="")
+    category: Mapped[str] = mapped_column(String(32), default="research")
+    source_type: Mapped[str] = mapped_column(String(32), default="document")
+    source_id: Mapped[str] = mapped_column(String(256), default="")
+    document_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    verification_status: Mapped[str] = mapped_column(String(32), default="unverified")
+    confidence: Mapped[float] = mapped_column(default=0.5)
+    created_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+
+    __table_args__ = (
+        Index("ix_agent_chunks_doc_id", "doc_id"),
+        Index("ix_agent_chunks_category", "category"),
+        Index("ix_agent_chunks_source_id", "source_id"),
     )
 
 

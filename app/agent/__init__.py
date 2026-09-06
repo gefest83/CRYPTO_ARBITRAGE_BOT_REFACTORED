@@ -49,15 +49,21 @@ from app.agent.core import AgentCore, AgentRequest, AgentResponse
 from app.agent.knowledge import KnowledgeRepository, KnowledgeService
 from app.agent.memory import ExperienceRepository, LessonRepository
 from app.agent.models import (
+    BOT_KNOWLEDGE,
+    EXCHANGE_KNOWLEDGE,
+    RESEARCH_KNOWLEDGE,
+    TRADING_KNOWLEDGE,
     AgentRecommendation,
     Experience,
     KnowledgeCategory,
+    KnowledgeChunk,
     KnowledgeDocument,
     Lesson,
     RecommendationStatus,
     ReflectionObservation,
     ReflectionResult,
     SourceType,
+    normalize_knowledge_category,
 )
 from app.agent.approval import RecommendationApprovalService
 from app.agent.audit import AgentAuditRepository
@@ -76,11 +82,14 @@ __all__ = [
     "AgentRequest",
     "AgentResponse",
     "AgentTools",
+    "BOT_KNOWLEDGE",
     "ContextCollector",
+    "EXCHANGE_KNOWLEDGE",
     "EchoProvider",
     "Experience",
     "ExperienceRepository",
     "KnowledgeCategory",
+    "KnowledgeChunk",
     "KnowledgeDocument",
     "KnowledgeRepository",
     "KnowledgeService",
@@ -88,6 +97,7 @@ __all__ = [
     "LessonRepository",
     "LLMProvider",
     "NullProvider",
+    "RESEARCH_KNOWLEDGE",
     "RecommendationApprovalService",
     "RecommendationRepository",
     "RecommendationService",
@@ -96,7 +106,9 @@ __all__ = [
     "ReflectionObservation",
     "ReflectionResult",
     "SourceType",
+    "TRADING_KNOWLEDGE",
     "build_agent",
+    "normalize_knowledge_category",
 ]
 
 
