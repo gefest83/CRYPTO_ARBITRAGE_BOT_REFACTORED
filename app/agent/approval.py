@@ -1,18 +1,28 @@
 """Human-gated recommendation lifecycle — CREATED -> REVIEWED -> APPROVED/REJECTED.
 
-Critical invariants (must remain true after Phase 7):
+Phase 8 — Approval Workflow
+---------------------------
+``RECOMMENDATION → explicit operator approval → validation → controlled
+config change → audit → measurement state``
+
+Critical invariants:
 
 * AI never calls REVIEW / APPROVE / APPLY / CONFIG MUTATION / RISK LIMIT MUTATION / ORDER EXECUTION.
+* Approval is explicit: non-empty human approver + exact recommendation id.
+  In LIVE mode an explicit reason is additionally required.
 * Only an explicit human operator (Telegram allow-list or CLI operator) may review/approve/reject.
-* Approval is explicit and allowlisted — no generic ``set_config(key, value)``.
+* Approval is explicit and allowlisted — no generic ``set_config(key, value)``,
+  no arbitrary config writes, no trade/order/withdrawal execution.
 * Risk limits have a separate explicit validation path (stricter bounds).
-* Every transition is audited and idempotent; duplicate transitions are rejected.
+* Existing risk gates, kill switch and DEMO/LIVE separation stay
+  authoritative: approval refuses while the kill switch is engaged and
+  never touches mode flags, gates or execution paths.
+* Every transition is audited (app log + agent audit); duplicate approvals
+  never apply twice (atomic PENDING/REVIEWED → terminal guard).
 * Fail-closed on any uncertainty (stale current value, invalid param/value,
   already applied, concurrent race).
-
-Phase 7 adds the REVIEWED step between creation and decision: a human marks
-a PENDING recommendation as reviewed without deciding it. Approve/reject
-accept PENDING or REVIEWED (Phase 8 approval workflow itself is NOT added).
+* After an approved change the service records ``awaiting_measurement``
+  state for the change (Phase 9 will measure it; evaluation is NOT here).
 
 The service never executes trades.
 """
@@ -325,7 +335,75 @@ class RecommendationApprovalService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("transition_agent_audit_failed", extra={"recommendation_id": rec.id, "error": str(exc)[:200]})
 
+    def _check_safety_gates(self, reason: str) -> None:
+        """Phase 8 gates: kill switch and LIVE mode remain authoritative.
+
+        * Kill switch engaged → refuse (uncertain state; release first).
+        * LIVE mode → require an explicit human reason (real-capital stakes).
+        Fail-closed when the guard/settings cannot be read.
+        """
+        if self._services is None:
+            return
+        try:
+            guard = getattr(self._services, "guard", None)
+            if guard is not None and bool(getattr(guard, "is_halted", False)):
+                raise ApprovalError("kill switch engaged — config changes blocked until released")
+        except ApprovalError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - unreadable guard fails closed
+            raise ApprovalError(f"cannot verify kill-switch state: {exc}") from exc
+        try:
+            settings = getattr(self._services, "settings", None)
+            mode = getattr(settings, "mode", None) if settings is not None else None
+            mode_value = str(getattr(mode, "value", mode) or "").upper()
+            if mode_value == "LIVE" and not str(reason or "").strip():
+                raise ApprovalError("LIVE mode requires an explicit reason for approval")
+        except ApprovalError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ApprovalError(f"cannot verify trading mode: {exc}") from exc
+
+    async def measurement_state(self, recommendation_id: str) -> dict[str, Any] | None:
+        """Read-only view of the ``awaiting_measurement`` record (Phase 9 input)."""
+        try:
+            bot_state = getattr(self._services, "bot_state", None) if self._services is not None else None
+            if bot_state is None or not hasattr(bot_state, "get"):
+                return None
+            value = await bot_state.get(f"agent_rec_measure:{recommendation_id}")
+            return dict(value) if isinstance(value, dict) else None
+        except Exception:
+            return None
+
+    async def _record_measurement_state(  # type: ignore[no-untyped-def]
+        self, *, recommendation_id: str, parameter: str, old_value: Any,
+        new_value: Any, approver: str,
+    ) -> None:
+        """Record that an approved change now requires measurement (best-effort)."""
+        try:
+            from app.models.base import utc_now
+
+            bot_state = getattr(self._services, "bot_state", None) if self._services is not None else None
+            if bot_state is None or not hasattr(bot_state, "set"):
+                return
+            await bot_state.set(
+                f"agent_rec_measure:{recommendation_id}",
+                {"recommendation_id": recommendation_id, "parameter": parameter,
+                 "old_value": str(old_value), "new_value": str(new_value),
+                 "approver": approver, "approved_at": utc_now().isoformat(),
+                 "status": "awaiting_measurement"},
+            )
+        except Exception as exc:  # noqa: BLE001 - measurement bookkeeping never breaks approval
+            logger.warning("measurement_state_write_failed",
+                           extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+
     async def approve(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
+        """Approve an exact recommendation and apply it through the control plane.
+
+        Phase 8 flow: explicit operator + exact id → safety gates (kill
+        switch, LIVE reason) → allowlist validation → staleness check →
+        controlled apply → atomic PENDING/REVIEWED → APPROVED → dual audit →
+        ``awaiting_measurement`` state. Any failure aborts before mutation.
+        """
         if not approver or not str(approver).strip():
             raise ApprovalError("approver must be a non-empty human identifier")
         if not recommendation_id or not str(recommendation_id).strip():
@@ -350,6 +428,8 @@ class RecommendationApprovalService:
             spec = ALLOWLIST[param]
             parsed = _parse_value(proposed_raw, spec["type"])
             _validate_bounds(param, parsed)
+            # Phase 8 safety gates — existing controls stay authoritative.
+            self._check_safety_gates(reason)
             if self._services is not None:
                 live_current = self._get_current(param)
                 stored_current = row.current_value if row.current_value is not None else row.old_value
@@ -422,6 +502,18 @@ class RecommendationApprovalService:
                         await bot_state.set(f"agent_rec_approved:{rid_a}", {"parameter": param_a, "value": new_a, "approver": appr_a})
                 except Exception:
                     pass
+                # Phase 8: agent-audit trail + awaiting_measurement state.
+                try:
+                    agent_audit = getattr(self._services, "agent_audit", None) if self._services is not None else None
+                    if agent_audit is not None and hasattr(agent_audit, "log_recommendation"):
+                        await agent_audit.log_recommendation(returned, event_type="recommendation_approved")
+                except Exception as exc_issue:  # noqa: BLE001
+                    logger.warning("approval_agent_audit_failed",
+                                   extra={"recommendation_id": recommendation_id, "error": str(exc_issue)[:200]})
+                await self._record_measurement_state(
+                    recommendation_id=rid_a, parameter=param_a, old_value=old_a,
+                    new_value=new_a, approver=appr_a,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("approval_audit_failed", extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
         finally:
@@ -454,8 +546,10 @@ class RecommendationApprovalService:
             )
             if update_result.rowcount == 0:
                 raise ApprovalError("concurrent modification — not PENDING")
-            # Build returned directly to avoid stale identity map
-            return AgentRecommendation(
+            # Build returned directly to avoid stale identity map.
+            # Reject mutates nothing but the row status: configuration is
+            # provably unchanged (asserted by focused Phase 8 tests).
+            returned = AgentRecommendation(
                 id=row.id,
                 parameter=row.parameter,
                 current_value=row.current_value,
@@ -476,3 +570,11 @@ class RecommendationApprovalService:
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
+        await self._audit_transition(
+            "AGENT_RECOMMENDATION_REJECTED",
+            returned,
+            approver=approver,
+            reason=reason,
+            event_type="recommendation_rejected",
+        )
+        return returned  # type: ignore[no-any-return]
