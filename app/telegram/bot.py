@@ -405,7 +405,9 @@ class TelegramBot:
                     await self._safe_send(int(chat_id), reply_ai)
                     return
                 reply_ai = await adapter.dispatch(text, lang=lang, approver=str(user_id) if user_id is not None else None)
-                # Bounded response length is enforced by _safe_send (3500 chars)
+                # Explicit /ai replies keep the historic single-message contract
+                # (bounded by _safe_send with an explicit truncation note).
+                # Natural-language replies use chunked delivery instead.
                 await self._safe_send(int(chat_id), reply_ai)
             except Exception as exc:  # noqa: BLE001 - adapter failure must never crash telegram
                 logger.error(
@@ -432,6 +434,45 @@ class TelegramBot:
                     await self._set_strategy("triangle")
                     # Also inform but not block start
                     # Continue to handler
+
+        # --------------------------------------------------------------
+        # Natural-language read-only AI Advisor path (no "/" prefix).
+        # Auth + language already enforced above. Slash commands keep the
+        # explicit dispatcher below; everything else goes through the
+        # deterministic intent router -> AgentTelegramAdapter -> AgentTools.
+        # Privileged NL requests are refused inside the adapter (read-only).
+        # --------------------------------------------------------------
+        if not text.startswith("/"):
+            try:
+                adapter = await self._get_agent_adapter()
+                if adapter is None:
+                    try:
+                        from app.agent.telegram import _ai_t as _ai_t_nl  # type: ignore[import-not-found]
+
+                        reply_nl = _ai_t_nl("ai_not_configured", lang)
+                    except Exception:
+                        reply_nl = t("internal_error", lang)
+                    await self._safe_send(int(chat_id), reply_nl)
+                    return
+                if hasattr(adapter, "handle_natural_language"):
+                    reply_nl = await adapter.handle_natural_language(
+                        text, lang=lang, approver=str(user_id) if user_id is not None else None
+                    )
+                else:
+                    reply_nl = await adapter.dispatch(text, lang=lang, approver=str(user_id) if user_id is not None else None)
+                await self._safe_send_chunked(int(chat_id), reply_nl)
+            except Exception as exc:  # noqa: BLE001 - NL failure must never crash telegram
+                logger.error(
+                    "telegram_ai_nl_failed",
+                    extra={
+                        "command": text[:80],
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "error": redact_secrets(str(exc))[:300],
+                    },
+                )
+                await self._safe_send(int(chat_id), t("internal_error", lang))
+            return
 
         handler = self._dispatch(command)
         if handler is None:
@@ -801,6 +842,38 @@ class TelegramBot:
                     "error": redact_secrets(str(exc))[:200],
                 },
             )
+
+    async def _safe_send_chunked(self, chat_id: int, text: str) -> None:
+        """Send long read-only replies as clean chunks with continuation notes."""
+        cleaned = redact_secrets(text or "")
+        if len(cleaned) <= _MAX_REPLY_LENGTH:
+            await self._safe_send(chat_id, cleaned)
+            return
+        # Split on newlines to keep lines intact.
+        lines = cleaned.split("\n")
+        chunks: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            # Overlong single line: hard-split it.
+            while len(line) > _MAX_REPLY_LENGTH - 60:
+                head, line = line[: _MAX_REPLY_LENGTH - 60], line[_MAX_REPLY_LENGTH - 60 :]
+                if current_len + len(head) + 1 > _MAX_REPLY_LENGTH - 60:
+                    chunks.append("\n".join(current))
+                    current, current_len = [], 0
+                current.append(head)
+                current_len += len(head) + 1
+            if current_len + len(line) + 1 > _MAX_REPLY_LENGTH - 60:
+                chunks.append("\n".join(current))
+                current, current_len = [], 0
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, start=1):
+            suffix = f"\n... (part {i}/{total})" if total > 1 else ""
+            await self._safe_send(chat_id, chunk + suffix)
 
 
 _DISPATCH: dict[str, Callable[[TelegramBot, str], Awaitable[str]]] = {

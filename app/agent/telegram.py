@@ -115,6 +115,74 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_feedback_ok": "Feedback recorded: {kind} on {rec_id} (by {approver})",
         "ai_feedback_fail": "Feedback failed: {error}",
         "ai_feedback_usage": "Usage: /ai feedback <recommendation_id> <useful|wrong|ignore|approve|reject> [comment]",
+        "ai_nl_trades_title": "Recent trades ({count}):",
+        "ai_nl_trades_empty": "No trades found. The bot has not recorded any trades yet.",
+        "ai_nl_trades_line": "  {strategy} {route} [{status}] net {net_profit} ({created})",
+        "ai_nl_trades_more": "  ... and {remaining} more (see CLI for the full list)",
+        "ai_nl_trade_stats": (
+            "Trade statistics (last {total}):\n"
+            "  completed: {completed}\n"
+            "  failed: {failed}\n"
+            "  manual review: {manual_review}\n"
+            "  total PnL: {pnl}\n"
+            "  avg net: {bps} bps\n"
+            "  win rate: {win}%"
+        ),
+        "ai_nl_scan_stats": (
+            "Scan statistics:\n"
+            "  tickers: {tickers}\n"
+            "  order books: {books}\n"
+            "  venues with data: {venues}"
+        ),
+        "ai_nl_opportunities_found": "Current opportunities (read-only, no execution):",
+        "ai_nl_opportunities_none": (
+            "No profitable routes right now. Scanner ran on current market data "
+            "but nothing is above the configured profitability threshold."
+        ),
+        "ai_nl_opportunities_stale": (
+            "Scanner has incomplete/stale market data — opportunity check is unreliable right now."
+        ),
+        "ai_nl_opportunities_line": "  {kind} {desc} net {bps} bps",
+        "ai_nl_exchange_status": "Exchange status:",
+        "ai_nl_exchange_line": "  {venue}: {status} (keys {creds})",
+        "ai_nl_exchange_unavailable": "  {venue}: unavailable — {reason}",
+        "ai_nl_bot_status": "Bot status:",
+        "ai_nl_risk_title": "Risk state:",
+        "ai_nl_params_title": "Current parameters:",
+        "ai_nl_journal_title": "Recent journal ({count}):",
+        "ai_nl_journal_empty": "Journal is empty.",
+        "ai_nl_journal_line": "  {ts} {action}: {message}",
+        "ai_nl_why_title": "Why is the bot not trading — diagnostics (read-only):",
+        "ai_nl_why_no_blocker": "No clear blocker found in the available data.",
+        "ai_nl_help_full": (
+            "AI Advisor — I answer read-only questions (English / Русский):\n"
+            "- balances: 'show me balances', 'покажи балансы'\n"
+            "- trades: 'show recent trades', 'были ли сегодня сделки'\n"
+            "- scan statistics: 'how many opportunities did the scanner find', 'что показал последний скан'\n"
+            "- opportunities/routes: 'are there any arbitrage opportunities', 'есть ли арбитражные возможности'\n"
+            "- exchange status: 'which exchanges are online', 'какие биржи онлайн'\n"
+            "- bot status: 'what is the bot status', 'что сейчас происходит'\n"
+            "- risk state: 'what is the current risk state', 'какое состояние риска'\n"
+            "- parameters: 'show current parameters', 'какие сейчас параметры'\n"
+            "- journal: 'show journal', 'покажи журнал'\n"
+            "- memory: 'show agent memory', 'покажи память агента'\n"
+            "- recommendations: 'show recommendations', 'покажи рекомендации'\n"
+            "- why not trading: 'why is the bot not trading', 'почему бот не торгует'\n"
+            "\n"
+            "Trading, withdrawals, configuration changes and approvals stay protected — "
+            "use the explicit commands (/ai approve <id>, /pause, /resume, CLI) for those."
+        ),
+        "ai_nl_unknown": (
+            "I can answer read-only questions about balances, trades, scan statistics, "
+            "opportunities/routes, exchange status, bot status, risk state, parameters, "
+            "journal, memory and recommendations. Try 'what can you do?' for examples."
+        ),
+        "ai_nl_privileged_refused": (
+            "Refused: that action is privileged and cannot be done via natural language. "
+            "Use the explicit workflow (e.g. /ai approve <id>, /pause, CLI) as an authorized operator."
+        ),
+        "ai_nl_balance_unavailable": "  {venue}: unavailable — balance request failed",
+        "ai_nl_balance_more": "  ... and {remaining} more balances not shown",
     },
     "ru": {
         "ai_help": (
@@ -178,6 +246,74 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_feedback_ok": "Отзыв записан: {kind} по {rec_id} (кем {approver})",
         "ai_feedback_fail": "Ошибка отзыва: {error}",
         "ai_feedback_usage": "Использование: /ai feedback <id> <useful|wrong|ignore|approve|reject> [комментарий]",
+        "ai_nl_trades_title": "Последние сделки ({count}):",
+        "ai_nl_trades_empty": "Сделок не найдено. Бот пока не записал ни одной сделки.",
+        "ai_nl_trades_line": "  {strategy} {route} [{status}] net {net_profit} ({created})",
+        "ai_nl_trades_more": "  ... и ещё {remaining} (полный список в CLI)",
+        "ai_nl_trade_stats": (
+            "Статистика сделок (последние {total}):\n"
+            "  завершено: {completed}\n"
+            "  неудачно: {failed}\n"
+            "  ручная проверка: {manual_review}\n"
+            "  суммарный PnL: {pnl}\n"
+            "  средний net: {bps} bps\n"
+            "  доля успешных: {win}%"
+        ),
+        "ai_nl_scan_stats": (
+            "Статистика сканирования:\n"
+            "  тикеры: {tickers}\n"
+            "  стаканы: {books}\n"
+            "  площадки с данными: {venues}"
+        ),
+        "ai_nl_opportunities_found": "Текущие возможности (только чтение, без исполнения):",
+        "ai_nl_opportunities_none": (
+            "Прибыльных маршрутов сейчас нет. Сканер отработал по текущим данным, "
+            "но ничего не выше настроенного порога прибыльности."
+        ),
+        "ai_nl_opportunities_stale": (
+            "У сканера неполные/устаревшие рыночные данные — оценка возможностей сейчас ненадёжна."
+        ),
+        "ai_nl_opportunities_line": "  {kind} {desc} net {bps} bps",
+        "ai_nl_exchange_status": "Статус бирж:",
+        "ai_nl_exchange_line": "  {venue}: {status} (ключи {creds})",
+        "ai_nl_exchange_unavailable": "  {venue}: недоступна — {reason}",
+        "ai_nl_bot_status": "Статус бота:",
+        "ai_nl_risk_title": "Состояние риска:",
+        "ai_nl_params_title": "Текущие параметры:",
+        "ai_nl_journal_title": "Журнал (последние {count}):",
+        "ai_nl_journal_empty": "Журнал пуст.",
+        "ai_nl_journal_line": "  {ts} {action}: {message}",
+        "ai_nl_why_title": "Почему бот не торгует — диагностика (только чтение):",
+        "ai_nl_why_no_blocker": "Явной причины блокировки по доступным данным не найдено.",
+        "ai_nl_help_full": (
+            "AI-советник — отвечаю на вопросы только для чтения (English / Русский):\n"
+            "- балансы: 'покажи балансы', 'show me balances'\n"
+            "- сделки: 'покажи последние сделки', 'were there any trades today'\n"
+            "- статистика сканирования: 'что показал последний скан', 'how many opportunities did the scanner find'\n"
+            "- возможности/маршруты: 'есть ли арбитражные возможности', 'are there any arbitrage opportunities'\n"
+            "- статус бирж: 'какие биржи онлайн', 'which exchanges are online'\n"
+            "- статус бота: 'что сейчас происходит', 'what is the bot status'\n"
+            "- риск: 'какое состояние риска', 'what is the current risk state'\n"
+            "- параметры: 'какие сейчас параметры', 'show current parameters'\n"
+            "- журнал: 'покажи журнал', 'show journal'\n"
+            "- память: 'покажи память агента', 'show agent memory'\n"
+            "- рекомендации: 'покажи рекомендации', 'show recommendations'\n"
+            "- почему нет сделок: 'почему бот не торгует', 'why is the bot not trading'\n"
+            "\n"
+            "Торговля, выводы, изменение конфигурации и подтверждения остаются защищёнными — "
+            "используйте явные команды (/ai approve <id>, /pause, /resume, CLI)."
+        ),
+        "ai_nl_unknown": (
+            "Могу отвечать на вопросы только для чтения: балансы, сделки, статистика сканирования, "
+            "возможности/маршруты, статус бирж и бота, риск, параметры, журнал, память и рекомендации. "
+            "Спросите 'что ты умеешь?' для примеров."
+        ),
+        "ai_nl_privileged_refused": (
+            "Отклонено: это привилегированное действие нельзя выполнить естественным языком. "
+            "Используйте явный процесс (/ai approve <id>, /pause, CLI) как авторизованный оператор."
+        ),
+        "ai_nl_balance_unavailable": "  {venue}: недоступна — запрос баланса не удался",
+        "ai_nl_balance_more": "  ... и ещё {remaining} балансов не показано",
     },
 }
 
@@ -469,7 +605,31 @@ class AgentTelegramAdapter:
             )
         return _finalize_telegram("\n".join(lines))
 
-    async def balance(self, *, lang: str | None = None) -> str:
+    def _clean_nl(self, text: str) -> str:
+        """Redact secrets without the 3000-char cap (bot chunks long replies)."""
+        from app.agent.providers.base import filter_secrets_from_text
+        from app.exchanges.sanitize import redact_secrets as _redact
+
+        return filter_secrets_from_text(_redact(text))
+
+    def _services(self) -> Any | None:
+        tools = self._tools
+        if tools is None:
+            return None
+        return getattr(tools, "_services", None)
+
+    def _enabled_venues(self) -> list[str]:
+        try:
+            svc = self._services()
+            if svc is not None and getattr(svc, "manager", None) is not None:
+                return list(svc.manager.enabled_ids())
+        except Exception:
+            pass
+        return []
+
+    async def balance(
+        self, *, lang: str | None = None, venue: str | None = None, asset: str | None = None
+    ) -> str:
         effective = lang if lang in ("en", "ru") else "en"
         if self._tools is None:
             return _finalize_telegram(_ai_t("ai_not_configured", effective))
@@ -477,14 +637,445 @@ class AgentTelegramAdapter:
             snaps = await self._tools.get_balances()
         except Exception:
             return _finalize_telegram(_ai_t("ai_balance_empty", effective))
-        if not snaps:
-            return _finalize_telegram(_ai_t("ai_balance_empty", effective))
+        return self._clean_nl(self._format_balances(snaps, effective, venue=venue, asset=asset))
+
+    def _format_balances(
+        self, snaps: dict[str, Any], effective: str, *, venue: str | None = None, asset: str | None = None
+    ) -> str:
+        """Format *all* non-zero balances with venue/asset/free/used.
+
+        No artificial ``[:5]`` truncation. Partial venue failures (enabled
+        venue missing from ``snaps``) are reported explicitly instead of
+        being hidden. Very long outputs carry an explicit "+N more" note so
+        the Telegram chunking layer can split them safely.
+        """
+        from decimal import Decimal
+
+        venue_f = (venue or "").strip().lower() or None
+        asset_f = (asset or "").strip().upper() or None
         lines: list[str] = [_ai_t("ai_balance_title", effective)]
-        for venue, data in snaps.items():
+        shown = 0
+        hidden = 0
+        # Per-venue cap keeps single replies usable; overflow is counted,
+        # never silently dropped.
+        _PER_VENUE_SOFT_CAP = 60
+        venues = sorted(snaps.keys()) if isinstance(snaps, dict) else []
+        if venue_f:
+            venues = [v for v in venues if v.strip().lower() == venue_f]
+            if not venues and isinstance(snaps, dict) and snaps:
+                # Requested venue returned nothing — still report it.
+                lines.append(_ai_t("ai_nl_balance_unavailable", effective, venue=venue_f))
+                return "\n".join(lines)
+        if not venues and not snaps:
+            return _ai_t("ai_balance_empty", effective)
+        for v in venues:
+            data = snaps.get(v, {}) if isinstance(snaps, dict) else {}
             bals = data.get("balances", []) if isinstance(data, dict) else []
-            assets = ", ".join(f"{b.get('asset')} {b.get('free')}" for b in bals[:5]) if bals else "-"
-            lines.append(_ai_t("ai_balance_line", effective, venue=venue, assets=assets))
-        return _finalize_telegram("\n".join(lines))
+            rows: list[str] = []
+            for b in bals:
+                try:
+                    a = str(b.get("asset", "?")).upper()
+                    if asset_f and a != asset_f:
+                        continue
+                    free = str(b.get("free", "0"))
+                    used = str(b.get("used", "0"))
+                    # Skip dust / zero balances (both free and used are zero).
+                    try:
+                        if Decimal(str(free)) == 0 and Decimal(str(used)) == 0:
+                            continue
+                    except Exception:
+                        pass
+                    rows.append(f"{a}: free {free} / used {used}")
+                except Exception:
+                    continue
+            if not rows:
+                lines.append(f"{v}: -")
+                continue
+            lines.append(f"{v}:")
+            if len(rows) > _PER_VENUE_SOFT_CAP:
+                shown_rows = rows[:_PER_VENUE_SOFT_CAP]
+                hidden += len(rows) - _PER_VENUE_SOFT_CAP
+            else:
+                shown_rows = rows
+            for r in shown_rows:
+                lines.append(f"  {r}")
+                shown += 1
+        # Partial failures: enabled venues with no snapshot are unavailable.
+        try:
+            enabled = {e.strip().lower() for e in self._enabled_venues()}
+            present = {str(v).strip().lower() for v in (snaps.keys() if isinstance(snaps, dict) else [])}
+            if venue_f:
+                enabled = {e for e in enabled if e == venue_f}
+            for missing in sorted(enabled - present):
+                lines.append(_ai_t("ai_nl_balance_unavailable", effective, venue=missing))
+        except Exception:
+            pass
+        if hidden:
+            lines.append(_ai_t("ai_nl_balance_more", effective, remaining=hidden))
+        if shown == 0 and hidden == 0 and len(lines) <= 1:
+            return _ai_t("ai_balance_empty", effective)
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------- NL intents
+    async def handle_natural_language(
+        self, text: str, *, lang: str | None = None, approver: str | None = None
+    ) -> str:
+        """Deterministic NL entry point: intent router -> read-only tools.
+
+        Never performs privileged actions. Unknown or privileged inputs get
+        a safe help/refusal message.
+        """
+        from app.agent.nl_router import UNKNOWN, detect_intent, is_privileged_request
+
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._core is None and self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        if is_privileged_request(text or ""):
+            return self._clean_nl(_ai_t("ai_nl_privileged_refused", effective))
+        intent, entities = detect_intent(text or "")
+        try:
+            if intent == "BALANCE_QUERY":
+                return await self.balance(lang=effective, venue=entities.get("venue"), asset=entities.get("asset"))
+            if intent == "TRADES_QUERY":
+                return await self.nl_trades(lang=effective)
+            if intent == "TRADE_STATS_QUERY":
+                return await self.nl_trade_stats(lang=effective)
+            if intent == "SCAN_STATS_QUERY":
+                return await self.nl_scan_stats(lang=effective)
+            if intent == "OPPORTUNITIES_QUERY":
+                return await self.nl_opportunities(lang=effective)
+            if intent == "EXCHANGE_STATUS_QUERY":
+                return await self.nl_exchange_status(lang=effective)
+            if intent == "BOT_STATUS_QUERY":
+                return await self.nl_bot_status(lang=effective)
+            if intent == "RISK_QUERY":
+                return await self.nl_risk(lang=effective)
+            if intent == "PARAMETERS_QUERY":
+                return await self.nl_parameters(lang=effective)
+            if intent == "MEMORY_QUERY":
+                return await self.memory(lang=effective)
+            if intent == "JOURNAL_QUERY":
+                return await self.nl_journal(lang=effective)
+            if intent == "RECOMMENDATIONS_QUERY":
+                return await self.recommendations(lang=effective)
+            if intent == "WHY_NOT_TRADING_QUERY":
+                return await self.nl_why_not_trading(lang=effective)
+            if intent == "AI_HELP":
+                return self._clean_nl(_ai_t("ai_nl_help_full", effective))
+            _ = UNKNOWN
+            return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+        except Exception as exc:  # noqa: BLE001 - NL must never crash telegram
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            safe = _redact(str(exc))[:200]
+            _ = safe
+            return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+
+    async def nl_trades(self, *, lang: str | None = None, limit: int = 10) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            trades = await self._tools.get_recent_trades(limit=limit)
+        except Exception:
+            return self._clean_nl(_ai_t("ai_nl_trades_empty", effective))
+        if not trades:
+            return self._clean_nl(_ai_t("ai_nl_trades_empty", effective))
+        lines: list[str] = [_ai_t("ai_nl_trades_title", effective, count=len(trades))]
+        for tr in trades[:limit]:
+            lines.append(
+                _ai_t(
+                    "ai_nl_trades_line",
+                    effective,
+                    strategy=str(tr.get("strategy", "?")),
+                    route=str(tr.get("route", "?"))[:60],
+                    status=str(tr.get("status", "?")),
+                    net_profit=str(tr.get("net_profit", "?")),
+                    created=str(tr.get("created_at", "?"))[:19],
+                )
+            )
+        if len(trades) > limit:
+            lines.append(_ai_t("ai_nl_trades_more", effective, remaining=len(trades) - limit))
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_trade_stats(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            st = await self._tools.get_trade_statistics()
+        except Exception:
+            return self._clean_nl(_ai_t("ai_nl_trades_empty", effective))
+        return self._clean_nl(
+            _ai_t(
+                "ai_nl_trade_stats",
+                effective,
+                total=st.get("total", 0),
+                completed=st.get("completed", 0),
+                failed=st.get("failed", 0),
+                manual_review=st.get("manual_review", 0),
+                pnl=st.get("total_pnl", "0"),
+                bps=st.get("avg_net_bps", "0"),
+                win=st.get("win_rate", "0"),
+            )
+        )
+
+    async def nl_scan_stats(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            stats = await self._tools.get_scan_statistics()
+        except Exception:
+            stats = {}
+        if not isinstance(stats, dict) or not stats:
+            stats = {"tickers": 0, "order_books": 0, "exchanges": 0}
+        if "note" in stats:
+            return self._clean_nl(
+                _ai_t(
+                    "ai_nl_scan_stats",
+                    effective,
+                    tickers=stats.get("tickers", 0),
+                    books=stats.get("order_books", 0),
+                    venues=stats.get("exchanges", 0),
+                )
+                + f" ({stats.get('note')})"
+            )
+        return self._clean_nl(
+            _ai_t(
+                "ai_nl_scan_stats",
+                effective,
+                tickers=stats.get("tickers", 0),
+                books=stats.get("order_books", 0),
+                venues=stats.get("exchanges", 0),
+            )
+        )
+
+    async def nl_opportunities(self, *, lang: str | None = None) -> str:
+        """Read-only current opportunities via existing scanner data path."""
+        effective = lang if lang in ("en", "ru") else "en"
+        svc = self._services()
+        if svc is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            stats = await self._tools.get_scan_statistics() if self._tools else {}
+        except Exception:
+            stats = {}
+        books = int((stats or {}).get("order_books", 0) or 0) if isinstance(stats, dict) else 0
+        try:
+            triangles = await svc.scan_triangles()
+        except Exception:
+            triangles = ()
+        try:
+            plans = await svc.plan_transfers()
+        except Exception:
+            plans = []
+        lines: list[str] = []
+        if (not triangles) and (not plans):
+            if books == 0:
+                lines.append(_ai_t("ai_nl_opportunities_stale", effective))
+            else:
+                lines.append(_ai_t("ai_nl_opportunities_none", effective))
+            try:
+                min_bps = getattr(getattr(svc, "settings", None), "arbitrage", None)
+                thr = getattr(min_bps, "triangle_min_net_bps", None) if min_bps else None
+                if thr is not None:
+                    lines.append(f"(threshold: {thr} bps)" if effective == "en" else f"(порог: {thr} bps)")
+            except Exception:
+                pass
+            return self._clean_nl("\n".join(lines))
+        lines.append(_ai_t("ai_nl_opportunities_found", effective))
+        for opp in list(triangles or [])[:5]:
+            try:
+                desc = getattr(opp, "direction", "?") or "?"
+                bps = getattr(opp, "net_profit_bps", "?")
+                lines.append(_ai_t("ai_nl_opportunities_line", effective, kind="triangle", desc=str(desc)[:60], bps=str(bps)))
+            except Exception:
+                continue
+        for plan in list(plans or [])[:5]:
+            try:
+                desc = f"{plan.source_exchange}->{plan.dest_exchange} {plan.asset} {plan.amount}"
+                lines.append(_ai_t("ai_nl_opportunities_line", effective, kind="transfer", desc=desc[:60], bps=str(plan.net_profit_bps)))
+            except Exception:
+                continue
+        lines.append("(no execution — view-only)" if effective == "en" else "(без исполнения — только просмотр)")
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_exchange_status(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            snap = await self._tools.get_exchange_status()
+        except Exception:
+            snap = {}
+        lines: list[str] = [_ai_t("ai_nl_exchange_status", effective)]
+        if not snap:
+            enabled = self._enabled_venues()
+            if enabled:
+                for v in enabled:
+                    lines.append(_ai_t("ai_nl_exchange_unavailable", effective, venue=v, reason="no data"))
+            else:
+                lines.append("-")
+            return self._clean_nl("\n".join(lines))
+        for venue in sorted(snap.keys()):
+            info = snap.get(venue, {}) if isinstance(snap, dict) else {}
+            lines.append(
+                _ai_t(
+                    "ai_nl_exchange_line",
+                    effective,
+                    venue=venue,
+                    status=info.get("status", "?") if isinstance(info, dict) else "?",
+                    creds=info.get("credentials", "?") if isinstance(info, dict) else "?",
+                )
+            )
+        # Partial failures: enabled venues missing from snapshot.
+        try:
+            enabled = {e.strip().lower() for e in self._enabled_venues()}
+            present = {str(v).strip().lower() for v in snap.keys()}
+            for missing in sorted(enabled - present):
+                lines.append(_ai_t("ai_nl_exchange_unavailable", effective, venue=missing, reason="no snapshot"))
+        except Exception:
+            pass
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_bot_status(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        svc = self._services()
+        if svc is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            st = await svc.status()
+        except Exception:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        guard = st.get("guard", {}) if isinstance(st, dict) else {}
+        lines = [
+            _ai_t("ai_nl_bot_status", effective),
+            f"mode: {st.get('mode', '?')}",
+            f"kill switch: {guard.get('halted', '?')} ({guard.get('halt_reason', '')})".rstrip(),
+            f"auto trading: {st.get('auto_trading', '?')} / loop: {st.get('auto_loop_running', '?')}",
+            f"strategy: {st.get('active_strategy', '?')}",
+        ]
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_risk(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            rs = await self._tools.get_risk_state()
+        except Exception:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        lines = [
+            _ai_t("ai_nl_risk_title", effective),
+            f"daily pnl: {rs.get('daily_pnl', '?')}",
+            f"open transfers: {rs.get('open_transfers', '?')}",
+            f"limits: {rs.get('limits', {})}",
+            f"kill switch: {rs.get('kill_switch', {})}",
+        ]
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_parameters(self, *, lang: str | None = None) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            params = await self._tools.get_current_parameters()
+        except Exception:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        lines = [_ai_t("ai_nl_params_title", effective)]
+        try:
+            import json as _json
+
+            lines.append(_json.dumps(params, ensure_ascii=False, default=str)[:2500])
+        except Exception:
+            lines.append(str(params)[:2500])
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_journal(self, *, lang: str | None = None, limit: int = 10) -> str:
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        try:
+            rows = await self._tools.get_recent_journal(limit=limit)
+        except Exception:
+            rows = []
+        if not rows:
+            return self._clean_nl(_ai_t("ai_nl_journal_empty", effective))
+        lines: list[str] = [_ai_t("ai_nl_journal_title", effective, count=len(rows))]
+        for r in rows[:limit]:
+            lines.append(
+                _ai_t(
+                    "ai_nl_journal_line",
+                    effective,
+                    ts=str(r.get("ts", "?"))[:19],
+                    action=str(r.get("action", "?"))[:40],
+                    message=str(r.get("message", ""))[:120],
+                )
+            )
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_why_not_trading(self, *, lang: str | None = None) -> str:
+        """Explain blockers from read-only scan/trading/status data (no invention)."""
+        effective = lang if lang in ("en", "ru") else "en"
+        svc = self._services()
+        if svc is None or self._tools is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        blockers: list[str] = []
+        # Kill switch / guard
+        try:
+            st = await svc.status()
+            guard = st.get("guard", {}) if isinstance(st, dict) else {}
+            if str(guard.get("halted", "")).lower() == "true":
+                blockers.append(f"kill switch ENGAGED ({guard.get('halt_reason', '')})")
+            if str(guard.get("trading_enabled", "")).lower() in ("false", "0"):
+                blockers.append("trading disabled by execution guard")
+            if not st.get("auto_trading", False):
+                blockers.append("auto-trading flag is OFF" if effective == "en" else "флаг автоторговли ВЫКЛ")
+        except Exception:
+            pass
+        # Market data freshness
+        try:
+            stats = await self._tools.get_scan_statistics()
+            if isinstance(stats, dict):
+                if int(stats.get("order_books", 0) or 0) == 0:
+                    blockers.append("missing order books" if effective == "en" else "нет стаканов")
+        except Exception:
+            pass
+        # Exchange availability
+        try:
+            snap = await self._tools.get_exchange_status()
+            if isinstance(snap, dict):
+                for venue, info in snap.items():
+                    status = str((info or {}).get("status", "")).lower() if isinstance(info, dict) else ""
+                    if status in ("offline", "degraded"):
+                        blockers.append(f"exchange {venue} {status}")
+        except Exception:
+            pass
+        # Risk restrictions
+        try:
+            rs = await self._tools.get_risk_state()
+            limits = rs.get("limits", {}) if isinstance(rs, dict) else {}
+            if limits:
+                blockers.append(f"risk limits: {limits}")
+        except Exception:
+            pass
+        # Recent trades / audit hints
+        try:
+            tstats = await self._tools.get_trade_statistics()
+            if isinstance(tstats, dict) and int(tstats.get("total", 0) or 0) == 0:
+                blockers.append("no opportunities above profitability threshold (no recorded trades)" if effective == "en" else "нет возможностей выше порога прибыльности (сделок не записано)")
+            elif isinstance(tstats, dict) and int(tstats.get("failed", 0) or 0) > 0:
+                blockers.append(f"failed trades observed: {tstats.get('failed')}")
+        except Exception:
+            pass
+        lines = [_ai_t("ai_nl_why_title", effective)]
+        if blockers:
+            for b in blockers[:10]:
+                lines.append(f"  - {b}"[:300])
+        else:
+            lines.append(_ai_t("ai_nl_why_no_blocker", effective))
+        return self._clean_nl("\n".join(lines))
 
     async def approve(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
