@@ -274,7 +274,7 @@ async def test_hardening_config_persistence_failure_fails_closed(tmp_path):
         )
         service = app.agent_approval_service
 
-        async def broken_persist(session, param, value_str):
+        async def broken_persist(session, **kwargs):
             raise RuntimeError("injected persistence failure")
 
         service._persist_in_session = broken_persist  # type: ignore[method-assign]
@@ -314,12 +314,20 @@ async def test_hardening_risk_sync_failure_fails_closed(tmp_path):
         service._apply_value = broken_apply  # type: ignore[method-assign]
         with pytest.raises(ApprovalError):
             await service.approve(rec.id, approver="alice", reason="go")
-        # Fail-closed: rolled back everywhere, exception not swallowed.
+        # Fail-closed: exception not swallowed, no false success audit. The
+        # durable grant (APPROVED) + FAILED application record + desired
+        # config stay authoritative so startup reconciliation converges
+        # deterministically; the running process is compensated to
+        # last-known-good values.
+        from app.agent.approval import APPLY_STATUS_FAILED, apply_key
+
         stored = await app.agent_recommendation_service.repository.get(rec.id)
-        assert stored is not None and stored.status != RecommendationStatus.APPROVED
+        assert stored is not None and stored.status == RecommendationStatus.APPROVED
         assert str(app.settings.risk.max_slippage_bps) == before
         assert str(app.risk.limits.max_slippage_bps) == before_limits
-        assert await app.bot_state.get(config_key("risk.max_slippage_bps")) is None
+        assert await app.bot_state.get(config_key("risk.max_slippage_bps")) == "12"
+        apply_record = await app.bot_state.get(apply_key(rec.id))
+        assert isinstance(apply_record, dict) and apply_record["status"] == APPLY_STATUS_FAILED
         app_log = await app.audit.list_recent(limit=50)
         assert not any(
             e.action == "AGENT_RECOMMENDATION_APPROVED" and rec.id in str(e.context)
@@ -348,7 +356,13 @@ async def test_hardening_missing_risk_engine_fails_closed(tmp_path):
         finally:
             object.__setattr__(app, "risk", saved_risk)
         stored = await app.agent_recommendation_service.repository.get(rec.id)
-        assert stored is not None and stored.status != RecommendationStatus.APPROVED
+        assert stored is not None and stored.status == RecommendationStatus.APPROVED
         assert str(app.settings.risk.max_trade_size) == before
+        # Durable grant + FAILED record remain for deterministic recovery.
+        from app.agent.approval import APPLY_STATUS_FAILED, apply_key
+
+        assert await app.bot_state.get(config_key("risk.max_trade_size")) == "900"
+        apply_record = await app.bot_state.get(apply_key(rec.id))
+        assert isinstance(apply_record, dict) and apply_record["status"] == APPLY_STATUS_FAILED
     finally:
         await shutdown(app)

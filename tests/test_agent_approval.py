@@ -243,10 +243,12 @@ async def test_failure_during_apply_keeps_pending(tmp_path):
     try:
         rec_svc = services.agent_recommendation_service
         approval = services.agent_approval_service
+        before = str(services.settings.risk.max_trade_size)
+        before_limits = str(services.risk.limits.max_trade_size)
         # Create valid rec, but monkey-patch _apply_value to fail
         rec = await rec_svc.create(
             parameter="risk.max_trade_size",
-            current_value=str(services.settings.risk.max_trade_size),
+            current_value=before,
             proposed_value="800",
             reason="apply failure",
             source_id="test",
@@ -259,12 +261,19 @@ async def test_failure_during_apply_keeps_pending(tmp_path):
         approval._apply_value = failing_apply  # type: ignore[assignment]
         with pytest.raises(ApprovalError, match="apply failed"):
             await approval.approve(rec.id, approver="human", reason="try")
-        # Should remain pending
+        # Durable grant (APPROVED) + FAILED application record: deterministic
+        # recovery comes from durable state, and runtime stays last-known-good.
+        from app.agent.approval import APPLY_STATUS_FAILED, apply_key, config_key
         from app.agent.recommendations import RecommendationRepository
 
         repo = RecommendationRepository(services.db)
         loaded = await repo.get(rec.id)
-        assert loaded is not None and loaded.status == RecommendationStatus.PENDING
+        assert loaded is not None and loaded.status == RecommendationStatus.APPROVED
+        record = await services.bot_state.get(apply_key(rec.id))
+        assert isinstance(record, dict) and record["status"] == APPLY_STATUS_FAILED
+        assert await services.bot_state.get(config_key("risk.max_trade_size")) == "800"
+        assert str(services.settings.risk.max_trade_size) == before
+        assert str(services.risk.limits.max_trade_size) == before_limits
         approval._apply_value = original_apply
     finally:
         from app.services import shutdown_app

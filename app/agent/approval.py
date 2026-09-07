@@ -5,15 +5,26 @@ Phase 8 — Approval Workflow
 ``RECOMMENDATION → explicit operator approval → validation → controlled
 config change → audit → measurement state``
 
-Hardened approval flow (crash-safe, persistent, idempotent, fail-closed)::
+Crash-consistent approval flow (durable state machine + reconciliation)::
 
     validate (allowlist, bounds, gates, staleness)
         ↓
-    atomic durable claim + persistent config write (ONE db transaction)
+    atomic durable claim (ONE db transaction):
+        recommendation → APPROVED
+        + agent_config:<param> = NEW (authoritative desired config)
+        + agent_apply:<id> = applying (explicit application state)
         ↓
-    runtime settings + RiskEngine synchronization (fail-closed, rollback)
+    runtime settings + RiskEngine synchronization
+        ↓
+    agent_apply:<id> = applied | failed (durable, transactional)
         ↓
     audit + awaiting_measurement state
+
+Startup (:func:`reconcile_approved_config`, inside ``build_app`` before any
+trading can start) re-applies every desired value, finishes interrupted
+``applying``/``failed`` records idempotently, and VERIFIES that settings
+and RiskEngine converge — otherwise startup fails closed. A crash at any
+point is therefore recoverable deterministically from durable state alone.
 
 Critical invariants:
 
@@ -34,11 +45,16 @@ Critical invariants:
   already applied, concurrent race, persistence failure, risk-sync failure).
 * Approved values are persisted durably in the existing ``bot_state``
   key/value table (``agent_config:<param>``) inside the same database
-  transaction as the APPROVED claim, and re-applied on startup via
-  :func:`restore_approved_config`, so approvals survive restarts.
-* RiskEngine synchronization never fails silently: a sync failure rolls
-  back runtime, persisted and row state and raises instead of reporting
-  a false successful approval.
+  transaction as the APPROVED claim, together with an explicit
+  ``agent_apply:<id>`` application record (``applying`` → ``applied`` /
+  ``failed``). Startup reconciliation (:func:`reconcile_approved_config`)
+  finishes interrupted applications and verifies convergence, so a crash
+  at any point leaves a deterministic, recoverable state — never an
+  ambiguous one.
+* RiskEngine synchronization never fails silently: a sync failure is
+  recorded durably as ``failed`` (transactional, never swallowed) and
+  raises instead of reporting a false successful approval; the desired
+  config stays authoritative so startup reconciliation converges.
 * After an approved change the service records ``awaiting_measurement``
   state for the change (Phase 9 will measure it; evaluation is NOT here).
 
@@ -59,11 +75,18 @@ from app.errors import TerminalError
 
 __all__ = [
     "ALLOWLIST",
+    "APPLY_KEY_PREFIX",
+    "APPLY_STATUS_APPLIED",
+    "APPLY_STATUS_APPLYING",
+    "APPLY_STATUS_FAILED",
     "CONFIG_KEY_PREFIX",
     "ApprovalError",
     "RecommendationApprovalService",
+    "apply_key",
     "config_key",
+    "load_apply_records",
     "load_persisted_overrides",
+    "reconcile_approved_config",
     "restore_approved_config",
 ]
 
@@ -109,17 +132,34 @@ RISK_PARAMS = {k for k in ALLOWLIST if k.startswith("risk.")}
 #: Prefix for durable per-parameter keys in the ``bot_state`` table.
 CONFIG_KEY_PREFIX = "agent_config:"
 
+#: Prefix for durable per-approval application records in ``bot_state``.
+#: One record per approved recommendation; the explicit ``status`` makes an
+#: interrupted runtime application recoverable deterministically.
+APPLY_KEY_PREFIX = "agent_apply:"
+
+#: Application states for :data:`APPLY_KEY_PREFIX` records.
+APPLY_STATUS_APPLYING = "applying"
+APPLY_STATUS_APPLIED = "applied"
+APPLY_STATUS_FAILED = "failed"
+
 
 def config_key(param: str) -> str:
     """Durable ``bot_state`` key holding the approved value for *param*."""
     return f"{CONFIG_KEY_PREFIX}{param}"
 
 
+def apply_key(recommendation_id: str) -> str:
+    """Durable ``bot_state`` key holding the application record for an approval."""
+    return f"{APPLY_KEY_PREFIX}{recommendation_id}"
+
+
 async def load_persisted_overrides(db: Any) -> dict[str, str]:  # type: ignore[no-untyped-def]
     """Read all persisted approved values (validated allowlist only).
 
-    Unknown keys are ignored; malformed values are skipped with a warning
-    (fail-closed: never applied). Returns ``{param: raw_string}``.
+    Fail-closed: an allowlisted key holding a malformed or out-of-bounds
+    value raises :class:`ApprovalError` instead of being silently skipped —
+    corrupt durable state must never resolve to an unchecked default.
+    Unknown keys are ignored. Returns ``{param: raw_string}``.
     """
     from app.storage.tables import BotStateRow
 
@@ -131,52 +171,128 @@ async def load_persisted_overrides(db: Any) -> dict[str, str]:  # type: ignore[n
                 continue
             raw = str(row.value).strip()
             if not raw:
-                continue
+                raise ApprovalError(f"persisted config for {param} is empty — refusing unsafe default")
             try:
                 parsed = _parse_value(raw, ALLOWLIST[param]["type"])
                 _validate_bounds(param, parsed)
             except ApprovalError as exc:
-                logger.warning("persisted_config_skipped",
-                               extra={"parameter": param, "error": str(exc)[:200]})
-                continue
+                raise ApprovalError(
+                    f"persisted config for {param} is invalid ({exc}) — refusing unsafe default"
+                ) from exc
             overrides[param] = raw
     return overrides
+
+
+async def load_apply_records(db: Any) -> list[dict[str, Any]]:  # type: ignore[no-untyped-def]
+    """Load every durable ``agent_apply:*`` application record.
+
+    Returns the decoded record dicts (each carries ``recommendation_id``,
+    ``parameter``, ``value`` and ``status``). Malformed records are skipped
+    with a loud error — they never resolve to an assumed state.
+    """
+    from app.storage.tables import BotStateRow
+
+    records: list[dict[str, Any]] = []
+    async with db.session() as session:
+        result = await session.execute(
+            select(BotStateRow).where(BotStateRow.key.startswith(APPLY_KEY_PREFIX))
+        )
+        for row in result.scalars():
+            value = row.value
+            if not isinstance(value, dict):
+                logger.error("apply_record_malformed",
+                             extra={"key": row.key, "recommendation_id": None})
+                continue
+            record = dict(value)
+            record.setdefault("recommendation_id", row.key[len(APPLY_KEY_PREFIX):])
+            records.append(record)
+    return records
 
 
 async def restore_approved_config(services: Any) -> dict[str, str]:  # type: ignore[no-untyped-def]
     """Re-apply persisted approved values to a freshly built service set.
 
-    Called on application startup (see :func:`app.services.build_app`) so
-    that ``services.settings`` and ``services.risk`` agree with the durable
-    state after a restart. Invalid persisted values are skipped with a
-    warning and never applied. Returns the applied ``{param: raw}`` map.
+    Strict wrapper over :func:`reconcile_approved_config` kept for backward
+    compatibility. Fail-closed: any invalid durable value or failed runtime
+    application raises instead of starting with unchecked configuration.
+    """
+    return await reconcile_approved_config(services)
+
+
+async def reconcile_approved_config(services: Any) -> dict[str, str]:  # type: ignore[no-untyped-def]
+    """Deterministic startup reconciliation of durable approved configuration.
+
+    Called from :func:`app.services.build_app` BEFORE any trading service
+    can start, so normal operation never begins with stale runtime risk
+    settings. Steps:
+
+    1. Strict-load every ``agent_config:<param>`` desired value (invalid →
+       raise, fail-closed).
+    2. Apply each through the shared allowlist-only runtime path
+       (failure → raise, fail-closed).
+    3. VERIFY convergence: live settings (and RiskEngine limits for
+       ``risk.*``) must equal the persisted desired value (mismatch →
+       raise, fail-closed).
+    4. Finish interrupted ``agent_apply:*`` records (``applying``/``failed``)
+       by idempotently re-applying the desired value and marking them
+       ``applied``; each recovery is audited.
+
+    Returns the applied ``{param: raw}`` map. Raises :class:`ApprovalError`
+    on anything unrecoverable — the caller must refuse startup then.
     """
     db = getattr(services, "db", None)
     if db is None:
-        return {}
-    try:
-        overrides = await load_persisted_overrides(db)
-    except Exception as exc:  # noqa: BLE001 - startup stays alive; caller logs
-        logger.warning("persisted_config_load_failed", extra={"error": str(exc)[:200]})
-        raise
-    if not overrides:
-        return {}
+        raise ApprovalError("cannot reconcile approved config: no database bound")
+    overrides = await load_persisted_overrides(db)
     # Apply through a detached approval helper so the explicit allowlist
     # mapping is shared with the live approval path (no second code path).
     helper = RecommendationApprovalService(db, services=services)
     applied: dict[str, str] = {}
     for param, raw in sorted(overrides.items()):
+        parsed = _parse_value(raw, ALLOWLIST[param]["type"])
+        _validate_bounds(param, parsed)
         try:
-            parsed = _parse_value(raw, ALLOWLIST[param]["type"])
-            _validate_bounds(param, parsed)
             helper._apply_value(param, parsed)
-        except Exception as exc:  # noqa: BLE001 - one bad key must not break startup
-            logger.warning("persisted_config_apply_failed",
-                           extra={"parameter": param, "error": str(exc)[:200]})
+        except Exception as exc:
+            raise ApprovalError(
+                f"startup reconciliation failed for {param}={raw}: {exc}"
+            ) from exc
+        helper._verify_converged(param, raw)
+        applied[param] = raw
+    # Finish interrupted applications deterministically from durable state.
+    for record in await load_apply_records(db):
+        status = str(record.get("status") or "")
+        if status == APPLY_STATUS_APPLIED:
             continue
+        rec_id = str(record.get("recommendation_id") or "")
+        param = str(record.get("parameter") or "")
+        raw = str(record.get("value") or "")
+        if status not in (APPLY_STATUS_APPLYING, APPLY_STATUS_FAILED) or not rec_id or not param or not raw:
+            logger.error("apply_record_unrecoverable", extra={"recommendation_id": rec_id or None})
+            raise ApprovalError(
+                f"unrecoverable application record for {rec_id or '?'} — refusing startup"
+            )
+        if param not in ALLOWLIST:
+            raise ApprovalError(
+                f"application record for {rec_id} names non-allowlisted {param} — refusing startup"
+            )
+        parsed = _parse_value(raw, ALLOWLIST[param]["type"])
+        _validate_bounds(param, parsed)
+        try:
+            helper._apply_value(param, parsed)
+        except Exception as exc:
+            raise ApprovalError(
+                f"startup recovery of {rec_id} ({param}={raw}) failed: {exc}"
+            ) from exc
+        helper._verify_converged(param, raw)
+        await helper._mark_apply_status(
+            recommendation_id=rec_id, param=param, value_str=raw,
+            status=APPLY_STATUS_APPLIED, approver=str(record.get("approver") or ""),
+        )
+        await helper._audit_recovery(recommendation_id=rec_id, param=param, value_str=raw)
         applied[param] = raw
     if applied:
-        logger.info("persisted_config_restored", extra={"parameters": sorted(applied)})
+        logger.info("approved_config_reconciled", extra={"parameters": sorted(applied)})
     return applied
 
 
@@ -346,66 +462,156 @@ class RecommendationApprovalService:
             return
         raise ApprovalError(f"parameter not allowlisted for apply: {param}")
 
-    async def _persist_in_session(self, session: Any, param: str, value_str: str) -> None:  # type: ignore[no-untyped-def]
-        """Durable write of one approved value inside the caller's transaction.
+    async def _persist_in_session(  # type: ignore[no-untyped-def]
+        self, session: Any, *, recommendation_id: str, param: str, value_str: str,
+        approver: str,
+    ) -> None:
+        """Durable claim writes inside the caller's transaction.
 
-        Separate seam (not the ``bot_state`` repository) so the write can
-        share the approval claim's database transaction — and so tests can
-        inject a persistence failure deterministically.
+        Writes BOTH the authoritative desired value (``agent_config:<param>``)
+        AND the explicit application record (``agent_apply:<id>`` =
+        ``applying``) so a crash after commit leaves a deterministic,
+        recoverable state. Separate seam (not the ``bot_state`` repository)
+        so the writes share the approval claim's database transaction — and
+        so tests can inject a persistence failure deterministically.
         """
         from app.models.base import utc_now
         from app.storage.tables import BotStateRow
 
-        row = BotStateRow(key=config_key(param), value=value_str, updated_at=utc_now())
-        await session.merge(row)
+        now = utc_now().isoformat()
+        await session.merge(BotStateRow(key=config_key(param), value=value_str, updated_at=utc_now()))
+        await session.merge(BotStateRow(
+            key=apply_key(recommendation_id),
+            value={"recommendation_id": recommendation_id, "parameter": param,
+                   "value": value_str, "status": APPLY_STATUS_APPLYING,
+                   "approver": approver, "approved_at": now, "error": None},
+            updated_at=utc_now(),
+        ))
 
-    async def _rollback_claim(  # type: ignore[no-untyped-def]
-        self, *, recommendation_id: str, from_status: str, param: str,
-        old_persisted: Any, old_settings: Any, old_risk: Any,
+    async def _mark_apply_status(  # type: ignore[no-untyped-def]
+        self, *, recommendation_id: str, param: str, value_str: str,
+        status: str, approver: str, error: str | None = None,
     ) -> None:
-        """Best-effort rollback after a post-claim runtime failure.
+        """Durably record the application outcome (``applied`` / ``failed``).
 
-        Restores runtime settings/risk, the durable config key and the
-        recommendation row so no false APPROVED state survives. Never
-        raises — the original failure stays authoritative.
+        Transactional and loud: a failure to record raises — it never
+        silently leaves the system believing an unrecorded state. When the
+        ``failed`` mark itself cannot be written, the record stays
+        ``applying``, which startup reconciliation still recovers
+        deterministically.
         """
-        if self._services is not None:
-            try:
-                if old_settings is not None:
-                    object.__setattr__(self._services, "settings", old_settings)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("approval_rollback_settings_failed",
-                               extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
-            try:
-                if old_risk is not None:
-                    object.__setattr__(self._services, "risk", old_risk)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("approval_rollback_risk_failed",
-                               extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
-        try:
-            bot_state = getattr(self._services, "bot_state", None) if self._services is not None else None
-            if bot_state is not None:
-                if old_persisted is None:
-                    try:
-                        await bot_state.delete(config_key(param))
-                    except Exception:
-                        pass
-                else:
-                    await bot_state.set(config_key(param), old_persisted)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("approval_rollback_persist_failed",
-                           extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+        from app.models.base import utc_now
+        from app.storage.tables import BotStateRow
+
+        if status == APPLY_STATUS_APPLIED:
+            record = {"recommendation_id": recommendation_id, "parameter": param,
+                      "value": value_str, "status": status,
+                      "approver": approver, "approved_at": utc_now().isoformat(),
+                      "error": None}
+        elif status == APPLY_STATUS_FAILED:
+            record = {"recommendation_id": recommendation_id, "parameter": param,
+                      "value": value_str, "status": status,
+                      "approver": approver, "approved_at": utc_now().isoformat(),
+                      "error": (error or "")[:300]}
+        else:
+            raise ApprovalError(f"refusing to mark unexpected apply status: {status!r}")
         try:
             async with self._db.session() as session:
-                await session.execute(
-                    AgentRecommendationRow.__table__.update()
-                    .where(AgentRecommendationRow.id == recommendation_id,
-                           AgentRecommendationRow.status == RecommendationStatus.APPROVED.value)
-                    .values(status=from_status, operator_decision=None,
-                            decision_reason=None, result="rolled back: runtime sync failed")
+                await session.merge(BotStateRow(
+                    key=apply_key(recommendation_id), value=record, updated_at=utc_now(),
+                ))
+        except Exception as exc:
+            logger.error("apply_status_write_failed",
+                         extra={"recommendation_id": recommendation_id,
+                                "status": status, "error": str(exc)[:200]})
+            raise ApprovalError(f"could not durably mark {recommendation_id} as {status}: {exc}") from exc
+
+    async def _record_apply_outcome(  # type: ignore[no-untyped-def]
+        self, *, recommendation_id: str, param: str, value_str: str,
+        approver: str, error: str,
+    ) -> None:
+        """Durably record a failed runtime application (transactional).
+
+        Never masks the original failure: if the ``failed`` mark itself
+        cannot be written, the error is logged loudly and the record stays
+        ``applying`` — startup reconciliation still recovers it
+        deterministically. Never raises.
+        """
+        try:
+            await self._mark_apply_status(
+                recommendation_id=recommendation_id, param=param, value_str=value_str,
+                status=APPLY_STATUS_FAILED, approver=approver, error=error,
+            )
+        except ApprovalError as exc:
+            logger.error("apply_failed_mark_failed",
+                         extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+
+    def _verify_converged(self, param: str, value_str: str) -> None:
+        """Prove settings and RiskEngine hold the durable desired value.
+
+        Raises :class:`ApprovalError` on ANY divergence — a converged state
+        is never assumed, it is checked. Used both after live application
+        and during startup reconciliation.
+        """
+        live = self._get_current(param)
+        if live is None:
+            raise ApprovalError(f"cannot verify convergence for {param}: unreadable runtime value")
+        if str(live).strip() != str(value_str).strip():
+            raise ApprovalError(
+                f"settings diverged for {param}: durable {value_str!r} vs runtime {live!r}"
+            )
+        if param in RISK_PARAMS:
+            engine = getattr(self._services, "risk", None) if self._services is not None else None
+            if engine is None or not hasattr(engine, "limits"):
+                raise ApprovalError(f"RiskEngine unavailable for {param} — refusing divergent state")
+            try:
+                limit_value = getattr(engine.limits, self._risk_field(param))
+            except Exception as exc:
+                raise ApprovalError(f"cannot read RiskEngine limit for {param}: {exc}") from exc
+            if str(limit_value).strip() != str(value_str).strip():
+                raise ApprovalError(
+                    f"RiskEngine diverged for {param}: durable {value_str!r} vs engine {limit_value!r}"
+                )
+
+    def _compensate_runtime(self, *, recommendation_id: str, old_settings: Any, old_risk: Any) -> None:
+        """Non-authoritative in-memory compensation after a failed sync.
+
+        Restores the previous settings/risk object references so the running
+        process keeps serving the last known-good values until startup
+        reconciliation converges deterministically from durable state.
+        Loud on failure (error level, never swallowed silently) — but NOT
+        the correctness guarantee: durable state is authoritative.
+        """
+        if self._services is None:
+            return
+        if old_settings is not None:
+            try:
+                object.__setattr__(self._services, "settings", old_settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("approval_compensate_settings_failed",
+                             extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+        if old_risk is not None:
+            try:
+                object.__setattr__(self._services, "risk", old_risk)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("approval_compensate_risk_failed",
+                             extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+
+    async def _audit_recovery(  # type: ignore[no-untyped-def]
+        self, *, recommendation_id: str, param: str, value_str: str,
+    ) -> None:
+        """Audit a startup-recovered interrupted application (best-effort log only)."""
+        try:
+            audit = getattr(self._services, "audit", None) if self._services is not None else None
+            if audit is not None and hasattr(audit, "log"):
+                await audit.log(
+                    "AGENT_RECOMMENDATION_APPLY_RECOVERED",
+                    f"{param}={value_str} (interrupted application finished at startup)",
+                    {"recommendation_id": recommendation_id, "parameter": param,
+                     "value": value_str},
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("approval_rollback_row_failed",
+            logger.warning("recovery_audit_failed",
                            extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
 
     async def _audit_approval_failure(  # type: ignore[no-untyped-def]
@@ -593,20 +799,23 @@ class RecommendationApprovalService:
     async def approve(self, recommendation_id: str, *, approver: str, reason: str = "") -> AgentRecommendation:
         """Approve an exact recommendation and apply it through the control plane.
 
-        Hardened Phase 8 flow: explicit operator + exact id → allowlist /
-        bounds validation → safety gates (kill switch, LIVE reason) →
-        staleness check → ATOMIC durable claim (PENDING/REVIEWED → APPROVED
-        plus the persistent ``bot_state`` config write in ONE database
-        transaction) → runtime settings + RiskEngine synchronization
-        (fail-closed with rollback) → dual audit + ``awaiting_measurement``
+        Crash-consistent Phase 8 flow: explicit operator + exact id →
+        allowlist / bounds validation → safety gates (kill switch, LIVE
+        reason) → staleness check → ATOMIC durable claim (PENDING/REVIEWED →
+        APPROVED plus the authoritative desired config AND the
+        ``applying`` application record in ONE database transaction) →
+        runtime settings + RiskEngine synchronization → durable
+        ``applied``/``failed`` mark → dual audit + ``awaiting_measurement``
         state.
 
         Concurrency: the conditional UPDATE claims the row only when it is
         still actionable, so of concurrent approve/approve or approve/reject
         callers exactly one wins; every loser raises WITHOUT mutating any
         configuration. A failed claim or failed persistence applies nothing.
-        A failed runtime sync rolls durable, runtime and row state back and
-        raises — never a false APPROVED.
+        A failed runtime sync is recorded durably as ``failed``
+        (transactional) and raises — never a false ``applied``. A crash at
+        any point leaves durable state from which startup reconciliation
+        (:func:`reconcile_approved_config`) converges deterministically.
         """
         if not approver or not str(approver).strip():
             raise ApprovalError("approver must be a non-empty human identifier")
@@ -641,7 +850,6 @@ class RecommendationApprovalService:
                     raise ApprovalError(
                         f"current config changed for {param}: recommendation stored {stored_current!r} vs live {live_current!r} — stale, reject"
                     )
-            from_status = str(row.status)
             from_version = int(row.version)
             # Snapshot row fields for the returned model (session scope ends).
             snap = {
@@ -653,21 +861,17 @@ class RecommendationApprovalService:
                 "created_at": row.created_at, "updated_at": row.updated_at,
             }
 
-        # ---- Phase 2: snapshot runtime + durable state (still no mutation) ----
+        # ---- Phase 2: snapshot runtime (still no mutation) ----
         old_settings = getattr(self._services, "settings", None)
         old_risk = getattr(self._services, "risk", None)
-        try:
-            bot_state = getattr(self._services, "bot_state", None)
-            old_persisted = await bot_state.get(config_key(param)) if bot_state is not None else None
-        except Exception as exc:
-            raise ApprovalError(f"cannot read persistent config for {param}: {exc}") from exc
 
-        # ---- Phase 3: atomic durable claim + persistent config (ONE txn) ----
+        # ---- Phase 3: atomic durable claim (ONE txn) ----
         # The conditional UPDATE is the idempotency guard: only a row that is
         # still PENDING/REVIEWED transitions, so concurrent or repeated
-        # approvals cannot apply twice. The persistent config write shares
-        # the transaction — a persistence failure rolls the claim back and
-        # nothing is applied anywhere.
+        # approvals cannot apply twice. The authoritative desired config AND
+        # the ``applying`` application record share the transaction — a
+        # persistence failure rolls the claim back and nothing is applied
+        # anywhere; a crash after commit leaves a recoverable state.
         try:
             async with self._db.session() as session:
                 update_result = await session.execute(
@@ -684,7 +888,10 @@ class RecommendationApprovalService:
                 )
                 if update_result.rowcount == 0:
                     raise ApprovalError("recommendation not PENDING/REVIEWED (concurrent modification) — duplicate")
-                await self._persist_in_session(session, param, proposed_raw)
+                await self._persist_in_session(
+                    session, recommendation_id=recommendation_id, param=param,
+                    value_str=proposed_raw, approver=approver,
+                )
         except ApprovalError:
             raise
         except Exception as exc:
@@ -694,16 +901,24 @@ class RecommendationApprovalService:
             )
             raise ApprovalError(f"durable approval claim failed for {param}: {exc}") from exc
 
-        # ---- Phase 4: runtime synchronization (fail-closed with rollback) ----
-        # Durable state is committed; runtime cannot join that transaction, so
-        # a sync failure explicitly rolls durable + runtime + row state back
-        # instead of leaving a false APPROVED behind.
+        # ---- Phase 4: runtime synchronization (durable outcome, fail-closed) ----
+        # Durable state is committed and authoritative. A sync failure is
+        # recorded transactionally as ``failed`` (never swallowed), the
+        # in-memory objects are compensated to last-known-good values (loud,
+        # non-authoritative), and the error raises. Startup reconciliation
+        # converges deterministically from durable state alone — including
+        # after a crash that skips this handler entirely.
         try:
             self._apply_value(param, parsed)
+            self._verify_converged(param, proposed_raw)
         except ApprovalError as exc:
-            await self._rollback_claim(
-                recommendation_id=recommendation_id, from_status=from_status, param=param,
-                old_persisted=old_persisted, old_settings=old_settings, old_risk=old_risk,
+            await self._record_apply_outcome(
+                recommendation_id=recommendation_id, param=param, value_str=proposed_raw,
+                approver=approver, error=str(exc)[:300],
+            )
+            self._compensate_runtime(
+                recommendation_id=recommendation_id,
+                old_settings=old_settings, old_risk=old_risk,
             )
             await self._audit_approval_failure(
                 recommendation_id=recommendation_id, param=param,
@@ -712,15 +927,33 @@ class RecommendationApprovalService:
             )
             raise
         except Exception as exc:
-            await self._rollback_claim(
-                recommendation_id=recommendation_id, from_status=from_status, param=param,
-                old_persisted=old_persisted, old_settings=old_settings, old_risk=old_risk,
+            await self._record_apply_outcome(
+                recommendation_id=recommendation_id, param=param, value_str=proposed_raw,
+                approver=approver, error=str(exc)[:300],
+            )
+            self._compensate_runtime(
+                recommendation_id=recommendation_id,
+                old_settings=old_settings, old_risk=old_risk,
             )
             await self._audit_approval_failure(
                 recommendation_id=recommendation_id, param=param,
                 stage="runtime_apply", error=str(exc)[:300],
             )
             raise ApprovalError(f"apply failed for {param}: {exc}") from exc
+
+        # ---- Phase 4b: durable applied mark (transactional) ----
+        # Crash before this mark leaves ``applying`` + desired config, which
+        # startup reconciliation finishes idempotently — never ambiguity.
+        try:
+            await self._mark_apply_status(
+                recommendation_id=recommendation_id, param=param, value_str=proposed_raw,
+                status=APPLY_STATUS_APPLIED, approver=approver,
+            )
+        except ApprovalError as exc:
+            logger.error("apply_mark_failed",
+                         extra={"recommendation_id": recommendation_id, "error": str(exc)[:200]})
+            # Runtime already converged and verified above; the lingering
+            # ``applying`` record is finished by startup reconciliation.
 
         returned = AgentRecommendation(
             id=snap["id"],

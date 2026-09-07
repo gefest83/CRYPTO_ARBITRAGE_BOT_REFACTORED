@@ -572,18 +572,31 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     from app.auto_controller import AutoTradingController
 
     services.auto_controller = AutoTradingController(services)
-    # Human-approved AI Advisor tuning survives restarts: re-apply the
-    # durable ``agent_config:<param>`` overrides (if any) on top of the
-    # environment-derived settings so settings, RiskEngine and storage
-    # agree after every boot. Best-effort at this layer — a restore
-    # failure is logged and never blocks startup (approval itself stays
-    # fail-closed).
+    # Human-approved AI Advisor tuning survives restarts: deterministically
+    # reconcile the durable ``agent_config:<param>`` desired state (plus any
+    # interrupted ``agent_apply:<id>`` application) on top of the
+    # environment-derived settings, and VERIFY that settings and RiskEngine
+    # converge — BEFORE any trading service can start (trading begins only
+    # in ``start_app`` / the auto loop, both strictly after this return).
+    # Fail-closed: a reconciliation failure disposes the database and
+    # refuses startup, so the bot can never trade on stale or divergent
+    # risk settings.
     try:
-        from app.agent.approval import restore_approved_config
+        from app.agent.approval import reconcile_approved_config
 
-        await restore_approved_config(services)
-    except Exception as exc:  # noqa: BLE001 - restore must never block startup
-        logger.warning("approved_config_restore_failed", extra={"error": str(exc)[:200]})
+        await reconcile_approved_config(services)
+    except Exception as exc:  # noqa: BLE001 - fail-closed startup, never stale trading
+        logger.error("approved_config_reconcile_failed", extra={"error": str(exc)[:200]})
+        try:
+            await services.audit.log(
+                "APPROVED_CONFIG_RECONCILE_FAILED",
+                str(exc)[:500],
+                {"error": str(exc)[:300]},
+            )
+        except Exception:  # noqa: BLE001 - audit is best-effort; the refusal stands
+            pass
+        await db.dispose()
+        raise
     return services
 
 
