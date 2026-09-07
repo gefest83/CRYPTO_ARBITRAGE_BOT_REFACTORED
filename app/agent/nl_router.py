@@ -7,8 +7,17 @@ Supported intents (at least)::
 
     BALANCE_QUERY, TRADES_QUERY, TRADE_STATS_QUERY, SCAN_STATS_QUERY,
     OPPORTUNITIES_QUERY, EXCHANGE_STATUS_QUERY, BOT_STATUS_QUERY,
-    RISK_QUERY, PARAMETERS_QUERY, MEMORY_QUERY, JOURNAL_QUERY,
-    RECOMMENDATIONS_QUERY, WHY_NOT_TRADING_QUERY, AI_HELP, UNKNOWN
+    BOT_OPERATION_QUERY, RISK_QUERY, PARAMETERS_QUERY, MEMORY_QUERY,
+    JOURNAL_QUERY, RECOMMENDATIONS_QUERY, WHY_NOT_TRADING_QUERY,
+    AI_HELP, UNKNOWN
+
+``BOT_OPERATION_QUERY`` ("how does the bot trade/work?") is an
+architecture/behavior explanation; ``BOT_STATUS_QUERY`` ("what is the bot
+doing right now?") is current runtime state. They are distinct intents.
+
+``TRADES_QUERY`` may carry a time-window entity (``period`` = ``today`` /
+``last_hour`` / ``recent`` / ``None``); recent-history questions carry no
+period and keep the legacy recent-trades behavior.
 
 Security: :func:`is_privileged_request` detects natural-language attempts
 to perform privileged actions (approve / trade / withdraw / configure).
@@ -27,6 +36,7 @@ __all__ = [
     "OPPORTUNITIES_QUERY",
     "EXCHANGE_STATUS_QUERY",
     "BOT_STATUS_QUERY",
+    "BOT_OPERATION_QUERY",
     "RISK_QUERY",
     "PARAMETERS_QUERY",
     "MEMORY_QUERY",
@@ -35,9 +45,13 @@ __all__ = [
     "WHY_NOT_TRADING_QUERY",
     "AI_HELP",
     "UNKNOWN",
+    "PERIOD_TODAY",
+    "PERIOD_LAST_HOUR",
+    "PERIOD_RECENT",
     "detect_intent",
     "is_privileged_request",
     "extract_balance_filters",
+    "extract_trade_period",
     "KNOWN_VENUES",
 ]
 
@@ -54,8 +68,14 @@ MEMORY_QUERY = "MEMORY_QUERY"
 JOURNAL_QUERY = "JOURNAL_QUERY"
 RECOMMENDATIONS_QUERY = "RECOMMENDATIONS_QUERY"
 WHY_NOT_TRADING_QUERY = "WHY_NOT_TRADING_QUERY"
+BOT_OPERATION_QUERY = "BOT_OPERATION_QUERY"
 AI_HELP = "AI_HELP"
 UNKNOWN = "UNKNOWN"
+
+#: Trade time-window entities for TRADES_QUERY.
+PERIOD_TODAY = "today"
+PERIOD_LAST_HOUR = "last_hour"
+PERIOD_RECENT = "recent"
 
 KNOWN_VENUES = ("binance", "okx", "bybit")
 
@@ -157,6 +177,24 @@ _INTENT_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "почему бот не торгует", "почему нет сделок", "почему сейчас нет сделок",
         "почему бот не торговал", "почему не торгует", "почему нет торговли",
         "что мешает", "что блокирует", "почему сделок нет",
+        "почему бот ничего не делает", "почему не исполняются сделки",
+        "почему сделки не исполняются",
+    )),
+    (BOT_OPERATION_QUERY, (
+        "how does the bot trade", "how does our bot work", "how does the bot work",
+        "how does it find arbitrage", "how does it find trades",
+        "how does it choose trades", "how are routes selected",
+        "how does it decide to trade", "how does the trading cycle work",
+        "how does the bot choose", "how does the bot decide",
+        "what strategies does the bot use", "what strategies are used",
+        "how does the bot find", "trading cycle",
+        "как торгует наш бот", "как торгует бот", "как работает бот",
+        "как работает наш бот", "как бот выбирает сделки", "как он ищет арбитраж",
+        "как он ищет сделки", "как происходит торговый цикл", "торговый цикл",
+        "как бот принимает решение о сделке", "как принимается решение о сделке",
+        "какие стратегии использует бот", "какие стратегии используются",
+        "как выбираются маршруты", "как ищет арбитраж", "как устроен бот",
+        "как бот ищет",
     )),
     (BALANCE_QUERY, (
         "balance", "balances", "баланс", "балансы",
@@ -217,9 +255,18 @@ _INTENT_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "bot status", "status of the bot", "is auto trading", "is autotrade",
         "auto trading running", "auto-trading", "is the bot running",
         "is bot running", "what is happening with", "what's happening",
+        "what is the bot doing", "what is the bot doing now",
+        "is the bot currently trading", "currently trading",
+        "what strategies is the bot using now", "which strategy is active",
+        "what strategy is active",
         "статус бота", "состояние бота", "автоторговля", "автоторгов",
         "бот работает", "бот запущен", "что сейчас происходит",
         "что происходит", "статус работы",
+        "что сейчас делает бот", "что делает бот сейчас",
+        "что сейчас происходит с ботом",
+        "какая стратегия сейчас активна", "какая стратегия активна",
+        "активная стратегия", "активна сейчас",
+        "торгует ли бот сейчас", "бот сейчас торгует",
     )),
     (RISK_QUERY, (
         "risk state", "risk status", "current risk", "risk limit",
@@ -308,7 +355,40 @@ def detect_intent(text: str) -> tuple[str, dict]:
     entities: dict = {}
     if best_intent == BALANCE_QUERY:
         entities.update(filters)
+    if best_intent == TRADES_QUERY:
+        period = extract_trade_period(text)
+        if period is not None:
+            entities["period"] = period
     return best_intent, entities
+
+
+_TODAY_MARKERS: tuple[str, ...] = ("сегодня", "today", "за сегодня")
+
+_LAST_HOUR_MARKERS: tuple[str, ...] = (
+    "last hour", "past hour",
+    "за последний час", "за последние часы", "последний час",
+)
+
+_RECENT_MARKERS: tuple[str, ...] = (
+    "recently", "recent", "lately", "last few",
+    "недавно", "недавние", "последние сделки", "последняя",
+)
+
+
+def extract_trade_period(text: str) -> str | None:
+    """Extract the requested time window from a trades question.
+
+    ``today`` / ``last_hour`` are strict filters; ``recent`` (or ``None``)
+    keeps the legacy recent-history behavior.
+    """
+    t = _norm(text)
+    if any(m in t for m in _TODAY_MARKERS):
+        return PERIOD_TODAY
+    if any(m in t for m in _LAST_HOUR_MARKERS):
+        return PERIOD_LAST_HOUR
+    if any(m in t for m in _RECENT_MARKERS):
+        return PERIOD_RECENT
+    return None
 
 
 _BALANCE_ASSET_RE = re.compile(r"\b([A-Za-z]{2,10})\b")

@@ -30,9 +30,12 @@ from typing import Any
 
 from app.agent.core import AgentCore, AgentRequest
 from app.agent.tools import AgentTools
+from app.config.logging_config import get_logger
 from app.telegram.i18n import t
 
 __all__ = ["AgentTelegramAdapter", "AI_COMMANDS"]
+
+logger = get_logger("agent.telegram")
 
 
 AI_COMMANDS: tuple[str, ...] = (
@@ -168,6 +171,7 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "- memory: 'show agent memory', 'покажи память агента'\n"
             "- recommendations: 'show recommendations', 'покажи рекомендации'\n"
             "- why not trading: 'why is the bot not trading', 'почему бот не торгует'\n"
+            "- how the bot works: 'how does the bot trade', 'как торгует бот'\n"
             "\n"
             "Trading, withdrawals, configuration changes and approvals stay protected — "
             "use the explicit commands (/ai approve <id>, /pause, /resume, CLI) for those."
@@ -183,6 +187,15 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         ),
         "ai_nl_balance_unavailable": "  {venue}: unavailable — balance request failed",
         "ai_nl_balance_more": "  ... and {remaining} more balances not shown",
+        "ai_nl_trades_today_title": "Trades today ({count}):",
+        "ai_nl_trades_empty_today": "No trades today. The bot has not recorded any trades on the current calendar date.",
+        "ai_nl_trades_last_hour_title": "Trades in the last hour ({count}):",
+        "ai_nl_trades_empty_last_hour": "No trades in the last hour.",
+        "ai_nl_threshold_line": "(governing threshold: {value} bps — {source}, active strategy: {strategy})",
+        "ai_nl_risk_gate_line": "(execution is additionally gated by risk min_net_profit_bps: {value} bps)",
+        "ai_nl_scan_took": "(scan took {ms} ms)",
+        "ai_nl_bot_operation_title": "How this bot works (read-only explanation):",
+        "ai_nl_insufficient_data": "Available data is insufficient to establish a reason — no reason is invented.",
     },
     "ru": {
         "ai_help": (
@@ -299,6 +312,7 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "- память: 'покажи память агента', 'show agent memory'\n"
             "- рекомендации: 'покажи рекомендации', 'show recommendations'\n"
             "- почему нет сделок: 'почему бот не торгует', 'why is the bot not trading'\n"
+            "- как работает бот: 'как торгует бот', 'how does the bot trade'\n"
             "\n"
             "Торговля, выводы, изменение конфигурации и подтверждения остаются защищёнными — "
             "используйте явные команды (/ai approve <id>, /pause, /resume, CLI)."
@@ -314,6 +328,15 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         ),
         "ai_nl_balance_unavailable": "  {venue}: недоступна — запрос баланса не удался",
         "ai_nl_balance_more": "  ... и ещё {remaining} балансов не показано",
+        "ai_nl_trades_today_title": "Сделки сегодня ({count}):",
+        "ai_nl_trades_empty_today": "Сегодня сделок не было. На текущую календарную дату бот сделок не записывал.",
+        "ai_nl_trades_last_hour_title": "Сделки за последний час ({count}):",
+        "ai_nl_trades_empty_last_hour": "За последний час сделок не было.",
+        "ai_nl_threshold_line": "(действующий порог: {value} bps — {source}, активная стратегия: {strategy})",
+        "ai_nl_risk_gate_line": "(исполнение дополнительно ограничено риск-лимитом min_net_profit_bps: {value} bps)",
+        "ai_nl_scan_took": "(скан занял {ms} мс)",
+        "ai_nl_bot_operation_title": "Как работает этот бот (объяснение, только чтение):",
+        "ai_nl_insufficient_data": "Доступных данных недостаточно для установления причины — причина не выдумывается.",
     },
 }
 
@@ -717,27 +740,98 @@ class AgentTelegramAdapter:
         return "\n".join(lines)
 
     # ------------------------------------------------------------- NL intents
+    async def _active_strategy(self) -> str:
+        """Active runtime strategy (``triangle`` default, mirrors AutoTrader)."""
+        svc = self._services()
+        if svc is None:
+            return "triangle"
+        get_active = getattr(svc, "get_active_strategy", None)
+        if get_active is not None:
+            try:
+                active = await get_active()
+                if active in ("triangle", "transfer"):
+                    return active
+            except Exception:
+                pass
+        # Fallback: status() view carries the same field.
+        try:
+            st = await svc.status()
+            if isinstance(st, dict) and st.get("active_strategy") in ("triangle", "transfer"):
+                return str(st.get("active_strategy"))
+        except Exception:
+            pass
+        return "triangle"
+
+    async def _threshold_context(self) -> dict[str, str]:
+        """Thresholds actually governing the active runtime path (read-only).
+
+        Root cause of the historical "5 bps vs 10 bps" confusion: the
+        *scanner* filters triangles at ``arbitrage.triangle_min_net_bps``
+        (default 5) while the *risk engine* additionally gates every
+        execution at ``risk.min_net_profit_bps`` (default 10) via
+        ``MinNetProfitRule``. Transfer plans filter at
+        ``transfer.min_net_profit_bps`` (default 50). This helper reports
+        the strategy threshold that governs *opportunity detection* plus
+        the risk gate that governs *execution* — never inventing values.
+        """
+        strategy = await self._active_strategy()
+        strat_value: str | None = None
+        strat_source = ""
+        risk_value: str | None = None
+        svc = self._services()
+        settings = getattr(svc, "settings", None) if svc is not None else None
+        try:
+            if strategy == "transfer":
+                transfer = getattr(settings, "transfer", None)
+                if transfer is not None and getattr(transfer, "min_net_profit_bps", None) is not None:
+                    strat_value = str(transfer.min_net_profit_bps)
+                    strat_source = "transfer.min_net_profit_bps"
+            else:
+                arbitrage = getattr(settings, "arbitrage", None)
+                if arbitrage is not None and getattr(arbitrage, "triangle_min_net_bps", None) is not None:
+                    strat_value = str(arbitrage.triangle_min_net_bps)
+                    strat_source = "arbitrage.triangle_min_net_bps"
+        except Exception:
+            pass
+        try:
+            risk = getattr(settings, "risk", None)
+            if risk is not None and getattr(risk, "min_net_profit_bps", None) is not None:
+                risk_value = str(risk.min_net_profit_bps)
+        except Exception:
+            pass
+        return {
+            "strategy": strategy,
+            "threshold": strat_value or "?",
+            "source": strat_source or "unknown",
+            "risk_threshold": risk_value or "?",
+        }
+
     async def handle_natural_language(
         self, text: str, *, lang: str | None = None, approver: str | None = None
     ) -> str:
         """Deterministic NL entry point: intent router -> read-only tools.
 
         Never performs privileged actions. Unknown or privileged inputs get
-        a safe help/refusal message.
+        a safe help/refusal message. Every request is timed and logged as
+        ``ai_nl_request`` (intent + duration only — never secrets).
         """
+        import time as _time
+
         from app.agent.nl_router import UNKNOWN, detect_intent, is_privileged_request
 
         effective = lang if lang in ("en", "ru") else "en"
         if self._core is None and self._tools is None:
             return self._clean_nl(_ai_t("ai_not_configured", effective))
         if is_privileged_request(text or ""):
+            logger.info("ai_nl_request", extra={"intent": "PRIVILEGED_REFUSED", "duration_ms": 0})
             return self._clean_nl(_ai_t("ai_nl_privileged_refused", effective))
         intent, entities = detect_intent(text or "")
+        started = _time.perf_counter()
         try:
             if intent == "BALANCE_QUERY":
                 return await self.balance(lang=effective, venue=entities.get("venue"), asset=entities.get("asset"))
             if intent == "TRADES_QUERY":
-                return await self.nl_trades(lang=effective)
+                return await self.nl_trades(lang=effective, period=entities.get("period"))
             if intent == "TRADE_STATS_QUERY":
                 return await self.nl_trade_stats(lang=effective)
             if intent == "SCAN_STATS_QUERY":
@@ -748,6 +842,8 @@ class AgentTelegramAdapter:
                 return await self.nl_exchange_status(lang=effective)
             if intent == "BOT_STATUS_QUERY":
                 return await self.nl_bot_status(lang=effective)
+            if intent == "BOT_OPERATION_QUERY":
+                return await self.nl_bot_operation(lang=effective)
             if intent == "RISK_QUERY":
                 return await self.nl_risk(lang=effective)
             if intent == "PARAMETERS_QUERY":
@@ -770,18 +866,108 @@ class AgentTelegramAdapter:
             safe = _redact(str(exc))[:200]
             _ = safe
             return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+        finally:
+            try:
+                duration_ms = int((_time.perf_counter() - started) * 1000)
+                logger.info("ai_nl_request", extra={"intent": intent, "duration_ms": duration_ms})
+            except Exception:
+                pass
 
-    async def nl_trades(self, *, lang: str | None = None, limit: int = 10) -> str:
+    @staticmethod
+    def _trade_local_date(raw: Any) -> Any | None:
+        """Parse a trade ``created_at`` ISO value to an app-local date."""
+        from datetime import datetime as _dt
+
+        if not raw:
+            return None
+        try:
+            parsed = _dt.fromisoformat(str(raw))
+        except Exception:
+            return None
+        try:
+            if parsed.tzinfo is None:
+                # Domain timestamps are UTC; naive values are treated as UTC.
+                from datetime import UTC as _UTC
+
+                parsed = parsed.replace(tzinfo=_UTC)
+            return parsed.astimezone().date()
+        except Exception:
+            return None
+
+    def _filter_trades_by_period(self, trades: list[dict[str, Any]], period: str | None) -> list[dict[str, Any]]:
+        """Apply a strict time window; ``None``/``recent`` keeps history order."""
+        from datetime import datetime as _dt
+        from datetime import timedelta as _td
+
+        if period == "today":
+            today = _dt.now().astimezone().date()
+            return [t for t in trades if self._trade_local_date(t.get("created_at")) == today]
+        if period == "last_hour":
+            now = _dt.now().astimezone()
+            cutoff = now - _td(hours=1)
+            out: list[dict[str, Any]] = []
+            for t in trades:
+                raw = t.get("created_at")
+                try:
+                    parsed = _dt.fromisoformat(str(raw)) if raw else None
+                except Exception:
+                    parsed = None
+                if parsed is None:
+                    continue
+                try:
+                    if parsed.tzinfo is None:
+                        from datetime import UTC as _UTC
+
+                        parsed = parsed.replace(tzinfo=_UTC)
+                    if parsed >= cutoff:
+                        out.append(t)
+                except Exception:
+                    continue
+            return out
+        return list(trades)
+
+    async def nl_trades(self, *, lang: str | None = None, limit: int = 10, period: str | None = None) -> str:
+        """Recent trades, optionally restricted to a strict time window.
+
+        ``period="today"`` returns *only* trades from the current
+        application-local calendar date (never stale history); when empty
+        it explicitly says so instead of showing old trades.
+        ``None``/``"recent"`` keeps the legacy recent-history behavior.
+        """
         effective = lang if lang in ("en", "ru") else "en"
         if self._tools is None:
             return self._clean_nl(_ai_t("ai_not_configured", effective))
+        fetch_limit = 100 if period in ("today", "last_hour") else limit
         try:
-            trades = await self._tools.get_recent_trades(limit=limit)
+            trades = await self._tools.get_recent_trades(limit=fetch_limit)
         except Exception:
             return self._clean_nl(_ai_t("ai_nl_trades_empty", effective))
+        if period in ("today", "last_hour"):
+            windowed = self._filter_trades_by_period(trades or [], period)
+            if not windowed:
+                if period == "today":
+                    return self._clean_nl(_ai_t("ai_nl_trades_empty_today", effective))
+                return self._clean_nl(_ai_t("ai_nl_trades_empty_last_hour", effective))
+            title_key = "ai_nl_trades_today_title" if period == "today" else "ai_nl_trades_last_hour_title"
+            lines: list[str] = [_ai_t(title_key, effective, count=len(windowed))]
+            for tr in windowed[:limit]:
+                lines.append(
+                    _ai_t(
+                        "ai_nl_trades_line",
+                        effective,
+                        strategy=str(tr.get("strategy", "?")),
+                        route=str(tr.get("route", "?"))[:60],
+                        status=str(tr.get("status", "?")),
+                        net_profit=str(tr.get("net_profit", "?")),
+                        created=str(tr.get("created_at", "?"))[:19],
+                    )
+                )
+            if len(windowed) > limit:
+                lines.append(_ai_t("ai_nl_trades_more", effective, remaining=len(windowed) - limit))
+            return self._clean_nl("\n".join(lines))
         if not trades:
             return self._clean_nl(_ai_t("ai_nl_trades_empty", effective))
-        lines: list[str] = [_ai_t("ai_nl_trades_title", effective, count=len(trades))]
+        lines = [_ai_t("ai_nl_trades_title", effective, count=len(trades))]
         for tr in trades[:limit]:
             lines.append(
                 _ai_t(
@@ -852,7 +1038,15 @@ class AgentTelegramAdapter:
         )
 
     async def nl_opportunities(self, *, lang: str | None = None) -> str:
-        """Read-only current opportunities via existing scanner data path."""
+        """Read-only current opportunities, scoped to the active strategy.
+
+        Latency: cheap ``store.stats()`` first — with zero order books the
+        answer is "stale data" with *no* scan at all. Otherwise exactly one
+        strategy-scoped calculation runs (triangle *or* transfer, never
+        both), timed and logged. Strictly read-only: no orders, no config.
+        """
+        import time as _time
+
         effective = lang if lang in ("en", "ru") else "en"
         svc = self._services()
         if svc is None:
@@ -862,27 +1056,39 @@ class AgentTelegramAdapter:
         except Exception:
             stats = {}
         books = int((stats or {}).get("order_books", 0) or 0) if isinstance(stats, dict) else 0
+        if books == 0:
+            lines: list[str] = [_ai_t("ai_nl_opportunities_stale", effective)]
+            lines.append(await self._threshold_text(effective))
+            return self._clean_nl("\n".join(lines))
+        strategy = await self._active_strategy()
+        triangles: Any = ()
+        plans: Any = []
+        scan_ms: int | None = None
         try:
-            triangles = await svc.scan_triangles()
-        except Exception:
-            triangles = ()
-        try:
-            plans = await svc.plan_transfers()
-        except Exception:
-            plans = []
-        lines: list[str] = []
-        if (not triangles) and (not plans):
-            if books == 0:
-                lines.append(_ai_t("ai_nl_opportunities_stale", effective))
+            started = _time.perf_counter()
+            if strategy == "transfer":
+                try:
+                    plans = await svc.plan_transfers()
+                except Exception:
+                    plans = []
             else:
-                lines.append(_ai_t("ai_nl_opportunities_none", effective))
+                try:
+                    triangles = await svc.scan_triangles()
+                except Exception:
+                    triangles = ()
+            scan_ms = int((_time.perf_counter() - started) * 1000)
             try:
-                min_bps = getattr(getattr(svc, "settings", None), "arbitrage", None)
-                thr = getattr(min_bps, "triangle_min_net_bps", None) if min_bps else None
-                if thr is not None:
-                    lines.append(f"(threshold: {thr} bps)" if effective == "en" else f"(порог: {thr} bps)")
+                logger.info("ai_nl_scan", extra={"strategy": strategy, "duration_ms": scan_ms})
             except Exception:
                 pass
+        except Exception:
+            pass
+        lines = []
+        if (not triangles) and (not plans):
+            lines.append(_ai_t("ai_nl_opportunities_none", effective))
+            lines.append(await self._threshold_text(effective))
+            if scan_ms is not None:
+                lines.append(_ai_t("ai_nl_scan_took", effective, ms=scan_ms))
             return self._clean_nl("\n".join(lines))
         lines.append(_ai_t("ai_nl_opportunities_found", effective))
         for opp in list(triangles or [])[:5]:
@@ -898,8 +1104,22 @@ class AgentTelegramAdapter:
                 lines.append(_ai_t("ai_nl_opportunities_line", effective, kind="transfer", desc=desc[:60], bps=str(plan.net_profit_bps)))
             except Exception:
                 continue
+        lines.append(await self._threshold_text(effective))
+        if scan_ms is not None:
+            lines.append(_ai_t("ai_nl_scan_took", effective, ms=scan_ms))
         lines.append("(no execution — view-only)" if effective == "en" else "(без исполнения — только просмотр)")
         return self._clean_nl("\n".join(lines))
+
+    async def _threshold_text(self, effective: str) -> str:
+        """One-line threshold provenance for the active runtime path."""
+        ctx = await self._threshold_context()
+        return _ai_t(
+            "ai_nl_threshold_line",
+            effective,
+            value=ctx["threshold"],
+            source=ctx["source"],
+            strategy=ctx["strategy"],
+        )
 
     async def nl_exchange_status(self, *, lang: str | None = None) -> str:
         effective = lang if lang in ("en", "ru") else "en"
@@ -956,6 +1176,71 @@ class AgentTelegramAdapter:
             f"auto trading: {st.get('auto_trading', '?')} / loop: {st.get('auto_loop_running', '?')}",
             f"strategy: {st.get('active_strategy', '?')}",
         ]
+        return self._clean_nl("\n".join(lines))
+
+    async def nl_bot_operation(self, *, lang: str | None = None) -> str:
+        """Explain how the bot actually trades (read-only, from live config).
+
+        Describes the real pipeline — strategies, market data, scanning,
+        profitability, sizing, risk, execution, recovery, persistence and
+        DEMO-vs-LIVE behavior — using current runtime values. Never invents
+        components; every named stage exists in this repository.
+        """
+        effective = lang if lang in ("en", "ru") else "en"
+        svc = self._services()
+        if svc is None:
+            return self._clean_nl(_ai_t("ai_not_configured", effective))
+        settings = getattr(svc, "settings", None)
+        strategy = await self._active_strategy()
+        ctx = await self._threshold_context()
+        venues: list[str] = []
+        try:
+            venues = list(self._enabled_venues())
+        except Exception:
+            pass
+        venues_s = ", ".join(venues) if venues else "?"
+        mode = "?"
+        tri_assets = ""
+        trf_assets = ""
+        interval = "?"
+        try:
+            if settings is not None:
+                mode = str(getattr(getattr(settings, "mode", "?"), "value", getattr(settings, "mode", "?")))
+                tri_assets = ", ".join(list(getattr(getattr(settings, "arbitrage", None), "triangle_assets", ()) or ()))
+                trf_assets = ", ".join(list(getattr(getattr(settings, "transfer", None), "assets", ()) or ())[:8])
+                interval = str(getattr(getattr(settings, "execution", None), "auto_interval_seconds", "?"))
+        except Exception:
+            pass
+        if effective == "ru":
+            lines = [
+                _ai_t("ai_nl_bot_operation_title", effective),
+                f"Сейчас активна стратегия: {strategy}. Режим: {mode}. Площадки: {venues_s}.",
+                "",
+                "Как бот торгует (реальный конвейер):",
+                "1. Рыночные данные: MarketDataService (сначала WebSocket, fallback — REST) собирает стаканы/тикеры в MarketDataStore; устаревшие данные отбрасываются.",
+                f"2. Сканирование: triangle — TriangularScanner ищет циклы среди активов ({tri_assets or '?'}); transfer — TransferPlanner/Orchestrator ищут межбиржевые различия ({trf_assets or '?'}).",
+                f"3. Прибыльность: чистая прибыль после комиссий и проскальзывания сравнивается с порогом стратегии ({ctx['threshold']} bps, {ctx['source']}); размер позиции ограничен авто-ноционалом.",
+                f"4. Риск: RiskEngine (лимиты) + ExecutionGuard (стоп-кран); исполнение дополнительно требует net >= риск-лимита ({ctx['risk_threshold']} bps, risk.min_net_profit_bps).",
+                f"5. Исполнение: цикл AutoTrader (каждые {interval} c) проверяет флаг автоторговли, валидирует риск и исполняет через TriangleExecutor / start_transfer. Ордера: PAPER — никогда, DEMO — только песочница, LIVE — только через guard.",
+                "6. Учёт и восстановление: результат пишется в TradeRepository и audit-журнал; прерванные циклы ExecutionRecovery переводит в MANUAL_REVIEW, а не продолжает автоматически.",
+                "",
+                "Что может мешать исполнению: стоп-кран, выключенная автоторговля, отсутствие стратегии, нет стаканов/устаревшие данные, возможности ниже порога, недоступная биржа, риск-лимиты, провал preflight.",
+            ]
+        else:
+            lines = [
+                _ai_t("ai_nl_bot_operation_title", effective),
+                f"Active strategy: {strategy}. Mode: {mode}. Venues: {venues_s}.",
+                "",
+                "How the bot trades (actual pipeline):",
+                "1. Market data: MarketDataService (WebSocket-first, REST fallback) feeds order books/tickers into MarketDataStore; stale quotes are discarded.",
+                f"2. Scanning: triangle — TriangularScanner walks cycles over ({tri_assets or '?'}); transfer — TransferPlanner/Orchestrator look for cross-venue spreads ({trf_assets or '?'}).",
+                f"3. Profitability: net profit after taker fees and slippage is compared against the strategy threshold ({ctx['threshold']} bps, {ctx['source']}); position size is capped by the auto notional.",
+                f"4. Risk: RiskEngine (limits) + ExecutionGuard (kill switch); execution additionally requires net >= risk limit ({ctx['risk_threshold']} bps, risk.min_net_profit_bps).",
+                f"5. Execution: the AutoTrader cycle (every {interval}s) checks the auto-trading flag, risk-validates and executes via TriangleExecutor / start_transfer. Orders: PAPER — never, DEMO — sandbox only, LIVE — guard-gated.",
+                "6. Recording & recovery: results go to TradeRepository and the audit journal; interrupted cycles are failed-closed into MANUAL_REVIEW by ExecutionRecovery, never auto-continued.",
+                "",
+                "What can prevent execution: kill switch, auto-trading off, no active strategy, missing/stale books, opportunities below threshold, venue offline, risk limits, preflight failure.",
+            ]
         return self._clean_nl("\n".join(lines))
 
     async def nl_risk(self, *, lang: str | None = None) -> str:
@@ -1016,65 +1301,101 @@ class AgentTelegramAdapter:
         return self._clean_nl("\n".join(lines))
 
     async def nl_why_not_trading(self, *, lang: str | None = None) -> str:
-        """Explain blockers from read-only scan/trading/status data (no invention)."""
+        """Explain blockers from cheap read-only diagnostics (no fresh scan).
+
+        Uses a single ``status()`` snapshot plus store/exchange/risk/trade
+        statistics already available at runtime. No ``scan_triangles()`` /
+        ``plan_transfers()`` call: freshness-gated opportunity detection
+        belongs to the opportunities handler. Anything not supported by the
+        data is explicitly marked as insufficient — never invented.
+        """
         effective = lang if lang in ("en", "ru") else "en"
         svc = self._services()
         if svc is None or self._tools is None:
             return self._clean_nl(_ai_t("ai_not_configured", effective))
         blockers: list[str] = []
-        # Kill switch / guard
+        cheap_ok = False
+        # Single status snapshot: kill switch / guard / auto flag / strategy / loop.
         try:
             st = await svc.status()
+            cheap_ok = True
             guard = st.get("guard", {}) if isinstance(st, dict) else {}
             if str(guard.get("halted", "")).lower() == "true":
                 blockers.append(f"kill switch ENGAGED ({guard.get('halt_reason', '')})")
             if str(guard.get("trading_enabled", "")).lower() in ("false", "0"):
                 blockers.append("trading disabled by execution guard")
-            if not st.get("auto_trading", False):
-                blockers.append("auto-trading flag is OFF" if effective == "en" else "флаг автоторговли ВЫКЛ")
+            if isinstance(st, dict) and not st.get("auto_trading", False):
+                blockers.append("auto-trading flag is OFF (strategy not running)" if effective == "en" else "флаг автоторговли ВЫКЛ (стратегия не запущена)")
+            if isinstance(st, dict) and st.get("active_strategy", "not_set") == "not_set":
+                blockers.append("no active strategy selected" if effective == "en" else "активная стратегия не выбрана")
+            if isinstance(st, dict) and st.get("auto_trading", False) and not st.get("auto_loop_running", False):
+                blockers.append("auto-trading flag is ON but the loop is not running" if effective == "en" else "флаг автоторговли ВКЛ, но цикл не запущен")
+            # Preflight hint: DEMO venues that never delivered market data.
+            md = st.get("market_data", {}) if isinstance(st, dict) else {}
+            if isinstance(md, dict) and int(md.get("order_books", 0) or 0) == 0:
+                blockers.append("missing order books (market data unavailable — possible preflight failure)" if effective == "en" else "нет стаканов (рыночные данные недоступны — возможен провал preflight)")
         except Exception:
             pass
-        # Market data freshness
+        # Market-data freshness (cheap store stats, no refresh).
         try:
             stats = await self._tools.get_scan_statistics()
+            cheap_ok = True
             if isinstance(stats, dict):
                 if int(stats.get("order_books", 0) or 0) == 0:
-                    blockers.append("missing order books" if effective == "en" else "нет стаканов")
+                    marker = "missing order books" if effective == "en" else "нет стаканов"
+                    if marker not in blockers:
+                        blockers.append(marker)
         except Exception:
             pass
-        # Exchange availability
+        # Exchange availability (cheap snapshot, no I/O).
         try:
             snap = await self._tools.get_exchange_status()
+            cheap_ok = True
             if isinstance(snap, dict):
                 for venue, info in snap.items():
                     status = str((info or {}).get("status", "")).lower() if isinstance(info, dict) else ""
                     if status in ("offline", "degraded"):
                         blockers.append(f"exchange {venue} {status}")
+                    if isinstance(info, dict) and info.get("private_blocked"):
+                        blockers.append(f"exchange {venue} private calls blocked")
         except Exception:
             pass
-        # Risk restrictions
-        try:
-            rs = await self._tools.get_risk_state()
-            limits = rs.get("limits", {}) if isinstance(rs, dict) else {}
-            if limits:
-                blockers.append(f"risk limits: {limits}")
-        except Exception:
-            pass
-        # Recent trades / audit hints
+        # Failed-trade evidence (cheap DB aggregate).
         try:
             tstats = await self._tools.get_trade_statistics()
-            if isinstance(tstats, dict) and int(tstats.get("total", 0) or 0) == 0:
-                blockers.append("no opportunities above profitability threshold (no recorded trades)" if effective == "en" else "нет возможностей выше порога прибыльности (сделок не записано)")
-            elif isinstance(tstats, dict) and int(tstats.get("failed", 0) or 0) > 0:
-                blockers.append(f"failed trades observed: {tstats.get('failed')}")
+            cheap_ok = True
+            if isinstance(tstats, dict):
+                if int(tstats.get("failed", 0) or 0) > 0:
+                    blockers.append(f"failed trades observed: {tstats.get('failed')}")
+                if int(tstats.get("manual_review", 0) or 0) > 0:
+                    blockers.append(f"manual-review cases: {tstats.get('manual_review')}")
         except Exception:
             pass
         lines = [_ai_t("ai_nl_why_title", effective)]
         if blockers:
             for b in blockers[:10]:
                 lines.append(f"  - {b}"[:300])
+        elif not cheap_ok:
+            lines.append(_ai_t("ai_nl_insufficient_data", effective))
         else:
             lines.append(_ai_t("ai_nl_why_no_blocker", effective))
+        # Threshold provenance: the value actually governing the active path,
+        # plus the risk execution gate (the 5-vs-10 root cause, made explicit).
+        try:
+            ctx = await self._threshold_context()
+            lines.append(
+                _ai_t(
+                    "ai_nl_threshold_line",
+                    effective,
+                    value=ctx["threshold"],
+                    source=ctx["source"],
+                    strategy=ctx["strategy"],
+                )
+            )
+            if str(ctx.get("risk_threshold", "?")) != "?":
+                lines.append(_ai_t("ai_nl_risk_gate_line", effective, value=ctx["risk_threshold"]))
+        except Exception:
+            pass
         return self._clean_nl("\n".join(lines))
 
     async def approve(self, rec_id: str, *, lang: str | None = None, approver: str | None = None) -> str:
