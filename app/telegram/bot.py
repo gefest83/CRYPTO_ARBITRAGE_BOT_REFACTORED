@@ -491,7 +491,10 @@ class TelegramBot:
             # Approval service is human-gated; expose it to the adapter for
             # ``/ai approve`` / ``/ai reject`` (authorized users only).
             approval = getattr(self._services, "agent_approval_service", None)
-            self._agent_adapter = AgentTelegramAdapter(core, tools, approval_service=approval)
+            # Phase 9: learning engine for ``/ai measurements`` / ``/ai feedback``.
+            learning = getattr(self._services, "agent_learning", None)
+            self._agent_adapter = AgentTelegramAdapter(core, tools, approval_service=approval,
+                                                       learning=learning)
             return self._agent_adapter
         except Exception as exc:  # noqa: BLE001 - telegram must never crash on advisor build
             logger.warning(

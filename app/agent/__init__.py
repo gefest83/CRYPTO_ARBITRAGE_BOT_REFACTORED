@@ -54,6 +54,7 @@ from app.agent.extraction import (
 )
 from app.agent.journal import JournalReader
 from app.agent.knowledge import KnowledgeRepository, KnowledgeService
+from app.agent.learning import LearningEngine, MeasurementError, MeasurementRepository
 from app.agent.notifications import EVENT_TYPES, NotificationEvent, NotificationService
 from app.agent.memory import (
     ExperienceRepository,
@@ -76,6 +77,8 @@ from app.agent.models import (
     KnowledgeDocument,
     LearningType,
     Lesson,
+    Measurement,
+    MeasurementOutcome,
     RecommendationStatus,
     ReflectionObservation,
     ReflectionResult,
@@ -114,11 +117,16 @@ __all__ = [
     "KnowledgeDocument",
     "KnowledgeRepository",
     "KnowledgeService",
+    "LearningEngine",
     "LearningType",
     "Lesson",
     "LessonHistoryRepository",
     "LessonRepository",
     "LLMProvider",
+    "Measurement",
+    "MeasurementError",
+    "MeasurementOutcome",
+    "MeasurementRepository",
     "MemoryLabelRepository",
     "NotificationEvent",
     "NotificationService",
@@ -201,6 +209,10 @@ def build_agent(services, *, llm: LLMProvider | None = None):  # type: ignore[no
     # Phase 7: evidence-based recommendation engine (persistence only).
     recommender = RecommendationEngine(services)
     services.agent_recommender = recommender  # type: ignore[attr-defined]
+
+    # Phase 9: closed learning loop (measure → outcome → feedback → memory).
+    learning = LearningEngine(services)
+    services.agent_learning = learning  # type: ignore[attr-defined]
 
     tools = AgentTools(services)
     collector = ContextCollector(

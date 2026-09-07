@@ -123,6 +123,9 @@ class AppServices:
     #: Phase 7: evidence-based recommendation engine (wired by
     #: :func:`app.agent.build_agent`; ``None`` until then; persistence only).
     agent_recommender: Any = field(default=None)
+    #: Phase 9: closed learning loop (wired by :func:`app.agent.build_agent`;
+    #: ``None`` until then; measurements + feedback + lessons only).
+    agent_learning: Any = field(default=None)
 
     # ------------------------------------------------------------ risk
     def risk_environment(self):

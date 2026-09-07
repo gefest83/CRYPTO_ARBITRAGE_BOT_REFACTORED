@@ -11,6 +11,7 @@ Nine tables cover the advisor persistence surface (Phase 5):
 * ``agent_feedback``       — human feedback on lessons/recommendations (Phase 5)
 * ``agent_lesson_history`` — superseded lesson versions, auditable (Phase 5)
 * ``agent_memory_labels``  — learning-type / sample-size / direction overlay (Phase 5)
+* ``agent_measurements``   — before/after measurements of approved changes (Phase 9)
 
 Phase 5 store mapping: ``ai_memory`` → experiences+lessons; ``ai_experiences``
 → agent_experiences; ``ai_lessons`` → agent_lessons; ``ai_recommendations`` →
@@ -34,7 +35,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Index, Integer, String, Text
+from sqlalchemy import Boolean, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sqlalchemy import JSON as SA_JSON
@@ -49,6 +50,7 @@ __all__ = [
     "AgentKnowledgeRow",
     "AgentLessonHistoryRow",
     "AgentLessonRow",
+    "AgentMeasurementRow",
     "AgentMemoryLabelRow",
     "AgentRecommendationRow",
 ]
@@ -250,4 +252,47 @@ class AgentMemoryLabelRow(Base):
 
     __table_args__ = (
         Index("ix_agent_memory_labels_type", "learning_type"),
+    )
+
+
+class AgentMeasurementRow(Base):
+    """Phase 9 ``measurement`` — before/after verdicts for approved changes.
+
+    New table only; existing tables are never altered. ``details`` carries
+    window stats, trade id lists (bounded) and the optional AI note.
+    """
+
+    __tablename__ = "agent_measurements"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    recommendation_id: Mapped[str] = mapped_column(String(32))
+    parameter: Mapped[str] = mapped_column(String(128))
+    old_value: Mapped[str] = mapped_column(String(256))
+    new_value: Mapped[str] = mapped_column(String(256))
+    metric: Mapped[str] = mapped_column(String(64))
+    higher_is_better: Mapped[bool] = mapped_column(default=False)
+    before_value: Mapped[str] = mapped_column(String(64))
+    after_value: Mapped[str] = mapped_column(String(64))
+    delta: Mapped[str] = mapped_column(String(64))
+    n_before: Mapped[int] = mapped_column(Integer, default=0)
+    n_after: Mapped[int] = mapped_column(Integer, default=0)
+    outcome: Mapped[str] = mapped_column(String(32), default="insufficient")
+    confidence: Mapped[float] = mapped_column(default=0.0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    feedback_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    feedback_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME, nullable=True)
+    lesson_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    evidence_before: Mapped[list[str]] = mapped_column(SA_JSON, default=list)
+    evidence_after: Mapped[list[str]] = mapped_column(SA_JSON, default=list)
+    details: Mapped[dict[str, Any] | None] = mapped_column(SA_JSON, nullable=True)
+    source_type: Mapped[str] = mapped_column(String(32), default="system")
+    source_id: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utc_now)
+
+    __table_args__ = (
+        Index("ix_agent_measurements_rec", "recommendation_id"),
+        Index("ix_agent_measurements_outcome", "outcome"),
+        Index("ix_agent_measurements_created_at", "created_at"),
     )

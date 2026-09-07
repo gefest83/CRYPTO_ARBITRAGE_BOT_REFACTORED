@@ -32,6 +32,8 @@ __all__ = [
     "KnowledgeDocument",
     "LearningType",
     "Lesson",
+    "Measurement",
+    "MeasurementOutcome",
     "RESEARCH_KNOWLEDGE",
     "RecommendationStatus",
     "ReflectionObservation",
@@ -448,6 +450,77 @@ class AgentRecommendation(DomainModel):
     def sample_size(self) -> int:
         """Evidence sample size (number of supporting trade/experience/knowledge ids)."""
         return len(self.evidence or ())
+
+
+# ------------------------------------------------------------------ measurement (Phase 9)
+
+
+class MeasurementOutcome(StrEnum):
+    """Deterministic verdict of a before/after comparison."""
+
+    IMPROVED = "improved"
+    WORSENED = "worsened"
+    UNCHANGED = "unchanged"
+    INSUFFICIENT = "insufficient"
+
+
+class Measurement(DomainModel):
+    """Persisted before/after measurement of one approved recommendation.
+
+    All figures are computed deterministically from journal/config data.
+    ``outcome`` is one of improved/worsened/unchanged/insufficient.
+    Operator feedback (useful/wrong/ignore/approve/reject) lands in
+    ``feedback_kind`` (+ ``FeedbackRepository`` rows for useful/wrong);
+    ``lesson_id`` links the lesson created/revised from this outcome.
+    """
+
+    id: str = Field(default_factory=lambda: f"mea-{uuid.uuid4().hex[:12]}")
+    recommendation_id: str
+    parameter: str
+    old_value: str
+    new_value: str
+    metric: str = Field(description="Journal metric compared, e.g. avg_slippage_bps")
+    higher_is_better: bool = False
+    before_value: str = Field(description="Metric value before approval")
+    after_value: str = Field(description="Metric value after approval")
+    delta: str = Field(description="after - before in metric units")
+    n_before: int = Field(ge=0)
+    n_after: int = Field(ge=0)
+    outcome: MeasurementOutcome = MeasurementOutcome.INSUFFICIENT
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reason: str = Field(default="")
+    feedback_kind: str | None = Field(default=None)
+    feedback_by: str | None = Field(default=None)
+    feedback_at: datetime | None = Field(default=None)
+    lesson_id: str | None = Field(default=None)
+    evidence_before: tuple[str, ...] = ()
+    evidence_after: tuple[str, ...] = ()
+    details: dict[str, Any] = Field(default_factory=dict)
+    source_type: str = Field(default=SourceType.SYSTEM.value)
+    source_id: str = Field(description="phase7 rule id carried from the recommendation")
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("recommendation_id", "parameter", "old_value", "new_value", "metric")
+    @classmethod
+    def _non_empty_measurement(cls, value: str) -> str:
+        if not value or not str(value).strip():
+            raise ValueError("field must be non-empty")
+        return str(value).strip()
+
+    @field_validator("feedback_kind", mode="before")
+    @classmethod
+    def _coerce_feedback_kind(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if text not in ("useful", "wrong", "ignore", "approve", "reject"):
+            raise ValueError("feedback_kind must be useful/wrong/ignore/approve/reject")
+        return text
+
+    @property
+    def sample_size(self) -> int:
+        return int(self.n_before) + int(self.n_after)
 
 
 # ------------------------------------------------------------------ reflection

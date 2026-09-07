@@ -44,6 +44,8 @@ AI_COMMANDS: tuple[str, ...] = (
     "/ai balance",
     "/ai approve",
     "/ai reject",
+    "/ai measurements",
+    "/ai feedback",
 )
 
 # Additional translations for AI Advisor (English / Russian).
@@ -61,6 +63,8 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "/ai balance         - balances per venue (via bot services)\n"
             "/ai approve <id>    - approve and apply a recommendation (human-only, allowlisted)\n"
             "/ai reject <id>     - reject a pending recommendation\n"
+            "/ai measurements [id] - measured outcomes of approved changes (or one rec)\n"
+            "/ai feedback <id> <useful|wrong|ignore|approve|reject> [comment] - operator feedback\n"
             "\n"
             "The advisor can READ, ANALYZE, REMEMBER, REFLECT and RECOMMEND. "
             "It cannot execute trades, withdraw funds, or modify configuration directly."
@@ -97,6 +101,20 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_reject_fail": "Reject failed: {error}",
         "ai_approve_usage": "Usage: /ai approve <recommendation_id>",
         "ai_reject_usage": "Usage: /ai reject <recommendation_id>",
+        "ai_measurements_empty": "No measured outcomes yet.",
+        "ai_measurements_header": "Measured outcomes ({count}):",
+        "ai_measurements_line": "  {parameter}: {outcome} ({metric} {before} → {after}, n={n_before}/{n_after}) [rec:{rec_id}]",
+        "ai_measurements_detail": (
+            "Measurement for {rec_id}:\n"
+            "  parameter: {parameter} ({old} → {new})\n"
+            "  outcome: {outcome} — {reason}\n"
+            "  metric: {metric} {before} → {after} (Δ{delta}, n={n_before}/{n_after}, conf {confidence:.2f})\n"
+            "  feedback: {feedback} | lesson: {lesson}"
+        ),
+        "ai_measurements_missing": "No measurement for {rec_id} yet.",
+        "ai_feedback_ok": "Feedback recorded: {kind} on {rec_id} (by {approver})",
+        "ai_feedback_fail": "Feedback failed: {error}",
+        "ai_feedback_usage": "Usage: /ai feedback <recommendation_id> <useful|wrong|ignore|approve|reject> [comment]",
     },
     "ru": {
         "ai_help": (
@@ -108,6 +126,8 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
             "/ai balance         - балансы по площадкам\n"
             "/ai approve <id>    - подтвердить и применить рекомендацию (только оператор, allowlist)\n"
             "/ai reject <id>     - отклонить ожидующую рекомендацию\n"
+            "/ai measurements [id] - измеренные исходы применённых изменений (или одна)\n"
+            "/ai feedback <id> <useful|wrong|ignore|approve|reject> [комментарий] - отзыв оператора\n"
             "\n"
             "Советник может ЧИТАТЬ, АНАЛИЗИРОВАТЬ, ЗАПОМИНАТЬ, РЕФЛЕКСИРОВАТЬ и РЕКОМЕНДОВАТЬ. "
             "Он не исполняет сделки, не выводит средства и не меняет конфигурацию напрямую."
@@ -144,6 +164,20 @@ AI_TRANSLATIONS: dict[str, dict[str, str]] = {
         "ai_reject_fail": "Ошибка отклонения: {error}",
         "ai_approve_usage": "Использование: /ai approve <id>",
         "ai_reject_usage": "Использование: /ai reject <id>",
+        "ai_measurements_empty": "Измеренных исходов пока нет.",
+        "ai_measurements_header": "Измеренные исходы ({count}):",
+        "ai_measurements_line": "  {parameter}: {outcome} ({metric} {before} → {after}, n={n_before}/{n_after}) [рек:{rec_id}]",
+        "ai_measurements_detail": (
+            "Измерение для {rec_id}:\n"
+            "  параметр: {parameter} ({old} → {new})\n"
+            "  исход: {outcome} — {reason}\n"
+            "  метрика: {metric} {before} → {after} (Δ{delta}, n={n_before}/{n_after}, увер {confidence:.2f})\n"
+            "  отзыв: {feedback} | урок: {lesson}"
+        ),
+        "ai_measurements_missing": "Измерения для {rec_id} пока нет.",
+        "ai_feedback_ok": "Отзыв записан: {kind} по {rec_id} (кем {approver})",
+        "ai_feedback_fail": "Ошибка отзыва: {error}",
+        "ai_feedback_usage": "Использование: /ai feedback <id> <useful|wrong|ignore|approve|reject> [комментарий]",
     },
 }
 
@@ -223,10 +257,12 @@ class AgentTelegramAdapter:
         core: AgentCore | None,
         tools: AgentTools | None = None,
         approval_service: Any | None = None,
+        learning: Any | None = None,
     ) -> None:
         self._core = core
         self._tools = tools
         self._approval = approval_service
+        self._learning = learning
 
     async def dispatch(self, text: str, *, lang: str | None = None, approver: str | None = None) -> str:
         """Route ``/ai*`` text to the appropriate sub-handler.
@@ -266,6 +302,16 @@ class AgentTelegramAdapter:
             if not rec_id:
                 return _finalize_telegram(_ai_t("ai_reject_usage", effective))
             return await self.reject(rec_id, lang=effective, approver=approver)
+        if sub == "measurements":
+            rec_id = parts[2].strip() if len(parts) > 2 else ""
+            return await self.measurements(rec_id or None, lang=effective)
+        if sub == "feedback":
+            rec_id = parts[2].strip() if len(parts) > 2 else ""
+            kind = parts[3].strip().lower() if len(parts) > 3 else ""
+            comment = " ".join(parts[4:]).strip() if len(parts) > 4 else ""
+            if not rec_id or not kind:
+                return _finalize_telegram(_ai_t("ai_feedback_usage", effective))
+            return await self.feedback(rec_id, kind, comment, lang=effective, approver=approver)
 
         return _finalize_telegram(_ai_t("ai_unknown_subcommand", effective))
 
@@ -486,3 +532,92 @@ class AgentTelegramAdapter:
 
             safe = _redact(str(exc))[:200]
             return _finalize_telegram(_ai_t("ai_reject_fail", effective, error=safe))
+
+    async def measurements(self, rec_id: str | None = None, *, lang: str | None = None) -> str:
+        """Phase 9 visibility: measured outcomes (list or one recommendation)."""
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._learning is None:
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
+        try:
+            if rec_id:
+                from app.exchanges.sanitize import redact_secrets as _redact
+
+                measurement = await self._learning.get_by_recommendation(_redact(rec_id).strip())
+                if measurement is None:
+                    state = None
+                    try:
+                        approval = getattr(self._learning, "_services", None)
+                        approval = getattr(approval, "agent_approval_service", None) if approval else self._approval
+                        if approval is not None and hasattr(approval, "measurement_state"):
+                            state = await approval.measurement_state(_redact(rec_id).strip())
+                    except Exception:
+                        state = None
+                    if state is not None and state.get("status") == "awaiting_measurement":
+                        return _finalize_telegram(
+                            _ai_t("ai_measurements_detail", effective, rec_id=rec_id[:12],
+                                  parameter=state.get("parameter", "?"), old=state.get("old_value", "?"),
+                                  new=state.get("new_value", "?"), outcome="awaiting_measurement",
+                                  reason="approved, not yet measured", metric="-", before="-", after="-",
+                                  delta="-", n_before=0, n_after=0, confidence=0.0,
+                                  feedback="-", lesson="-"))
+                    return _finalize_telegram(_ai_t("ai_measurements_missing", effective, rec_id=rec_id[:12]))
+                return _finalize_telegram(
+                    _ai_t("ai_measurements_detail", effective, rec_id=measurement.recommendation_id[:12],
+                          parameter=measurement.parameter, old=measurement.old_value, new=measurement.new_value,
+                          outcome=measurement.outcome.value
+                          if hasattr(measurement.outcome, "value") else str(measurement.outcome),
+                          reason=(measurement.reason or "")[:160], metric=measurement.metric,
+                          before=measurement.before_value, after=measurement.after_value,
+                          delta=measurement.delta, n_before=measurement.n_before, n_after=measurement.n_after,
+                          confidence=float(measurement.confidence),
+                          feedback=measurement.feedback_kind or "-",
+                          lesson=(measurement.lesson_id[:12] if measurement.lesson_id else "-")))
+            items = await self._learning.list_recent_measurements(limit=5)
+            if not items:
+                return _finalize_telegram(_ai_t("ai_measurements_empty", effective))
+            lines: list[str] = [_ai_t("ai_measurements_header", effective, count=len(items))]
+            for m in items:
+                lines.append(
+                    _ai_t("ai_measurements_line", effective, parameter=m.parameter,
+                          outcome=m.outcome.value if hasattr(m.outcome, "value") else str(m.outcome),
+                          metric=m.metric, before=m.before_value, after=m.after_value,
+                          n_before=m.n_before, n_after=m.n_after,
+                          rec_id=m.recommendation_id[:12]))
+            return _finalize_telegram("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001 - telegram must not leak internal details
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            safe = _redact(str(exc))[:200]
+            return _finalize_telegram(_ai_t("ai_measurements_missing", effective, rec_id=(rec_id or "?")[:12])
+                                      if rec_id else _ai_t("ai_measurements_empty", effective) + f" ({safe[:60]})")
+
+    async def feedback(self, rec_id: str, kind: str, comment: str = "", *, lang: str | None = None,
+                       approver: str | None = None) -> str:
+        """Phase 9 visibility: operator feedback (human-gated like approve)."""
+        effective = lang if lang in ("en", "ru") else "en"
+        if self._learning is None:
+            return _finalize_telegram(_ai_t("ai_not_configured", effective))
+        if not approver:
+            return _finalize_telegram(_ai_t("ai_feedback_fail", effective, error="approver required"))
+        try:
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            clean_id = _redact(rec_id).strip()
+            kwargs: dict[str, Any] = {"recommendation_id": clean_id,
+                                      "kind": str(kind).strip().lower(),
+                                      "approver": str(approver), "comment": comment}
+            try:
+                existing = await self._learning.get_by_recommendation(clean_id)
+                if existing is not None:
+                    kwargs["measurement_id"] = existing.id
+            except Exception:
+                pass
+            result = await self._learning.record_feedback(**kwargs)
+            return _finalize_telegram(
+                _ai_t("ai_feedback_ok", effective, kind=result["kind"],
+                      rec_id=str(result["recommendation_id"])[:12], approver=approver))
+        except Exception as exc:  # noqa: BLE001
+            from app.exchanges.sanitize import redact_secrets as _redact
+
+            safe = _redact(str(exc))[:200]
+            return _finalize_telegram(_ai_t("ai_feedback_fail", effective, error=safe))
