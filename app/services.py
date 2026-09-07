@@ -572,6 +572,18 @@ async def build_app(settings: Settings | None = None) -> AppServices:
     from app.auto_controller import AutoTradingController
 
     services.auto_controller = AutoTradingController(services)
+    # Human-approved AI Advisor tuning survives restarts: re-apply the
+    # durable ``agent_config:<param>`` overrides (if any) on top of the
+    # environment-derived settings so settings, RiskEngine and storage
+    # agree after every boot. Best-effort at this layer — a restore
+    # failure is logged and never blocks startup (approval itself stays
+    # fail-closed).
+    try:
+        from app.agent.approval import restore_approved_config
+
+        await restore_approved_config(services)
+    except Exception as exc:  # noqa: BLE001 - restore must never block startup
+        logger.warning("approved_config_restore_failed", extra={"error": str(exc)[:200]})
     return services
 
 
