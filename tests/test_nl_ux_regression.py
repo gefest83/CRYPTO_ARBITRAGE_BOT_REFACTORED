@@ -204,3 +204,137 @@ async def test_privileged_still_blocked():
     adapter = AgentTelegramAdapter(core, tools)
     ans = await adapter.handle_natural_language("зайди на OKX и продай 100 OKB на USDT", lang="ru")
     assert "Отклонено" in ans or "Refused" in ans
+
+
+@pytest.mark.asyncio
+async def test_null_provider_complex_no_trades_dump():
+    svc = _svc()
+    tools = StubTools(svc)
+    from app.agent.core import AgentCore
+
+    core = AgentCore(collector=FakeCollector(), llm=NullProvider(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    ans = await adapter.handle_natural_language("как улучшить, чтоб были сделки?", lang="ru")
+    assert "Последние сделки" not in ans
+    assert "Recent trades" not in ans
+    assert "Могу отвечать" not in ans
+    assert "5 bps" in ans or "порог" in ans
+
+
+@pytest.mark.asyncio
+async def test_null_provider_grounded_plus():
+    svc = _svc()
+    tools = StubTools(svc)
+    from app.agent.core import AgentCore
+
+    core = AgentCore(collector=FakeCollector(), llm=NullProvider(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    ans = await adapter.handle_natural_language("как улучшить бота, чтоб в + торговал?", lang="ru")
+    assert "5 bps" in ans or "порог" in ans
+    assert "Последние сделки" not in ans
+    assert len(tools.calls) > 0
+
+
+@pytest.mark.asyncio
+async def test_null_provider_grounded_what_to_do():
+    svc = _svc()
+    tools = StubTools(svc)
+    from app.agent.core import AgentCore
+
+    core = AgentCore(collector=FakeCollector(), llm=NullProvider(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    ans = await adapter.handle_natural_language("что можно сделать, чтобы было больше сделок?", lang="ru")
+    assert "5 bps" in ans or "порог" in ans
+    assert "Могу отвечать" not in ans
+    assert len(tools.calls) > 0
+
+
+@pytest.mark.asyncio
+async def test_broad_question_must_not_invoke_get_balances():
+    svc = _svc()
+    tools = StubTools(svc)
+    from app.agent.core import AgentCore
+
+    core = AgentCore(collector=FakeCollector(), llm=FakeLLM(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    ans = await adapter.handle_natural_language("А что у нас сейчас вообще происходит с арбитражем?", lang="ru")
+    assert "get_balances" not in tools.calls
+    assert "5 bps" in ans or "порог" in ans
+
+
+@pytest.mark.asyncio
+async def test_slow_tool_cannot_exceed_total_deadline():
+    svc = _svc()
+    # Slow get_balances
+    class SlowTools(StubTools):
+        async def get_balances(self):
+            self.calls.append("get_balances")
+            await asyncio.sleep(15)
+            return {"binance": {"exchange_id": "binance", "balances": [{"asset": "USDT", "free": "1000", "used": "0"}]}}
+
+    tools = SlowTools(svc)
+
+    class SlowLLM(LLMProvider):
+        name = "slow"
+        supports_tool_calling = True
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            has_tools = request.tools is not None
+            if has_tools and len(request.messages) == 2:
+                return LLMResponse(content="", model="slow", tool_calls=(LLMToolCall(id="1", name="get_balances", arguments={}, raw_arguments="{}"),))
+            return LLMResponse(content="ok", model="slow")
+
+    from app.agent.core import AgentCore
+    import time
+
+    core = AgentCore(collector=FakeCollector(), llm=SlowLLM(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    start = time.perf_counter()
+    ans = await adapter.handle_natural_language("покажи балансы", lang="ru")
+    dur = time.perf_counter() - start
+    assert dur < 13, f"exceeded 12s deadline: {dur}"
+    # Per-tool 3s + deterministic fallback should be grounded, not hanging
+    assert ans is not None
+
+
+@pytest.mark.asyncio
+async def test_timeout_must_not_trigger_second_expensive_scan():
+    svc = _svc()
+    scan_calls: list[str] = []
+
+    async def fake_scan():
+        scan_calls.append("scan")
+        await asyncio.sleep(10)
+        return []
+
+    svc.scan_triangles = fake_scan  # type: ignore
+
+    class SlowTools2(StubTools):
+        async def get_balances(self):
+            self.calls.append("get_balances")
+            await asyncio.sleep(15)
+            return {"binance": {"exchange_id": "binance", "balances": [{"asset": "USDT", "free": "1000", "used": "0"}]}}
+
+    tools = SlowTools2(svc)
+
+    class SlowLLM2(LLMProvider):
+        name = "slow2"
+        supports_tool_calling = True
+
+        async def complete(self, request: LLMRequest) -> LLMResponse:
+            has_tools = request.tools is not None
+            if has_tools and len(request.messages) == 2:
+                return LLMResponse(content="", model="slow2", tool_calls=(LLMToolCall(id="1", name="get_balances", arguments={}, raw_arguments="{}"),))
+            return LLMResponse(content="ok", model="slow2")
+
+    from app.agent.core import AgentCore
+    import time
+
+    core = AgentCore(collector=FakeCollector(), llm=SlowLLM2(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    start = time.perf_counter()
+    ans = await adapter.handle_natural_language("А что у нас сейчас вообще происходит с арбитражем?", lang="ru")
+    dur = time.perf_counter() - start
+    assert dur < 13
+    assert scan_calls == [], "timeout must not trigger second expensive scan"
+    assert ans is not None

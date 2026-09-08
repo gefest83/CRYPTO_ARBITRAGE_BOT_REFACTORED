@@ -879,6 +879,91 @@ class AgentTelegramAdapter:
             "Use available read-only tools to answer. Respond in the operator's language (English)."
         )
 
+    @staticmethod
+    def _is_balance_query(text: str) -> bool:
+        low = (text or "").lower()
+        return any(k in low for k in ["баланс", "balance", "wallet", "кошелек", "кошел", "сколько денег", "сколько средств", "how much money", "how much funds"])
+
+    async def _deterministic_grounded_fallback(self, text: str, effective: str) -> str:
+        """Deterministic, cheap, grounded recommendation when LLM unavailable.
+        Uses only cheap read-only tools, never get_balances unless explicitly requested, never full scan.
+        """
+        from app.agent.providers.base import filter_secrets_from_text, sanitize_untrusted_text
+        # Gather cheap context
+        trade_stats = {}
+        scan_stats = {}
+        params = {}
+        risk_state = {}
+        exchange_status = {}
+        threshold_ctx = {}
+        try:
+            threshold_ctx = await self._threshold_context()
+        except Exception:
+            threshold_ctx = {"threshold": "?", "source": "unknown", "strategy": "triangle", "risk_threshold": "?"}
+        try:
+            trade_stats = await self._tools.get_trade_statistics() if self._tools else {}
+        except Exception:
+            trade_stats = {}
+        try:
+            scan_stats = await self._tools.get_scan_statistics() if self._tools else {}
+        except Exception:
+            scan_stats = {}
+        try:
+            params = await self._tools.get_current_parameters() if self._tools else {}
+        except Exception:
+            params = {}
+        try:
+            risk_state = await self._tools.get_risk_state() if self._tools else {}
+        except Exception:
+            risk_state = {}
+        try:
+            exchange_status = await self._tools.get_exchange_status() if self._tools else {}
+        except Exception:
+            exchange_status = {}
+        # Sanitize and bound
+        def _s(v, n=120):
+            return sanitize_untrusted_text(filter_secrets_from_text(str(v)), max_chars=n)[:n]
+        total = trade_stats.get("total", 0) if isinstance(trade_stats, dict) else 0
+        failed = trade_stats.get("failed", 0) if isinstance(trade_stats, dict) else 0
+        completed = trade_stats.get("completed", 0) if isinstance(trade_stats, dict) else 0
+        tickers = scan_stats.get("tickers", 0) if isinstance(scan_stats, dict) else 0
+        books = scan_stats.get("order_books", 0) if isinstance(scan_stats, dict) else 0
+        # Build grounded recommendation
+        if effective == "ru":
+            lines = ["Рекомендация (детерминированная, только чтение, без LLM):"]
+            lines.append(f"Сделки: всего {total}, завершено {completed}, неудачно {failed}.")
+            lines.append(f"Скан: тикеры {tickers}, стаканы {books}.")
+            lines.append(f"Порог стратегии: {threshold_ctx.get('threshold','?')} bps ({threshold_ctx.get('source','?')}), риск-лимит: {threshold_ctx.get('risk_threshold','?')} bps, стратегия: {threshold_ctx.get('strategy','?')}.")
+            # Simple grounded suggestions without inventing
+            suggestions = []
+            if isinstance(failed, int) and failed > 0:
+                suggestions.append("Есть неудачные сделки — проверьте риск-лимиты и ликвидность.")
+            if isinstance(books, int) and books == 0:
+                suggestions.append("Нет стаканов — проверьте маркет-данные/подключения бирж.")
+            if not suggestions:
+                suggestions.append("Данных для точной рекомендации недостаточно — проверьте параметры и статус бирж.")
+            lines.append("Что проверить: " + " ".join(suggestions))
+            lines.append("Для изменений используйте /ai approve или CLI, не исполняю сделки автоматически.")
+        else:
+            lines = ["Recommendation (deterministic, read-only, no LLM):"]
+            lines.append(f"Trades: total {total}, completed {completed}, failed {failed}.")
+            lines.append(f"Scan: tickers {tickers}, books {books}.")
+            lines.append(f"Threshold: {threshold_ctx.get('threshold','?')} bps ({threshold_ctx.get('source','?')}), risk {threshold_ctx.get('risk_threshold','?')} bps, strategy {threshold_ctx.get('strategy','?')}.")
+            lines.append("Check risk limits, market data and venue status; use /ai approve for changes.")
+        # Audit with distinct path deterministic_fallback
+        try:
+            if self._core is not None and getattr(self._core, "_audit", None) is not None:
+                from app.agent.audit import AgentAuditEvent
+                import hashlib
+                ph = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+                ah = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+                ev = AgentAuditEvent(event_type="nl_fallback", provider="deterministic", model=None, query=ph[:500], details={"prompt_hash": ph, "answer_hash": ah, "routing_path": "deterministic_fallback", "tools": ["get_trade_statistics","get_scan_statistics","get_current_parameters","get_risk_state","get_exchange_status"]})
+                await self._core._audit.log(ev)  # type: ignore
+        except Exception:
+            pass
+        return self._clean_nl("\n".join(lines))
+
+
     async def _execute_llm_tools_flow(self, text: str, effective: str) -> str | None:
         """LLM tool-calling flow. Returns final answer or None if should fallback."""
         if self._tools is None:
@@ -888,6 +973,8 @@ class AgentTelegramAdapter:
             provider = getattr(self._core, "_llm", None) or getattr(self._core, "llm_provider", None)
         if provider is None or not getattr(provider, "supports_tool_calling", False):
             return None
+        # Broad arbitration/system questions must not trigger live balance fetching unless explicitly asked
+        is_balance_explicit = self._is_balance_query(text)
         limiter = getattr(self, "_nl_limiter", None) or _NL_RATE_LIMITER
         if limiter is not None:
             try:
@@ -932,6 +1019,16 @@ class AgentTelegramAdapter:
             for tc in tool_calls:
                 if total_calls >= MAX_NL_TOOL_CALLS:
                     break
+                # Do not allow get_balances unless explicitly requested
+                if tc.name == "get_balances" and not is_balance_explicit:
+                    if corrective_retries < 1:
+                        corrective_retries += 1
+                        err_msg = sanitize_untrusted_text(filter_secrets_from_text("get_balances not needed for this question — use cheap tools (scan, trade stats, params, risk, exchange status)"), max_chars=300)
+                        messages.append(LLMMessage(role="tool", content="Tool error: " + err_msg + " -- balances only for explicit balance queries.", tool_call_id=tc.id, name=tc.name))
+                        round_success = False
+                        break
+                    else:
+                        raise ToolAccessBlocked("get_balances not allowed without explicit balance request")
                 try:
                     validated = validate_tool_call(tc.name, tc.arguments)
                 except Exception as exc:
@@ -952,7 +1049,8 @@ class AgentTelegramAdapter:
                             pass
                         raise ToolAccessBlocked("malformed tool call " + tc.name) from exc
                 try:
-                    result_str = await executor.execute(tc.name, validated)
+                    # Per-tool timeout to avoid slow exchange/API blocking total deadline
+                    result_str = await asyncio.wait_for(executor.execute(tc.name, validated), timeout=3.0)
                 except Exception as exc:
                     if corrective_retries < 1 and isinstance(exc, ToolAccessBlocked):
                         corrective_retries += 1
@@ -1028,72 +1126,101 @@ class AgentTelegramAdapter:
         tool_names: list[str] = []
         outcome = "ok"
         try:
-            # 2. Deterministic fast-path — skip for complex arbitrary questions that should use LLM tools
-            low = (text or "").lower()
-            # Bypass fast-path for ambiguous / explanatory / recommendation / small-talk.
-            # Keep obvious read-only queries (balances, today trades, status) on fast-path.
-            # Do not add new deterministic intents; use LLM semantic path.
-            is_small_talk = any(ph in low for ph in ["привет", "как зовут", "кто ты", "как тебя зовут", "здравствуй"])
-            is_recommendation = any(ph in low for ph in ["улучшить", "мешает", "мешают", "можно сделать", "больше сделок", "мало сделок", "посоветуй", "порекомендуй", "рекоменд", "что делать", "как сделать", "почему нет сделок", "почему ни одной"])
-            # General policy: only clearly unambiguous read-only queries use fast-path.
-            # Analysis / recommendation / why-how questions must use LLM.
-            is_ambiguous_why_how = any(ph in low for ph in ["что мешает", "что можно", "почему", "зачем", "как сделать", "что делать"])
-            is_complex_llm_candidate = is_small_talk or is_recommendation or is_ambiguous_why_how or any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
-            fast = None
-            if not is_complex_llm_candidate:
-                fast = await self._deterministic_dispatch(intent, entities, effective)
-            if fast is not None and intent != UNKNOWN:
-                # AI_HELP and known intents are fast-path; also covers UNKNOWN->help but we want LLM for UNKNOWN
-                routing_path = "fast_path"
-                return fast
-            # If intent is UNKNOWN, we try LLM before fallback
-            # 3. LLM tool-calling under 12s deadline (covers retries+tools+final)
-            # Providers without native tool support will return None -> fallback
-            try:
-                async with asyncio.timeout(12):
-                    llm_answer = await self._execute_llm_tools_flow(text or "", effective)
-                    if llm_answer is not None:
-                        routing_path = "llm_tools"
-                        # Extract tool names from audit? For logging, we already have
-                        return llm_answer
-            except TimeoutError:
-                outcome = "timeout"
-                routing_path = "router_fallback"
-                logger.warning("ai_nl_timeout", extra={"routing_path": routing_path, "duration_ms": int((_time.perf_counter() - started) * 1000)})
-            except ToolAccessBlocked as exc:
-                outcome = "tool_blocked"
-                routing_path = "router_fallback"
+            async with asyncio.timeout(12):
+                # 2. Deterministic fast-path — skip for complex arbitrary questions that should use LLM tools
+                low = (text or "").lower()
+                # Bypass fast-path for ambiguous / explanatory / recommendation / small-talk.
+                # Keep obvious read-only queries (balances, today trades, status) on fast-path.
+                # Do not add new deterministic intents; use LLM semantic path.
+                is_small_talk = any(ph in low for ph in ["привет", "как зовут", "кто ты", "как тебя зовут", "здравствуй"])
+                is_recommendation = any(ph in low for ph in ["улучшить", "мешает", "мешают", "можно сделать", "больше сделок", "мало сделок", "посоветуй", "порекомендуй", "рекоменд", "что делать", "как сделать", "почему нет сделок", "почему ни одной"])
+                # General policy: only clearly unambiguous read-only queries use fast-path.
+                # Analysis / recommendation / why-how questions must use LLM.
+                is_ambiguous_why_how = any(ph in low for ph in ["что мешает", "что можно", "зачем", "как сделать", "что делать"])
+                is_complex_llm_candidate = is_small_talk or is_recommendation or is_ambiguous_why_how or any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
+                fast = None
+                if not is_complex_llm_candidate:
+                    fast = await self._deterministic_dispatch(intent, entities, effective)
+                if fast is not None and intent != UNKNOWN:
+                    # AI_HELP and known intents are fast-path; also covers UNKNOWN->help but we want LLM for UNKNOWN
+                    routing_path = "fast_path"
+                    return fast
+                # 3. LLM tool-calling — total 12s deadline is the outer timeout, per-tool 3s inside
+                # Providers without native tool support will return None -> deterministic grounded fallback
+                llm_answer = None
+                llm_error = None
                 try:
-                    from app.agent.audit import AgentAuditEvent
+                    llm_answer = await self._execute_llm_tools_flow(text or "", effective)
+                except ToolAccessBlocked as exc:
+                    llm_error = exc
+                    outcome = "tool_blocked"
+                    routing_path = "deterministic_fallback"
+                    try:
+                        from app.agent.audit import AgentAuditEvent
 
-                    if self._core is not None and getattr(self._core, "_audit", None) is not None:
-                        audit = self._core._audit  # type: ignore
-                        ev = AgentAuditEvent(event_type="ToolAccessBlocked", query=self._hash_text(text or "")[:500], details={"error": filter_secrets_from_text(str(exc))[:200], "routing_path": routing_path})
-                        await audit.log(ev)
-                except Exception:
-                    pass
-            except Exception as exc:
-                from app.exchanges.sanitize import redact_secrets as _redact
+                        if self._core is not None and getattr(self._core, "_audit", None) is not None:
+                            audit = self._core._audit  # type: ignore
+                            ev = AgentAuditEvent(event_type="ToolAccessBlocked", query=self._hash_text(text or "")[:500], details={"error": filter_secrets_from_text(str(exc))[:200], "routing_path": routing_path})
+                            await audit.log(ev)
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    from app.exchanges.sanitize import redact_secrets as _redact
 
-                _ = _redact(str(exc))[:200]
-                outcome = "llm_error"
-                routing_path = "router_fallback"
-            # 4. Router fallback (deterministic UNKNOWN help or intent-based)
-            routing_path = "router_fallback" if routing_path == "unknown" else routing_path
-            if intent == UNKNOWN:
-                # Small-talk should be answered naturally, not with technical capability list
-                if is_small_talk:
-                    if effective == "ru":
-                        return self._clean_nl("Привет! Я — AI-советник бота. Помогаю с анализом арбитража, балансами и сделками. Спроси, например, «покажи балансы» или «как улучшить, чтобы были сделки?»")
-                    return self._clean_nl("Hi! I'm the bot's AI advisor — I help with balances, trades and analysis. Try 'show me balances' or 'how to get more trades?'")
-                outcome = outcome if outcome != "ok" else "fallback"
+                    _ = _redact(str(exc))[:200]
+                    outcome = "llm_error"
+                    routing_path = "deterministic_fallback"
+                    llm_error = exc
+                if llm_answer is not None:
+                    routing_path = "llm_tools"
+                    return llm_answer
+                # No LLM available or LLM failed for complex/recommendation -> grounded deterministic fallback, not trades dump/help
+                if is_complex_llm_candidate:
+                    if is_small_talk:
+                        routing_path = "deterministic_fallback"
+                        outcome = "small_talk_fallback"
+                        if effective == "ru":
+                            return self._clean_nl("Привет! Я — AI-советник бота. Помогаю с анализом арбитража, балансами и сделками. Спроси, например, «покажи балансы» или «как улучшить, чтобы были сделки?»")
+                        return self._clean_nl("Hi! I'm the bot's AI advisor — I help with balances, trades and analysis. Try 'show me balances' or 'how to get more trades?'")
+                    routing_path = "deterministic_fallback"
+                    outcome = outcome if outcome != "ok" else "fallback_no_llm"
+                    # Use cheap grounded fallback, never get_balances unless explicitly requested
+                    return await self._deterministic_grounded_fallback(text or "", effective)
+                # 4. Router fallback for non-complex (deterministic UNKNOWN help or intent-based)
+                routing_path = "router_fallback" if routing_path == "unknown" else routing_path
+                if intent == UNKNOWN:
+                    # Small-talk should be answered naturally, not with technical capability list
+                    if is_small_talk:
+                        if effective == "ru":
+                            return self._clean_nl("Привет! Я — AI-советник бота. Помогаю с анализом арбитража, балансами и сделками. Спроси, например, «покажи балансы» или «как улучшить, чтобы были сделки?»")
+                        return self._clean_nl("Hi! I'm the bot's AI advisor — I help with balances, trades and analysis. Try 'show me balances' or 'how to get more trades?'")
+                    outcome = outcome if outcome != "ok" else "fallback"
+                    return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+                # For known intents that fast-path already handled, we wouldn't be here.
+                # Fallback: try deterministic again or unknown
+                fallback = await self._deterministic_dispatch(intent, entities, effective)
+                if fallback is not None:
+                    return fallback
                 return self._clean_nl(_ai_t("ai_nl_unknown", effective))
-            # For known intents that fast-path already handled, we wouldn't be here.
-            # Fallback: try deterministic again or unknown
-            fallback = await self._deterministic_dispatch(intent, entities, effective)
-            if fallback is not None:
-                return fallback
-            return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+        except TimeoutError:
+            outcome = "timeout"
+            routing_path = "deterministic_fallback"
+            logger.warning("ai_nl_timeout", extra={"routing_path": routing_path, "duration_ms": int((_time.perf_counter() - started) * 1000)})
+            # On total timeout, do NOT start expensive operations (no scan, no balances)
+            # Return minimal safe grounded fallback without calling expensive tools if possible
+            try:
+                # Try cheap grounded fallback with very short timeout
+                return await asyncio.wait_for(self._deterministic_grounded_fallback(text or "", effective), timeout=1.5)
+            except Exception:
+                # Ultimate safe fallback: threshold only, no tool calls
+                try:
+                    thr = await asyncio.wait_for(self._threshold_context(), timeout=0.5)
+                    val = thr.get("threshold","?"); src = thr.get("source","unknown"); strat = thr.get("strategy","triangle")
+                except Exception:
+                    val="?" ; src="unknown"; strat="triangle"
+                if effective == "ru":
+                    return self._clean_nl(f"Сервис временно занят (таймаут 12с). Порог {val} bps ({src}), стратегия {strat}. Попробуйте позже или спросите «покажи балансы» / «почему нет сделок».")
+                return self._clean_nl(f"Service busy (timeout 12s). Threshold {val} bps ({src}), strategy {strat}. Try again.")
         except Exception as exc:  # noqa: BLE001 - NL must never crash telegram
             from app.exchanges.sanitize import redact_secrets as _redact
 
