@@ -155,6 +155,7 @@ class OpenRouterProvider(LLMProvider):
     """
 
     name = "openrouter"
+    supports_tool_calling = True
 
     def __init__(
         self,
@@ -219,13 +220,27 @@ class OpenRouterProvider(LLMProvider):
             raise
 
         # Filter outbound messages before any network and bound sizes
-        safe_messages = []
+        safe_messages: list[dict[str, Any]] = []
         for msg in request.messages:
             safe_content = filter_secrets_from_text(msg.content)
             # Bounded prompt: truncate each message to max_prompt_chars
             if len(safe_content) > self._max_prompt_chars:
                 safe_content = safe_content[: self._max_prompt_chars - 20] + "... (truncated)"
-            safe_messages.append({"role": msg.role, "content": safe_content})
+            entry: dict[str, Any] = {"role": msg.role, "content": safe_content}
+            if msg.tool_call_id:
+                entry["tool_call_id"] = msg.tool_call_id
+            if msg.name:
+                entry["name"] = msg.name
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.raw_arguments or "{}"},
+                    }
+                    for tc in msg.tool_calls
+                ]
+            safe_messages.append(entry)
 
         # Also enforce overall prompt budget: if combined still too large, truncate again
         total_chars = sum(len(m["content"]) for m in safe_messages)
@@ -241,6 +256,9 @@ class OpenRouterProvider(LLMProvider):
             "model": model,
             "messages": safe_messages,
         }
+        if request.tools:
+            payload["tools"] = list(request.tools)
+            payload["tool_choice"] = request.tool_choice or "auto"
         if request.temperature is not None:
             payload["temperature"] = request.temperature
         else:
@@ -406,12 +424,48 @@ class OpenRouterProvider(LLMProvider):
                 if content is None:
                     # Some models return text field
                     content = msg.get("text", "")
+                # Tool calls in message.tool_calls
+                tool_calls_raw = msg.get("tool_calls")
             else:
                 content = str(msg)
+                tool_calls_raw = None
             if content is None:
                 content = ""
             if not isinstance(content, str):
                 content = str(content)
+            # Parse tool_calls if present
+            tool_calls = None
+            if isinstance(tool_calls_raw, list) and tool_calls_raw:
+                parsed: list[Any] = []
+                import json as _json
+
+                from app.agent.providers.base import LLMToolCall  # local import
+
+                for tc in tool_calls_raw:
+                    try:
+                        if not isinstance(tc, dict):
+                            continue
+                        func = tc.get("function") or {}
+                        name = str(func.get("name", "")).strip()
+                        raw_args = func.get("arguments", "{}")
+                        if not isinstance(raw_args, str):
+                            raw_args = _json.dumps(raw_args)
+                        try:
+                            args = _json.loads(raw_args) if raw_args else {}
+                            if not isinstance(args, dict):
+                                args = {}
+                        except Exception:
+                            args = {}
+                            raw_args = "{}"
+                        tid = str(tc.get("id", f"call_{len(parsed)}"))
+                        # Secret filtering on tool args content
+                        if raw_args:
+                            raw_args = filter_secrets_from_text(raw_args)
+                        parsed.append(LLMToolCall(id=tid, name=name, arguments=args, raw_arguments=raw_args))
+                    except Exception:
+                        continue
+                if parsed:
+                    tool_calls = tuple(parsed)
             # Usage may be absent
             usage = data.get("usage", {})
             # Secret filtering on inbound content
@@ -422,6 +476,7 @@ class OpenRouterProvider(LLMProvider):
                 finish_reason=first.get("finish_reason"),
                 usage=dict(usage) if isinstance(usage, dict) else {},
                 raw=data,
+                tool_calls=tool_calls,
             )
         except OpenRouterError:
             raise

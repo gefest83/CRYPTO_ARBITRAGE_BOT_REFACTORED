@@ -150,9 +150,22 @@ def filter_secrets_from_text(text: str, *, extra: tuple[str, ...] = ()) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class LLMToolCall:
+    """Parsed tool call from an LLM (native function calling)."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    raw_arguments: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LLMMessage:
-    role: str  # system | user | assistant
+    role: str  # system | user | assistant | tool
     content: str
+    tool_call_id: str | None = None
+    name: str | None = None
+    tool_calls: tuple[LLMToolCall, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +175,8 @@ class LLMRequest:
     temperature: float | None = None
     max_tokens: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    tools: tuple[dict[str, Any], ...] | None = None
+    tool_choice: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +186,7 @@ class LLMResponse:
     finish_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
+    tool_calls: tuple[LLMToolCall, ...] | None = None
 
 
 # ------------------------------------------------------------------ abstract provider
@@ -186,6 +202,7 @@ class LLMProvider(abc.ABC):
     """
 
     name: str = "base"
+    supports_tool_calling: bool = False
 
     @abc.abstractmethod
     async def complete(self, request: LLMRequest) -> LLMResponse:
@@ -220,6 +237,7 @@ class NullProvider(LLMProvider):
     """
 
     name = "null"
+    supports_tool_calling = False
 
     def __init__(self, canned: str = "No LLM configured — analysis stub (no external call).") -> None:
         self._canned = canned
@@ -236,6 +254,7 @@ class EchoProvider(LLMProvider):
     """Echo back the last user message (sanitized) — useful for tests."""
 
     name = "echo"
+    supports_tool_calling = False
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
         last = request.messages[-1].content if request.messages else ""

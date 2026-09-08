@@ -26,6 +26,9 @@ one place without opening the advisor core to Telegram-specific concerns.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import time as _time
 from typing import Any
 
 from app.agent.core import AgentCore, AgentRequest
@@ -36,6 +39,14 @@ from app.telegram.i18n import t
 __all__ = ["AgentTelegramAdapter", "AI_COMMANDS"]
 
 logger = get_logger("agent.telegram")
+
+# Separate NL rate/budget limits (independent from /ai report budget)
+try:
+    from app.agent.providers.openrouter import RateLimiter as _RateLimiter  # type: ignore[import-not-found]
+
+    _NL_RATE_LIMITER: Any = _RateLimiter(per_minute=20, per_hour=100, per_day=300)
+except Exception:
+    _NL_RATE_LIMITER = None
 
 
 AI_COMMANDS: tuple[str, ...] = (
@@ -422,6 +433,13 @@ class AgentTelegramAdapter:
         self._tools = tools
         self._approval = approval_service
         self._learning = learning
+        # Per-adapter NL rate limiter instance (separate from /ai report budget)
+        try:
+            from app.agent.providers.openrouter import RateLimiter as _RL  # type: ignore
+
+            self._nl_limiter: Any = _RL(per_minute=20, per_hour=100, per_day=300)
+        except Exception:
+            self._nl_limiter = None
 
     async def dispatch(self, text: str, *, lang: str | None = None, approver: str | None = None) -> str:
         """Route ``/ai*`` text to the appropriate sub-handler.
@@ -806,70 +824,291 @@ class AgentTelegramAdapter:
             "risk_threshold": risk_value or "?",
         }
 
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+    async def _deterministic_dispatch(self, intent: str, entities: dict, effective: str) -> str | None:
+        """Try deterministic fast-path. Returns string if handled, else None."""
+        if intent == "BALANCE_QUERY":
+            return await self.balance(lang=effective, venue=entities.get("venue"), asset=entities.get("asset"))
+        if intent == "TRADES_QUERY":
+            return await self.nl_trades(lang=effective, period=entities.get("period"))
+        if intent == "TRADE_STATS_QUERY":
+            return await self.nl_trade_stats(lang=effective)
+        if intent == "SCAN_STATS_QUERY":
+            return await self.nl_scan_stats(lang=effective)
+        if intent == "OPPORTUNITIES_QUERY":
+            return await self.nl_opportunities(lang=effective)
+        if intent == "EXCHANGE_STATUS_QUERY":
+            return await self.nl_exchange_status(lang=effective)
+        if intent == "BOT_STATUS_QUERY":
+            return await self.nl_bot_status(lang=effective)
+        if intent == "BOT_OPERATION_QUERY":
+            return await self.nl_bot_operation(lang=effective)
+        if intent == "RISK_QUERY":
+            return await self.nl_risk(lang=effective)
+        if intent == "PARAMETERS_QUERY":
+            return await self.nl_parameters(lang=effective)
+        if intent == "MEMORY_QUERY":
+            return await self.memory(lang=effective)
+        if intent == "JOURNAL_QUERY":
+            return await self.nl_journal(lang=effective)
+        if intent == "RECOMMENDATIONS_QUERY":
+            return await self.recommendations(lang=effective)
+        if intent == "WHY_NOT_TRADING_QUERY":
+            return await self.nl_why_not_trading(lang=effective)
+        if intent == "AI_HELP":
+            return self._clean_nl(_ai_t("ai_nl_help_full", effective))
+        return None
+
+    def _nl_system_prompt(self, effective: str, threshold_ctx: dict[str, str]) -> str:
+        if effective == "ru":
+            return (
+                "Ты — AI-советник крипто-арбитражного бота. Отвечай только на основе реальных данных из инструментов. "
+                "Не выдумывай пороги/параметры — используй только live-контекст. "
+                f"Текущий порог: {threshold_ctx.get('threshold','?')} bps ({threshold_ctx.get('source','?')}), "
+                f"риск-лимит: {threshold_ctx.get('risk_threshold','?')} bps, стратегия: {threshold_ctx.get('strategy','?')}. "
+                "Используй доступные инструменты (только чтение) для ответа. Отвечай на языке оператора (русский)."
+            )
+        return (
+            "You are the AI Advisor for a crypto arbitrage bot. Answer grounded in real tool data only. "
+            "Never invent thresholds/parameters — use only the live context provided. "
+            f"Current threshold: {threshold_ctx.get('threshold','?')} bps ({threshold_ctx.get('source','?')}), "
+            f"risk gate: {threshold_ctx.get('risk_threshold','?')} bps, strategy: {threshold_ctx.get('strategy','?')}. "
+            "Use available read-only tools to answer. Respond in the operator's language (English)."
+        )
+
+    async def _execute_llm_tools_flow(self, text: str, effective: str) -> str | None:
+        """LLM tool-calling flow. Returns final answer or None if should fallback."""
+        if self._tools is None:
+            return None
+        provider = None
+        if self._core is not None:
+            provider = getattr(self._core, "_llm", None) or getattr(self._core, "llm_provider", None)
+        if provider is None or not getattr(provider, "supports_tool_calling", False):
+            return None
+        limiter = getattr(self, "_nl_limiter", None) or _NL_RATE_LIMITER
+        if limiter is not None:
+            try:
+                limiter.check()
+            except Exception:
+                return None
+            try:
+                limiter.record()
+            except Exception:
+                pass
+        try:
+            threshold_ctx = await self._threshold_context()
+        except Exception:
+            threshold_ctx = {"threshold": "?", "source": "unknown", "strategy": "triangle", "risk_threshold": "?"}
+        from app.agent.providers.base import filter_secrets_from_text, sanitize_untrusted_text
+        from app.agent.tools import ToolAccessBlocked
+        safe_user = sanitize_untrusted_text(filter_secrets_from_text(text or ""), max_chars=1000)[:1000]
+        system_prompt = self._nl_system_prompt(effective, threshold_ctx)
+        safe_system = filter_secrets_from_text(system_prompt)[:1500]
+        prompt_hash = self._hash_text(safe_system + "|" + safe_user)
+        from app.agent.nl_tool_executor import MAX_NL_TOOL_CALLS, NL_TOOL_DEFINITIONS, NLToolExecutor, validate_tool_call
+        from app.agent.providers.base import LLMMessage, LLMRequest
+        executor = NLToolExecutor(self._tools)
+        messages: list[LLMMessage] = [
+            LLMMessage(role="system", content=safe_system),
+            LLMMessage(role="user", content=safe_user),
+        ]
+        tool_names_used: list[str] = []
+        corrective_retries = 0
+        total_calls = 0
+        final_content: str | None = None
+        while total_calls < MAX_NL_TOOL_CALLS:
+            req = LLMRequest(messages=tuple(messages), tools=NL_TOOL_DEFINITIONS, tool_choice="auto")
+            resp = await provider.complete(req)
+            filtered_content = filter_secrets_from_text(resp.content or "")
+            if not resp.tool_calls:
+                final_content = filtered_content
+                break
+            tool_calls = list(resp.tool_calls)[: MAX_NL_TOOL_CALLS - total_calls]
+            messages.append(LLMMessage(role="assistant", content=filtered_content, tool_calls=tuple(tool_calls)))
+            round_success = False
+            for tc in tool_calls:
+                if total_calls >= MAX_NL_TOOL_CALLS:
+                    break
+                try:
+                    validated = validate_tool_call(tc.name, tc.arguments)
+                except Exception as exc:
+                    if corrective_retries < 1:
+                        corrective_retries += 1
+                        err_msg = sanitize_untrusted_text(filter_secrets_from_text(str(exc)[:300]), max_chars=500)
+                        messages.append(LLMMessage(role="tool", content="Tool error: " + err_msg + " -- use valid allowlisted tools only.", tool_call_id=tc.id, name=tc.name))
+                        try:
+                            logger.warning("ai_nl_tool_blocked", extra={"tool": tc.name, "error": err_msg[:200], "routing_path": "llm_tools"})
+                        except Exception:
+                            pass
+                        round_success = False
+                        break
+                    else:
+                        try:
+                            logger.warning("ai_nl_tool_blocked", extra={"tool": tc.name, "routing_path": "llm_tools", "outcome": "fallback"})
+                        except Exception:
+                            pass
+                        raise ToolAccessBlocked("malformed tool call " + tc.name) from exc
+                try:
+                    result_str = await executor.execute(tc.name, validated)
+                except Exception as exc:
+                    if corrective_retries < 1 and isinstance(exc, ToolAccessBlocked):
+                        corrective_retries += 1
+                        messages.append(LLMMessage(role="tool", content="ToolAccessBlocked: " + filter_secrets_from_text(str(exc))[:300], tool_call_id=tc.id, name=tc.name))
+                        round_success = False
+                        break
+                    raise
+                messages.append(LLMMessage(role="tool", content=result_str, tool_call_id=tc.id, name=tc.name))
+                tool_names_used.append(tc.name)
+                total_calls += 1
+                round_success = True
+            if not round_success and corrective_retries and total_calls == 0:
+                continue
+            if not round_success:
+                break
+            if total_calls >= MAX_NL_TOOL_CALLS:
+                break
+        if final_content is None:
+            try:
+                final_req = LLMRequest(messages=tuple(messages))
+                final_resp = await provider.complete(final_req)
+                final_content = filter_secrets_from_text(final_resp.content or "")
+            except Exception:
+                return None
+        if not final_content or len(final_content.strip()) < 5:
+            return None
+        from app.agent.providers.base import filter_secrets_from_text as _filt, sanitize_untrusted_text as _san
+        from app.exchanges.sanitize import redact_secrets as _redact
+        cleaned = _redact(final_content)
+        cleaned = _filt(cleaned)
+        cleaned = _san(cleaned, max_chars=3500)[:3500]
+        answer_hash = self._hash_text(cleaned)
+        try:
+            if self._core is not None and getattr(self._core, "_audit", None) is not None:
+                audit = self._core._audit  # type: ignore
+                from app.agent.audit import AgentAuditEvent
+                ev = AgentAuditEvent(
+                    event_type="nl_llm_tools",
+                    provider=getattr(provider, "name", "unknown"),
+                    model=getattr(provider, "model", None),
+                    query=prompt_hash[:500],
+                    details={"prompt_hash": prompt_hash, "answer_hash": answer_hash, "tools": tool_names_used[:5], "routing_path": "llm_tools"},
+                )
+                await audit.log(ev)
+        except Exception:
+            pass
+        self._last_nl_tools = tool_names_used  # type: ignore
+        return self._clean_nl(cleaned)
+
     async def handle_natural_language(
         self, text: str, *, lang: str | None = None, approver: str | None = None
     ) -> str:
-        """Deterministic NL entry point: intent router -> read-only tools.
+        """Hybrid NL: pre-gate -> deterministic fast-path -> LLM tool-calling -> router fallback.
 
-        Never performs privileged actions. Unknown or privileged inputs get
-        a safe help/refusal message. Every request is timed and logged as
-        ``ai_nl_request`` (intent + duration only — never secrets).
+        Entire NL handling (provider retries + tool rounds + final generation) is wrapped
+        in a single 12s deadline. On timeout/error/budget exhaustion, falls back to
+        deterministic router. Every request logs routing_path without secrets.
         """
-        import time as _time
-
         from app.agent.nl_router import UNKNOWN, detect_intent, is_privileged_request
+        from app.agent.tools import ToolAccessBlocked
 
         effective = lang if lang in ("en", "ru") else "en"
         if self._core is None and self._tools is None:
             return self._clean_nl(_ai_t("ai_not_configured", effective))
+        # 1. Privileged pre-gate BEFORE any LLM call
         if is_privileged_request(text or ""):
-            logger.info("ai_nl_request", extra={"intent": "PRIVILEGED_REFUSED", "duration_ms": 0})
+            logger.info("ai_nl_request", extra={"intent": "PRIVILEGED_REFUSED", "duration_ms": 0, "routing_path": "privileged_refused", "outcome": "refused"})
             return self._clean_nl(_ai_t("ai_nl_privileged_refused", effective))
         intent, entities = detect_intent(text or "")
         started = _time.perf_counter()
+        routing_path = "unknown"
+        self._last_nl_tools = []  # type: ignore
+        tool_names: list[str] = []
+        outcome = "ok"
         try:
-            if intent == "BALANCE_QUERY":
-                return await self.balance(lang=effective, venue=entities.get("venue"), asset=entities.get("asset"))
-            if intent == "TRADES_QUERY":
-                return await self.nl_trades(lang=effective, period=entities.get("period"))
-            if intent == "TRADE_STATS_QUERY":
-                return await self.nl_trade_stats(lang=effective)
-            if intent == "SCAN_STATS_QUERY":
-                return await self.nl_scan_stats(lang=effective)
-            if intent == "OPPORTUNITIES_QUERY":
-                return await self.nl_opportunities(lang=effective)
-            if intent == "EXCHANGE_STATUS_QUERY":
-                return await self.nl_exchange_status(lang=effective)
-            if intent == "BOT_STATUS_QUERY":
-                return await self.nl_bot_status(lang=effective)
-            if intent == "BOT_OPERATION_QUERY":
-                return await self.nl_bot_operation(lang=effective)
-            if intent == "RISK_QUERY":
-                return await self.nl_risk(lang=effective)
-            if intent == "PARAMETERS_QUERY":
-                return await self.nl_parameters(lang=effective)
-            if intent == "MEMORY_QUERY":
-                return await self.memory(lang=effective)
-            if intent == "JOURNAL_QUERY":
-                return await self.nl_journal(lang=effective)
-            if intent == "RECOMMENDATIONS_QUERY":
-                return await self.recommendations(lang=effective)
-            if intent == "WHY_NOT_TRADING_QUERY":
-                return await self.nl_why_not_trading(lang=effective)
-            if intent == "AI_HELP":
-                return self._clean_nl(_ai_t("ai_nl_help_full", effective))
-            _ = UNKNOWN
+            # 2. Deterministic fast-path — skip for complex arbitrary questions that should use LLM tools
+            low = (text or "").lower()
+            is_complex_llm_candidate = any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
+            fast = None
+            if not is_complex_llm_candidate:
+                fast = await self._deterministic_dispatch(intent, entities, effective)
+            if fast is not None and intent != UNKNOWN:
+                # AI_HELP and known intents are fast-path; also covers UNKNOWN->help but we want LLM for UNKNOWN
+                routing_path = "fast_path"
+                return fast
+            # If intent is UNKNOWN, we try LLM before fallback
+            # 3. LLM tool-calling under 12s deadline (covers retries+tools+final)
+            # Providers without native tool support will return None -> fallback
+            try:
+                async with asyncio.timeout(12):
+                    llm_answer = await self._execute_llm_tools_flow(text or "", effective)
+                    if llm_answer is not None:
+                        routing_path = "llm_tools"
+                        # Extract tool names from audit? For logging, we already have
+                        return llm_answer
+            except TimeoutError:
+                outcome = "timeout"
+                routing_path = "router_fallback"
+                logger.warning("ai_nl_timeout", extra={"routing_path": routing_path, "duration_ms": int((_time.perf_counter() - started) * 1000)})
+            except ToolAccessBlocked as exc:
+                outcome = "tool_blocked"
+                routing_path = "router_fallback"
+                try:
+                    from app.agent.audit import AgentAuditEvent
+
+                    if self._core is not None and getattr(self._core, "_audit", None) is not None:
+                        audit = self._core._audit  # type: ignore
+                        ev = AgentAuditEvent(event_type="ToolAccessBlocked", query=self._hash_text(text or "")[:500], details={"error": filter_secrets_from_text(str(exc))[:200], "routing_path": routing_path})
+                        await audit.log(ev)
+                except Exception:
+                    pass
+            except Exception as exc:
+                from app.exchanges.sanitize import redact_secrets as _redact
+
+                _ = _redact(str(exc))[:200]
+                outcome = "llm_error"
+                routing_path = "router_fallback"
+            # 4. Router fallback (deterministic UNKNOWN help or intent-based)
+            routing_path = "router_fallback" if routing_path == "unknown" else routing_path
+            if intent == UNKNOWN:
+                outcome = outcome if outcome != "ok" else "fallback"
+                return self._clean_nl(_ai_t("ai_nl_unknown", effective))
+            # For known intents that fast-path already handled, we wouldn't be here.
+            # Fallback: try deterministic again or unknown
+            fallback = await self._deterministic_dispatch(intent, entities, effective)
+            if fallback is not None:
+                return fallback
             return self._clean_nl(_ai_t("ai_nl_unknown", effective))
         except Exception as exc:  # noqa: BLE001 - NL must never crash telegram
             from app.exchanges.sanitize import redact_secrets as _redact
 
             safe = _redact(str(exc))[:200]
             _ = safe
+            routing_path = "router_fallback"
+            outcome = "exception"
             return self._clean_nl(_ai_t("ai_nl_unknown", effective))
         finally:
             try:
                 duration_ms = int((_time.perf_counter() - started) * 1000)
-                logger.info("ai_nl_request", extra={"intent": intent, "duration_ms": duration_ms})
+                # Never log secrets or raw credentials
+                from app.agent.providers.base import filter_secrets_from_text as _ff
+
+                safe_intent = _ff(intent)[:40]
+                # Use tool names from last LLM run if available
+                logged_tools = tool_names[:5]
+                try:
+                    if hasattr(self, "_last_nl_tools") and getattr(self, "_last_nl_tools"):
+                        logged_tools = list(getattr(self, "_last_nl_tools"))[:5]
+                except Exception:
+                    pass
+                logger.info("ai_nl_request", extra={"intent": safe_intent, "duration_ms": duration_ms, "routing_path": routing_path, "tools": logged_tools, "outcome": outcome})
+                # Clear for next request
+                try:
+                    self._last_nl_tools = []  # type: ignore
+                except Exception:
+                    pass
             except Exception:
                 pass
 
