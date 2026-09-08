@@ -1030,7 +1030,12 @@ class AgentTelegramAdapter:
         try:
             # 2. Deterministic fast-path — skip for complex arbitrary questions that should use LLM tools
             low = (text or "").lower()
-            is_complex_llm_candidate = any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
+            # Bypass fast-path for ambiguous / explanatory / recommendation / small-talk.
+            # Keep obvious read-only queries (balances, today trades, status) on fast-path.
+            # Do not add new deterministic intents; use LLM semantic path.
+            is_small_talk = any(ph in low for ph in ["привет", "как зовут", "кто ты", "как тебя зовут", "здравствуй"])
+            is_recommendation = any(ph in low for ph in ["как улучшить", "чтобы были сделки", "чтобы было больше сделок", "как сделать чтобы были", "посоветуй", "порекомендуй", "что делать чтобы"])
+            is_complex_llm_candidate = is_small_talk or is_recommendation or any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
             fast = None
             if not is_complex_llm_candidate:
                 fast = await self._deterministic_dispatch(intent, entities, effective)
@@ -1073,6 +1078,11 @@ class AgentTelegramAdapter:
             # 4. Router fallback (deterministic UNKNOWN help or intent-based)
             routing_path = "router_fallback" if routing_path == "unknown" else routing_path
             if intent == UNKNOWN:
+                # Small-talk should be answered naturally, not with technical capability list
+                if is_small_talk:
+                    if effective == "ru":
+                        return self._clean_nl("Привет! Я — AI-советник бота. Помогаю с анализом арбитража, балансами и сделками. Спроси, например, «покажи балансы» или «как улучшить, чтобы были сделки?»")
+                    return self._clean_nl("Hi! I'm the bot's AI advisor — I help with balances, trades and analysis. Try 'show me balances' or 'how to get more trades?'")
                 outcome = outcome if outcome != "ok" else "fallback"
                 return self._clean_nl(_ai_t("ai_nl_unknown", effective))
             # For known intents that fast-path already handled, we wouldn't be here.
