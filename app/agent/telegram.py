@@ -1034,8 +1034,11 @@ class AgentTelegramAdapter:
             # Keep obvious read-only queries (balances, today trades, status) on fast-path.
             # Do not add new deterministic intents; use LLM semantic path.
             is_small_talk = any(ph in low for ph in ["привет", "как зовут", "кто ты", "как тебя зовут", "здравствуй"])
-            is_recommendation = any(ph in low for ph in ["как улучшить", "чтобы были сделки", "чтобы было больше сделок", "как сделать чтобы были", "посоветуй", "порекомендуй", "что делать чтобы"])
-            is_complex_llm_candidate = is_small_talk or is_recommendation or any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
+            is_recommendation = any(ph in low for ph in ["улучшить", "мешает", "мешают", "можно сделать", "больше сделок", "мало сделок", "посоветуй", "порекомендуй", "рекоменд", "что делать", "как сделать", "почему нет сделок", "почему ни одной"])
+            # General policy: only clearly unambiguous read-only queries use fast-path.
+            # Analysis / recommendation / why-how questions must use LLM.
+            is_ambiguous_why_how = any(ph in low for ph in ["что мешает", "что можно", "почему", "зачем", "как сделать", "что делать"])
+            is_complex_llm_candidate = is_small_talk or is_recommendation or is_ambiguous_why_how or any(ph in low for ph in ["что у нас сейчас", "вообще происходит", "объясни мне", "простыми словами", "почему сегодня"])
             fast = None
             if not is_complex_llm_candidate:
                 fast = await self._deterministic_dispatch(intent, entities, effective)

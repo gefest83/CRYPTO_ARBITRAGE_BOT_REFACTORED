@@ -155,6 +155,33 @@ async def test_recommendation_uses_llm_grounded_not_trades_dump():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "как улучшить, чтоб были сделки?",
+        "как улучшить бота, чтоб были сделки?",
+        "что мешает боту торговать?",
+        "что можно сделать, чтобы было больше сделок?",
+    ],
+)
+async def test_llm_routing_for_analysis_recommendation(query: str):
+    svc = _svc()
+    tools = StubTools(svc)
+    from app.agent.core import AgentCore
+
+    core = AgentCore(collector=FakeCollector(), llm=FakeLLM(), audit_repo=None)
+    adapter = AgentTelegramAdapter(core, tools)
+    ans = await adapter.handle_natural_language(query, lang="ru")
+    # Must go via LLM tool-calling, grounded in tool results, not a plain trades dump
+    assert "5 bps" in ans or "порог" in ans, f"not grounded: {ans[:200]}"
+    assert len(tools.calls) > 0, "LLM did not use read-only tools"
+    assert "get_trade_statistics" in tools.calls or "get_current_parameters" in tools.calls or "get_scan_statistics" in tools.calls
+    # Must not be just the 10-trades dump
+    assert "Последние сделки" not in ans or "порог" in ans
+    assert "Recent trades" not in ans
+
+
+@pytest.mark.asyncio
 async def test_obvious_read_only_still_fast_path():
     svc = _svc()
     tools = StubTools(svc)
