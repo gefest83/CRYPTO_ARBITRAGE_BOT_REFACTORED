@@ -140,10 +140,11 @@ _TERMINAL_TRANSFER_STATES = frozenset(
 
 
 class ArbitrageStrategy(StrEnum):
-    """The only two strategies this bot implements."""
+    """Strategies this bot implements."""
 
     TRIANGLE = "triangle"
     TRANSFER = "transfer"
+    KRONOS = "kronos"
 
 
 class OpportunityStatus(StrEnum):

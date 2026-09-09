@@ -24,6 +24,16 @@ dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",
 ]
+kronos = [
+    "torch>=2.0.0",
+    "einops==0.8.1",
+    "huggingface_hub==0.33.1",
+    "tqdm==4.67.1",
+    "safetensors==0.6.2",
+    "psutil>=5.9",
+    "numpy",
+    "pandas",
+]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
