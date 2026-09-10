@@ -17,13 +17,56 @@ from typing import Any
 
 import httpx
 
+from app.config.logging_config import get_logger
 from app.research.prediction_markets import endpoints as ep
 
 __all__ = ["BinancePredictionClient", "SignedRequestError"]
 
 
 class SignedRequestError(RuntimeError):
-    pass
+    """Raised on non-200 from Prediction SAPI; carries safe fields only."""
+
+    def __init__(self, message: str, *, status: int | None = None, code: int | str | None = None, binance_msg: str | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.binance_msg = binance_msg
+
+    @property
+    def safe_message(self) -> str:
+        return str(self.args[0]) if self.args else ""
+
+
+logger = get_logger("research.prediction_client")
+
+
+def _safe_binance_error(response: httpx.Response) -> tuple[int | str | None, str | None]:
+    """Extract Binance code/msg without touching secrets; never logs headers/keys."""
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            code = data.get("code")
+            msg = data.get("msg") or data.get("message") or data.get("error")
+            if msg is not None:
+                msg = str(msg)[:500]
+            return code, msg
+    except Exception:
+        pass
+    return None, None
+
+
+def _redacted_log(status: int | None, code: int | str | None, msg: str | None, path: str) -> None:
+    # safe: only status, binance code, binance msg, endpoint path
+    # never log api key, secret, signature, Authorization, query params
+    logger.warning(
+        "prediction_api_error",
+        extra={
+            "http_status": status,
+            "binance_code": code,
+            "binance_msg": (msg or "")[:500],
+            "endpoint": path,
+        },
+    )
 
 
 def _sign(query: str, secret: str) -> str:
@@ -73,14 +116,20 @@ class BinancePredictionClient:
         sp = self._signed_params(params)
         r = await self._client.get(path, params=sp)
         if r.status_code != 200:
-            raise SignedRequestError(f"GET {path} failed {r.status_code}: {r.text[:500]}")
+            code, msg = _safe_binance_error(r)
+            _redacted_log(r.status_code, code, msg, path)
+            safe_msg = f"GET {path} failed {r.status_code} code={code!r} msg={msg!r}"
+            raise SignedRequestError(safe_msg, status=r.status_code, code=code, binance_msg=msg)
         return r.json()
 
     async def _post(self, path: str, params: dict[str, Any]) -> Any:
         sp = self._signed_params(params)
         r = await self._client.post(path, params=sp)
         if r.status_code != 200:
-            raise SignedRequestError(f"POST {path} failed {r.status_code}: {r.text[:500]}")
+            code, msg = _safe_binance_error(r)
+            _redacted_log(r.status_code, code, msg, path)
+            safe_msg = f"POST {path} failed {r.status_code} code={code!r} msg={msg!r}"
+            raise SignedRequestError(safe_msg, status=r.status_code, code=code, binance_msg=msg)
         return r.json()
 
     # --- Market data ---
