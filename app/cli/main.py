@@ -45,6 +45,7 @@ COMMANDS = (
     "start_auto",
     "stop_auto",
     "telegram",
+    "research-collect",
 )
 
 
@@ -74,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--release", action="store_true", help="start_auto: release an engaged kill switch first"
     )
+    # research-collect (Phase 4A live collector, research-only, no trading)
+    parser.add_argument("--duration", type=float, default=30, help="research-collect: collection duration seconds")
+    parser.add_argument("--out", type=str, default="data/research/prediction_markets", help="research-collect: output dir")
     return parser
 
 
@@ -389,6 +393,31 @@ async def cmd_stop_auto(services: AppServices, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_research_collect(services: AppServices, args: argparse.Namespace) -> int:
+    """Research-only live collector (Phase 4A). No trading, no wallet ops — fail-closed if trading path reached."""
+    from pathlib import Path
+
+    from app.research.prediction_markets.runtime import LiveCollectorRuntime, RuntimeConfig
+
+    print("=== RESEARCH COLLECT (BTC/ETH 5m/15m, read-only, no trading) ===")
+    # guard: this handler must never call any trading/execution path
+    duration = float(getattr(args, "duration", 30) or 30)
+    out = Path(getattr(args, "out", "data/research/prediction_markets"))
+    cfg = RuntimeConfig(duration_secs=duration, out_dir=out)
+    # run research runtime directly (it resolves its own credentials, uses HistoricalCollector)
+    runtime = LiveCollectorRuntime(config=cfg)
+    # do NOT reuse AppServices exchanges for trading — research uses its own httpx client
+    result = await runtime.run()
+    print(f"discovered markets: {result.discovered_markets}")
+    print(f"spot observations: {result.spot_observations}")
+    print(f"prediction observations: {result.prediction_observations}")
+    print(f"synchronized: {result.synchronized}")
+    print(f"reconnects: {result.reconnects} gaps: {result.gaps} duplicates: {result.duplicates} stale: {result.stale} expired: {result.expired}")
+    print(f"persisted to {out}/observations/ and {out}/collector.db")
+    print("research-only mode: no orders placed, no wallet operations (fail-closed)")
+    return 0
+
+
 async def cmd_telegram(services: AppServices, args: argparse.Namespace) -> int:
     """Wait for the application lifetime.
 
@@ -449,6 +478,7 @@ _HANDLERS = {
     "start_auto": cmd_start_auto,
     "stop_auto": cmd_stop_auto,
     "telegram": cmd_telegram,
+    "research-collect": cmd_research_collect,
 }
 
 
