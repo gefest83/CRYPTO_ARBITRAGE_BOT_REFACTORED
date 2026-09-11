@@ -110,6 +110,7 @@ class RuntimeConfig:
     spot_poll_ms: int = 500
     prediction_poll_ms: int = 1000
     stale_threshold_ms: int = 5000
+    prediction_stale_threshold_ms: int = 3600000
     sync_window_ms: int = 500
     markets_limit: int = 20
 
@@ -208,6 +209,7 @@ class LiveCollectorRuntime:
             store=store,
             client=client,
             stale_threshold_ms=self.config.stale_threshold_ms,
+            prediction_stale_threshold_ms=self.config.prediction_stale_threshold_ms,
             sync_window_ms=self.config.sync_window_ms,
             resolution_by_market=resolution_by_market,
         )

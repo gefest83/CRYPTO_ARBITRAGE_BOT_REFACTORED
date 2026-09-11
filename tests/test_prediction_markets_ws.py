@@ -63,6 +63,29 @@ def test_predict_ws_parse_snapshot_preserves_timestamps():
     assert obs.market_id == 2191278
 
 
+def test_predict_ws_parse_official_push_format():
+    """Official docs: {"type":"M","topic":"predictOrderbook/123","data":{...}} must be parsed."""
+    msg = {
+        "type": "M",
+        "topic": "predictOrderbook/2191278",
+        "data": {
+            "marketId": 2191278,
+            "bids": [[0.51, 100]],
+            "asks": [[0.53, 150]],
+            "updateTimestampMs": T0 + 1200,
+            "sequence": 42,
+            "version": 1,
+        },
+    }
+    parsed = parse_predict_ws_message(msg)
+    assert parsed is not None
+    assert parsed["marketId"] == 2191278
+    assert parsed["updateTimestampMs"] == T0 + 1200
+    # Also test that subscription ack is ignored
+    ack = {"type": "R", "requestId": 0, "success": True}
+    assert parse_predict_ws_message(ack) is None
+
+
 def test_predict_ws_parse_update_with_same_timestamp_not_discarded():
     """Requirement 6: unchanged updateTimestampMs must not cause discard if snapshot is valid."""
     store = CollectorStore(memory_only=True)
@@ -131,13 +154,18 @@ def test_predict_ws_parse_preserves_no_fabrication():
 # --- Subscription ---
 
 def test_predict_ws_build_subscription_exact_format():
-    sub = build_predict_subscription([2191278, 2191279, 2191278])  # duplicate should be deduped and sorted
-    assert sub["method"] == "subscribe"
-    assert sub["params"]["channel"] == PREDICT_WS_CHANNEL
-    assert sub["params"]["marketIds"] == [2191278, 2191279]
-    assert sub["id"] == 1
+    # Official docs: {"requestId":0,"method":"subscribe","params":["predictOrderbook/123"]} one topic per request
+    subs = build_predict_subscription([2191278, 2191279, 2191278])  # duplicate should be deduped and sorted
+    assert len(subs) == 2
+    assert subs[0] == {"requestId": 0, "method": "subscribe", "params": ["predictOrderbook/2191278"]}
+    assert subs[1] == {"requestId": 1, "method": "subscribe", "params": ["predictOrderbook/2191279"]}
     # Ensure WS URL is correct
     assert PREDICT_WS_URL == "wss://ws.predict.fun/ws"
+    # Also test single helper matches docs
+    from app.research.prediction_markets.predict_ws import build_predict_subscription_single
+
+    single = build_predict_subscription_single(2191278, request_id=0)
+    assert single == {"requestId": 0, "method": "subscribe", "params": ["predictOrderbook/2191278"]}
 
 
 def test_predict_ws_subscription_filters_btc_eth_only():

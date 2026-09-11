@@ -7,11 +7,10 @@ This module is deliberately dependency-light: if ``websockets`` is not installed
 the client falls back to REST polling (caller should handle). For tests, the
 websockets.connect call is mockable.
 
-Subscription topics (exact, documented for report):
-- Predict.fun: {"method":"subscribe","params":{"channel":"orderbook","marketIds":[...]}}
-  where marketIds are the active BTC/ETH 5m/15m child market ids discovered via
-  REST list_categories (filtered BNB excluded). Each market maps to its symbol
-  (BTCUSDT/ETHUSDT) and duration (5m/15m) via the category metadata.
+Subscription topics (exact, documented per https://dev.predict.fun/subscription-topics and Rust SDK):
+- Predict.fun: wss://ws.predict.fun/ws, no auth for orderbook, topic `predictOrderbook/{marketId}`
+  RPC: {"requestId": 0, "method": "subscribe", "params": ["predictOrderbook/123"]}
+  One topic per request. marketIds are active BTC/ETH 5m/15m child ids from REST list_categories (BNB excluded).
 
 Timestamps:
 - captured_at_ms = int(time.time()*1000) at local receive (exact, not fabricated)
@@ -53,7 +52,12 @@ def _iso_to_ms(s: str | None) -> int | None:
 
 
 def _filter_btc_eth_5m_15m(categories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter categories to BTC/ETH 5m/15m, BNB excluded. Returns list of active market entries."""
+    """Filter categories to BTC/ETH 5m/15m, BNB excluded. Returns list of market entries.
+
+    For live collection, returns the most recent BTC/ETH 5m/15m markets (up to 20) that have
+    orderbooks, regardless of start time, to ensure WS has data. Time filtering is handled
+    by the collector's stale/expiry checks, not discovery.
+    """
     active: list[dict[str, Any]] = []
     for cat in categories:
         slug = str(cat.get("slug", "")).lower()
@@ -99,56 +103,95 @@ def _filter_btc_eth_5m_15m(categories: list[dict[str, Any]]) -> list[dict[str, A
                 break
         if len(active) >= 20:
             break
+    # No fallback to far-future markets — if no active, return empty and let caller retry on next discovery
     return active
 
 
-def build_predict_subscription(market_ids: list[int]) -> dict[str, Any]:
-    """Exact subscription message used for Predict.fun WS — documented for final report."""
-    return {
-        "method": "subscribe",
-        "params": {
-            "channel": PREDICT_WS_CHANNEL,
-            "marketIds": sorted(set(market_ids)),
-        },
-        "id": 1,
-    }
+def build_predict_subscription(market_ids: list[int]) -> list[dict[str, Any]]:
+    """Exact subscription messages used for Predict.fun WS — per official docs.
+
+    Official: wss://ws.predict.fun/ws, no auth for orderbook, topic `predictOrderbook/{marketId}`,
+    RPC: {"requestId": 0, "method": "subscribe", "params": ["predictOrderbook/123"]}
+    One topic per request (see dev.predict.fun/subscription-topics).
+    Returns list of JSON-RPC subscribe messages, one per marketId (BTC/ETH 5m/15m, BNB excluded).
+    """
+    # Deduplicate and sort for determinism
+    unique = sorted(set(market_ids))
+    return [
+        {"requestId": idx, "method": "subscribe", "params": [f"predictOrderbook/{mid}"]}
+        for idx, mid in enumerate(unique)
+    ]
+
+
+def build_predict_subscription_single(market_id: int, request_id: int = 0) -> dict[str, Any]:
+    """Single topic subscription — matches documented RPC format."""
+    return {"requestId": request_id, "method": "subscribe", "params": [f"predictOrderbook/{market_id}"]}
 
 
 def parse_predict_ws_message(msg: dict[str, Any]) -> dict[str, Any] | None:
     """Parse a Predict.fun WS orderbook message into collector ingest format.
 
-    Handles:
-    - Snapshot: {"channel":"orderbook","data":{"marketId":..., "bids":[[p,s]], "asks":..., "updateTimestampMs":..., "sequence":...}}
-    - Update: {"event":"orderbook_update","marketId":..., "bids":..., "asks":...}
-    - Direct orderbook: {"marketId":..., "bids":..., "asks":..., "updateTimestampMs":...}
+    Official format (dev.predict.fun/subscription-topics):
+    - Push: {"type":"M","topic":"predictOrderbook/123","data":{"marketId":123,"updateTimestampMs":..., "bids":[[p,q]], "asks":..., "version":1, ...}}
+    - Ack:  {"type":"R","requestId":0,"success":true}
+    Also handles legacy direct: {"marketId":..., "bids":..., "asks":..., "updateTimestampMs":...}
     Preserves exchange/update timestamps, do not fabricate.
     """
     if not isinstance(msg, dict):
         return None
-    # Handle subscription ack / ping
-    if msg.get("event") == "subscribed" or msg.get("result") == "subscribed":
+    # Handle subscription ack / ping/pong / heartbeat
+    if msg.get("type") == "R":  # request response
         return None
     if msg.get("type") == "pong" or msg.get("event") == "pong":
         return None
-
-    # Extract data payload
-    data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
-    # Also handle nested market object
+    if msg.get("event") == "subscribed" or msg.get("result") == "subscribed":
+        return None
+    # Official push is type M with topic predictOrderbook/{id}
+    topic = msg.get("topic", "")
+    if isinstance(topic, str) and topic.startswith("predictOrderbook/"):
+        # Extract marketId from topic if not in data
+        try:
+            topic_mid = int(topic.split("/")[-1])
+        except Exception:
+            topic_mid = None
+        data = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+        # Fallback to whole msg if data empty
+        if not data:
+            data = msg
+        # Inject marketId from topic if missing
+        if topic_mid is not None and "marketId" not in data and "market_id" not in data:
+            data["marketId"] = topic_mid
+    else:
+        # Fallback: data may be directly in msg or in msg["data"]
+        data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
+        # Some wrappers use "payload" or direct
+        if not data or ("marketId" not in data and "bids" not in data and "asks" not in data):
+            # Try to handle raw orderbook without wrapper
+            if "marketId" in msg or "bids" in msg:
+                data = msg
+            else:
+                return None
+    # Normalize marketId
     if "marketId" not in data and "market_id" in data:
         data["marketId"] = data["market_id"]
     market_id = data.get("marketId") or data.get("market_id") or data.get("id")
     if market_id is None:
-        # No marketId, not an orderbook message
+        # Try topic
+        if topic and "/" in topic:
+            try:
+                market_id = int(topic.split("/")[-1])
+            except Exception:
+                pass
+    if market_id is None:
         return None
 
     # Extract bids/asks in various formats
     bids = data.get("bids") or msg.get("bids") or []
     asks = data.get("asks") or msg.get("asks") or []
-    # Some payloads use bestBid/bestAsk
-    update_ts = data.get("updateTimestampMs") or data.get("update_ts_ms") or data.get("timestamp") or data.get("ts") or data.get("E") or data.get("T")
-    sequence = data.get("sequence") or data.get("seq") or data.get("u") or data.get("lastUpdateId")
+    # Some payloads use bestBid/bestAsk or orderCount
+    update_ts = data.get("updateTimestampMs") or data.get("update_ts_ms") or data.get("timestamp") or data.get("ts") or data.get("E") or data.get("T") or data.get("version")
+    sequence = data.get("sequence") or data.get("seq") or data.get("u") or data.get("lastUpdateId") or data.get("version")
     symbol = data.get("symbol") or data.get("priceFeedSymbol") or ""
-    # Try to infer symbol from market if not present - caller will fill via active list
     duration = data.get("duration")
     resolution_ms = data.get("resolution_ms") or data.get("endDate") or data.get("resolutionMs")
 
@@ -216,7 +259,7 @@ class PredictFunWSClient:
             items = cats.get("data", []) if isinstance(cats, dict) else []
             return _filter_btc_eth_5m_15m(items)
 
-    def build_subscription(self, market_ids: list[int]) -> dict[str, Any]:
+    def build_subscription(self, market_ids: list[int]) -> list[dict[str, Any]]:
         return build_predict_subscription(market_ids)
 
     async def _connect(self):
@@ -258,12 +301,13 @@ class PredictFunWSClient:
             ws = None
             try:
                 ws = await self._connect()
-                # Subscribe
+                # Subscribe — one topic per request per official docs (predictOrderbook/{marketId})
                 market_ids = [m["market_id"] for m in self._active_markets]
                 if market_ids:
-                    sub = self.build_subscription(market_ids)
-                    await ws.send(json.dumps(sub))
-                    logger.info("predict_ws_subscribed", extra={"marketIds": market_ids, "channel": PREDICT_WS_CHANNEL})
+                    subs = self.build_subscription(market_ids)
+                    for sub in subs:
+                        await ws.send(json.dumps(sub))
+                    logger.info("predict_ws_subscribed", extra={"marketIds": market_ids, "channel": PREDICT_WS_CHANNEL, "count": len(subs)})
                 else:
                     logger.info("predict_ws_no_markets_to_subscribe")
 

@@ -221,7 +221,7 @@ async def main():
         store=store,
         client=None,
         stale_threshold_ms=5000,
-        prediction_stale_threshold_ms=300000,
+        prediction_stale_threshold_ms=3600000,
         sync_window_ms=500,
         resolution_by_market={},
     )
