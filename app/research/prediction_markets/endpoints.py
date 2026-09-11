@@ -39,6 +39,15 @@ WS_TOPIC_ORDERBOOK_SINGLE_TPL = "web3_prediction_orderbook_{marketId}"
 # Predict.fun direct (upstream) — used only to assess historical data availability
 PREDICT_FUN_BASE_MAINNET = "https://api.predict.fun"
 PREDICT_FUN_BASE_TESTNET = "https://api-testnet.predict.fun"
+PREDICT_FUN_WS_BASE_MAINNET = "wss://ws.predict.fun/ws"
+PREDICT_FUN_WS_CHANNEL_ORDERBOOK = "orderbook"
+# Subscription topics for Predict.fun WS — BTC/ETH 5m/15m only, BNB excluded
+PREDICT_WS_SUBSCRIPTION_MARKETS_BTC_ETH = ["BTC-5m", "BTC-15m", "ETH-5m", "ETH-15m"]
+
+# Binance Spot WebSocket (public, no auth)
+BINANCE_SPOT_WS_BASE = "wss://stream.binance.com:9443/ws"
+BINANCE_SPOT_WS_COMBINED = "wss://stream.binance.com:9443/stream"
+BINANCE_SPOT_SUBSCRIPTION_TOPICS = ["btcusdt@bookTicker", "ethusdt@bookTicker"]
 
 # Human-readable registry
 ALL_ENDPOINTS: dict[str, str] = {

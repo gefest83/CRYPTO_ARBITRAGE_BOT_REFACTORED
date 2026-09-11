@@ -31,6 +31,15 @@ from app.research.prediction_markets.client import BinancePredictionClient
 from app.research.prediction_markets.collector.collector import HistoricalCollector
 from app.research.prediction_markets.collector.storage import CollectorStore
 from app.research.prediction_markets.discovery import discover_markets
+from app.research.prediction_markets.predict_client import resolve_predict_token
+
+try:
+    import websockets  # type: ignore[import-not-found]
+
+    _HAS_WEBSOCKETS = True
+except ImportError:
+    _HAS_WEBSOCKETS = False
+    websockets = None  # type: ignore[assignment]
 
 # fail-closed guard — never import trading modules here
 _FORBIDDEN_IMPORTS = (
@@ -204,22 +213,62 @@ class LiveCollectorRuntime:
         )
         self._collector = collector
 
-        # try WS if websockets available else polling fallback
-        # spot
+        # WebSocket-first, REST fallback — preserve timestamps, dedup, gaps, stale, expiry, reconnect
+        # Spot: Binance Spot WS preferred (public), fallback to REST polling
         if self._spot_factory is not None:
             # test injection
             self._tasks.append(asyncio.create_task(self._run_injected_spot(collector)))
+        elif _HAS_WEBSOCKETS:
+            try:
+                from app.research.prediction_markets.binance_spot_ws import BinanceSpotWSClient
+
+                spot_ws = BinanceSpotWSClient(collector)
+                self._tasks.append(asyncio.create_task(spot_ws.run(self._stop)))
+                logger.info("research_runtime_spot_ws_started", extra={"topics": spot_ws.topics})
+            except Exception as exc:
+                logger.warning(
+                    "research_runtime_spot_ws_failed_fallback_polling",
+                    extra={"error": str(exc)[:300]},
+                )
+                self._tasks.append(asyncio.create_task(self._poll_spot_loop(collector)))
         else:
             self._tasks.append(asyncio.create_task(self._poll_spot_loop(collector)))
 
-        # prediction
+        # Prediction: Predict.fun WS preferred with BTC/ETH 5m/15m, BNB excluded, fallback to Binance SAPI polling
         if self._pred_factory is not None:
             self._tasks.append(asyncio.create_task(self._run_injected_pred(collector)))
-        elif client is not None and resolution_by_market:
-            self._tasks.append(asyncio.create_task(self._poll_prediction_loop(collector, client, resolution_by_market)))
         else:
-            # no prediction source (no creds/mapping) — run spot only for smoke
-            logger.info("research_runtime_prediction_skipped")
+            predict_token = resolve_predict_token()
+            if predict_token and _HAS_WEBSOCKETS:
+                try:
+                    from app.research.prediction_markets.predict_client import PredictFunClient
+                    from app.research.prediction_markets.predict_ws import PredictFunWSClient
+
+                    # Use existing client if it is a PredictFunClient, else create one for discovery
+                    predict_rest: PredictFunClient | None = None
+                    if isinstance(self._client, PredictFunClient):
+                        predict_rest = self._client
+                    else:
+                        # Create temporary rest client for market discovery (will be closed by WS client)
+                        predict_rest = PredictFunClient(predict_token)
+
+                    predict_ws = PredictFunWSClient(predict_token, collector, rest_client=predict_rest)
+                    self._tasks.append(asyncio.create_task(predict_ws.run(self._stop)))
+                    logger.info("research_runtime_predict_ws_started", extra={"ws_url": predict_ws.ws_url})
+                except Exception as exc:
+                    logger.warning(
+                        "research_runtime_predict_ws_failed_fallback_polling",
+                        extra={"error": str(exc)[:300]},
+                    )
+                    if client is not None and resolution_by_market:
+                        self._tasks.append(asyncio.create_task(self._poll_prediction_loop(collector, client, resolution_by_market)))
+                    else:
+                        logger.info("research_runtime_prediction_skipped")
+            elif client is not None and resolution_by_market:
+                self._tasks.append(asyncio.create_task(self._poll_prediction_loop(collector, client, resolution_by_market)))
+            else:
+                # no prediction source (no creds/mapping) — run spot only for smoke
+                logger.info("research_runtime_prediction_skipped")
 
         # optional REST snapshot on startup
         if client is not None and resolution_by_market:

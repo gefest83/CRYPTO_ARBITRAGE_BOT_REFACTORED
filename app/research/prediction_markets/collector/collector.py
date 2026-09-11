@@ -95,6 +95,17 @@ class HistoricalCollector:
     def _dedup_key(self, source: str, market_id: int | None, token_id: str | None, ts: int | None, seq: int | None) -> str:
         return f"{source}:{market_id}:{token_id}:{ts}:{seq}"
 
+    def _content_hash(self, bids: list | tuple | None, asks: list | tuple | None) -> str:
+        """Hash of orderbook content to avoid dedup of valid snapshots with unchanged updateTimestampMs."""
+        # Use first few levels for stability; include full if small
+        try:
+            b = str(bids) if bids else ""
+            a = str(asks) if asks else ""
+            # Simple deterministic hash, not cryptographic, for dedup differentiation
+            return str(hash((b, a)) & 0xFFFFFFFF)
+        except Exception:
+            return "0"
+
     def _watermark_key(self, market_id: int | None, token_id: str | None, symbol: str) -> str:
         if market_id is not None and token_id is not None:
             return f"{market_id}:{token_id}"
@@ -127,27 +138,39 @@ class HistoricalCollector:
         if base not in ALLOWED_BASES:
             # BNB excluded
             return None
-        # stale check uses exchange timestamp if provided
-        exch_ts = data.get("exchange_ts_ms") or data.get("timestamp") or data.get("ts") or cap
+        # stale check uses exchange timestamp if provided - preserve exact, do not fabricate
+        exch_ts_raw = data.get("exchange_ts_ms") or data.get("timestamp") or data.get("ts")
         try:
-            exch_ts = int(exch_ts)
+            exch_ts = int(exch_ts_raw) if exch_ts_raw is not None else None
         except Exception:
-            exch_ts = cap
-        if self._is_stale(cap, exch_ts):
+            exch_ts = None
+        if exch_ts is not None and self._is_stale(cap, exch_ts):
             self.stats = self.stats.model_copy(update={"stale_dropped": self.stats.stale_dropped + 1})
             return None
-        # dedup
+        # dedup - include content hash when sequence is None to avoid discarding valid WS snapshot with unchanged exchange_ts
         seq = data.get("sequence") or data.get("seq")
-        seq_int = int(seq) if seq is not None else None
-        dkey = self._dedup_key("spot", None, None, exch_ts, seq_int)
+        try:
+            seq_int = int(seq) if seq is not None else None
+        except Exception:
+            seq_int = None
+        # Content hash for spot when seq is None (e.g., WS bookTicker with same E but different bid/ask)
+        if seq_int is None:
+            content_hash = self._content_hash([data.get("bid")], [data.get("ask")])
+            dkey = f"{self._dedup_key('spot', None, None, exch_ts, seq_int)}:{content_hash}:{data.get('bid')}:{data.get('ask')}"
+        else:
+            dkey = self._dedup_key("spot", None, None, exch_ts, seq_int)
         if dkey in self._seen:
             self.stats = self.stats.model_copy(update={"duplicates_dropped": self.stats.duplicates_dropped + 1})
             return None
         self._seen.add(dkey)
-        # out-of-order: watermark per symbol
+        # out-of-order: watermark per symbol - use effective timestamp
         wkey = self._watermark_key(None, None, symbol)
         last_wm = self._watermark.get(wkey, -1)
-        if exch_ts < last_wm - self.oor_tolerance_ms:
+        effective_ts = exch_ts if exch_ts is not None else cap
+        if exch_ts is not None and exch_ts < last_wm - self.oor_tolerance_ms:
+            self.stats = self.stats.model_copy(update={"out_of_order_dropped": self.stats.out_of_order_dropped + 1})
+            return None
+        if exch_ts is None and effective_ts < last_wm - self.oor_tolerance_ms:
             self.stats = self.stats.model_copy(update={"out_of_order_dropped": self.stats.out_of_order_dropped + 1})
             return None
         # gap detection via sequence
@@ -156,8 +179,8 @@ class HistoricalCollector:
             if last is not None and seq_int > last + 1:
                 self.stats = self.stats.model_copy(update={"gaps_detected": self.stats.gaps_detected + 1})
             self._last_seq[wkey] = seq_int
-        if exch_ts > last_wm:
-            self._watermark[wkey] = exch_ts
+        if effective_ts > last_wm:
+            self._watermark[wkey] = effective_ts
 
         # build observation
         # spread/depth computed in model
@@ -229,15 +252,15 @@ class HistoricalCollector:
                     # unknown, assume BTC for generic price book
                     symbol = "BTCUSDT"
 
-        # timestamps
-        update_ts = data.get("updateTimestampMs") or data.get("update_ts_ms") or data.get("timestamp") or data.get("ts")
-        exch_ts = update_ts  # for prediction, exchange_ts == updateTimestampMs
+        # timestamps - preserve exact local receive time (cap) and exchange/update timestamps, do not fabricate
+        update_ts_raw = data.get("updateTimestampMs") or data.get("update_ts_ms") or data.get("timestamp") or data.get("ts")
+        exch_ts_raw = update_ts_raw  # for prediction, exchange_ts == updateTimestampMs
         try:
-            update_ts = int(update_ts) if update_ts is not None else cap
-            exch_ts = int(exch_ts) if exch_ts is not None else cap
+            update_ts = int(update_ts_raw) if update_ts_raw is not None else None
+            exch_ts = int(exch_ts_raw) if exch_ts_raw is not None else None
         except Exception:
-            update_ts = cap
-            exch_ts = cap
+            update_ts = None
+            exch_ts = None
 
         # expiration: need resolution_ms
         resolution_ms = data.get("resolution_ms") or data.get("endDate")
@@ -261,7 +284,17 @@ class HistoricalCollector:
         except Exception:
             seq_int = None
 
-        dkey = self._dedup_key("pred_ob", int(market_id) if market_id is not None else None, token_id, update_ts, seq_int)
+        # Parse bids/asks early to support dedup with content hash (requirement 6: do NOT discard valid WS snapshot just because updateTimestampMs unchanged)
+        bids_raw = data.get("bids") or []
+        asks_raw = data.get("asks") or []
+        # Compute content hash for dedup differentiation when updateTimestampMs unchanged but book changed
+        content_hash = self._content_hash(bids_raw, asks_raw)
+        # Include content hash and captured_at_ms differentiation for WebSocket snapshots
+        # If sequence is None, use content hash to avoid false duplicates on unchanged updateTimestampMs
+        if seq_int is None:
+            dkey = f"{self._dedup_key('pred_ob', int(market_id) if market_id is not None else None, token_id, update_ts, seq_int)}:{content_hash}"
+        else:
+            dkey = self._dedup_key("pred_ob", int(market_id) if market_id is not None else None, token_id, update_ts, seq_int)
         if dkey in self._seen:
             self.stats = self.stats.model_copy(update={"duplicates_dropped": self.stats.duplicates_dropped + 1})
             return None
@@ -269,7 +302,12 @@ class HistoricalCollector:
 
         wkey = self._watermark_key(int(market_id) if market_id is not None else None, token_id, symbol)
         last_wm = self._watermark.get(wkey, -1)
-        if update_ts < last_wm - self.oor_tolerance_ms:
+        # Preserve timestamps: if update_ts is None, use captured_at_ms for ordering but do not fabricate exchange_ts
+        effective_ts = update_ts if update_ts is not None else cap
+        if update_ts is not None and update_ts < last_wm - self.oor_tolerance_ms:
+            self.stats = self.stats.model_copy(update={"out_of_order_dropped": self.stats.out_of_order_dropped + 1})
+            return None
+        if update_ts is None and effective_ts < last_wm - self.oor_tolerance_ms:
             self.stats = self.stats.model_copy(update={"out_of_order_dropped": self.stats.out_of_order_dropped + 1})
             return None
         if seq_int is not None:
@@ -277,8 +315,8 @@ class HistoricalCollector:
             if last is not None and seq_int > last + 1:
                 self.stats = self.stats.model_copy(update={"gaps_detected": self.stats.gaps_detected + 1})
             self._last_seq[wkey] = seq_int
-        if update_ts > last_wm:
-            self._watermark[wkey] = update_ts
+        if effective_ts > last_wm:
+            self._watermark[wkey] = effective_ts
 
         # parse bids/asks
         bids_raw = data.get("bids") or []

@@ -23,6 +23,14 @@ from app.research.prediction_markets.collector.collector import HistoricalCollec
 from app.research.prediction_markets.collector.storage import CollectorStore
 from app.research.prediction_markets.predict_client import PredictFunClient, resolve_predict_token
 
+try:
+    import websockets  # type: ignore[import-not-found]
+
+    _HAS_WEBSOCKETS = True
+except ImportError:
+    _HAS_WEBSOCKETS = False
+    websockets = None  # type: ignore[assignment]
+
 DEFAULT_OUT = Path("data/research/prediction_markets")
 SPOT_URL = "https://api.binance.com"
 SPOT_SYMBOLS = ("BTCUSDT", "ETHUSDT")
@@ -103,15 +111,20 @@ async def predict_loop(collector: HistoricalCollector, stop: asyncio.Event, clie
                 # priceFeedSymbol from variantData
                 vd = cat.get("variantData") or {}
                 symbol = vd.get("priceFeedSymbol") or ("BTCUSDT" if "btc" in slug else "ETHUSDT")
-                # duration from slug or tags
-                if "5m" in slug or "5-min" in slug:
-                    duration = "5m"
-                elif "15m" in slug or "15-min" in slug:
+                # duration from slug or tags — check 15m before 5m to avoid substring false positive ("15m" contains "5m")
+                if "15m" in slug or "15-min" in slug:
                     duration = "15m"
+                elif "5m" in slug or "5-min" in slug:
+                    duration = "5m"
                 else:
                     # infer from tags
                     tag_names = " ".join(str(t.get("name","")).lower() for t in cat.get("tags", []) or [])
-                    duration = "5m" if "5 min" in tag_names else "15m" if "15 min" in tag_names else "5m"
+                    if "15 min" in tag_names:
+                        duration = "15m"
+                    elif "5 min" in tag_names:
+                        duration = "5m"
+                    else:
+                        duration = "5m"
                 starts = cat.get("startsAt")
                 ends = cat.get("endsAt")
                 res_ms = _iso_to_ms(ends)
@@ -216,20 +229,38 @@ async def main():
     stop = asyncio.Event()
     client = PredictFunClient(tok)
 
-    # try WS preference check (websockets optional)
-    ws_available = False
-    try:
-        import websockets  # type: ignore
-        ws_available = True
-    except Exception:
-        ws_available = False
-    print(f"WebSocket market data preferred: {ws_available} (fallback REST snapshots for recovery)")
     print("Research-only: no orders, wallet ops, transfers, withdrawals or trading - fail-closed")
 
-    tasks = [
-        asyncio.create_task(spot_loop(collector, stop, poll_ms=500)),
-        asyncio.create_task(predict_loop(collector, stop, client, poll_ms=1000)),
-    ]
+    # WebSocket-first, REST fallback — preserve timestamps, dedup, gaps, stale, expiry, reconnect
+    tasks: list[asyncio.Task] = []
+    if _HAS_WEBSOCKETS:
+        try:
+            from app.research.prediction_markets.binance_spot_ws import BinanceSpotWSClient
+            from app.research.prediction_markets.predict_ws import PredictFunWSClient
+            from app.research.prediction_markets import endpoints as ep
+
+            spot_ws = BinanceSpotWSClient(collector)
+            predict_ws = PredictFunWSClient(tok, collector, rest_client=client)
+            tasks = [
+                asyncio.create_task(spot_ws.run(stop)),
+                asyncio.create_task(predict_ws.run(stop)),
+            ]
+            print(f"WebSocket market data preferred: True (Predict.fun {predict_ws.ws_url} + Binance Spot {spot_ws.ws_url}, fallback REST snapshots for recovery)")
+            print(f"Predict.fun subscription: {{\"method\":\"subscribe\",\"params\":{{\"channel\":\"{ep.PREDICT_FUN_WS_CHANNEL_ORDERBOOK}\",\"marketIds\":\"BTC/ETH 5m/15m discovered via REST list_categories (BNB excluded)\"}}}}")
+            print(f"Binance Spot topics: {ep.BINANCE_SPOT_SUBSCRIPTION_TOPICS}")
+        except Exception as exc:
+            print(f"WS init failed, fallback to REST polling: {exc}")
+            tasks = [
+                asyncio.create_task(spot_loop(collector, stop, poll_ms=500)),
+                asyncio.create_task(predict_loop(collector, stop, client, poll_ms=1000)),
+            ]
+            print("WebSocket market data preferred: False (fallback REST snapshots for recovery)")
+    else:
+        tasks = [
+            asyncio.create_task(spot_loop(collector, stop, poll_ms=500)),
+            asyncio.create_task(predict_loop(collector, stop, client, poll_ms=1000)),
+        ]
+        print("WebSocket market data preferred: False (fallback REST snapshots for recovery)")
 
     # handle signals
     import signal
