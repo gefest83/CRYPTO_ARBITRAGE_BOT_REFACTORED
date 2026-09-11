@@ -58,6 +58,7 @@ class HistoricalCollector:
         store: CollectorStore,
         client: BinancePredictionClient | None = None,
         stale_threshold_ms: int = 5000,
+        prediction_stale_threshold_ms: int | None = None,
         out_of_order_tolerance_ms: int = 1000,
         sync_window_ms: int = 500,
         resolution_by_market: dict[int, int] | None = None,
@@ -65,6 +66,15 @@ class HistoricalCollector:
         self.store = store
         self.client = client
         self.stale_threshold_ms = stale_threshold_ms
+        # Prediction orderbooks update sporadically (only on order changes); a 5s
+        # threshold incorrectly discards valid REST snapshots whose
+        # updateTimestampMs may lag captured time by 10-30s. Preserve per-source
+        # semantics: spot stays strict (5s), prediction allows 60s when
+        # explicitly requested (research collector). Default fallback keeps
+        # backward-compat for existing tests (fallback to spot threshold).
+        self.prediction_stale_threshold_ms = (
+            prediction_stale_threshold_ms if prediction_stale_threshold_ms is not None else stale_threshold_ms
+        )
         self.oor_tolerance_ms = out_of_order_tolerance_ms
         self.sync_window_ms = sync_window_ms
         self.resolution_by_market: dict[int, int] = resolution_by_market or {}
@@ -99,6 +109,11 @@ class HistoricalCollector:
         if event_ms is None:
             return False
         return (captured_ms - event_ms) > self.stale_threshold_ms
+
+    def _is_prediction_stale(self, captured_ms: int, event_ms: int | None) -> bool:
+        if event_ms is None:
+            return False
+        return (captured_ms - event_ms) > self.prediction_stale_threshold_ms
 
     # --- public ingest ---
 
@@ -236,7 +251,7 @@ class HistoricalCollector:
         if self._is_expired(resolution_ms, exch_ts):
             self.stats = self.stats.model_copy(update={"expired_dropped": self.stats.expired_dropped + 1})
             return None
-        if self._is_stale(cap, exch_ts):
+        if self._is_prediction_stale(cap, exch_ts):
             self.stats = self.stats.model_copy(update={"stale_dropped": self.stats.stale_dropped + 1})
             return None
 
@@ -358,7 +373,7 @@ class HistoricalCollector:
         if self._is_expired(resolution_ms, ts):
             self.stats = self.stats.model_copy(update={"expired_dropped": self.stats.expired_dropped + 1})
             return None
-        if self._is_stale(cap, ts):
+        if self._is_prediction_stale(cap, ts):
             self.stats = self.stats.model_copy(update={"stale_dropped": self.stats.stale_dropped + 1})
             return None
         price = data.get("price") or data.get("lastTradePrice") or data.get("last_trade_price")
