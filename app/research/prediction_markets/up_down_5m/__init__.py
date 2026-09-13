@@ -15,6 +15,10 @@ Canonical prediction-market path — NOT spot trading:
 * :mod:`app.research.prediction_markets.up_down_5m.chainlink_feed` —
   official Chainlink Data Streams resolution feed (auth client, v3 decode,
   start price / final 5m close math, CHAINLINK attach; read-only).
+* :mod:`app.research.prediction_markets.up_down_5m.signal` — deterministic
+  UP/DOWN/HOLD entry signal from pre-decision data only (drift, momentum/
+  acceleration, trade flow, book imbalance, time gating) + enter/exit
+  policy (immediate entry, fast exit on reversal, hold to settlement).
 
 Supersedes the spot-proxy probability approach in
 ``app.research.prediction_markets.backtest`` (impulse -> repricing lag),
@@ -74,6 +78,19 @@ from app.research.prediction_markets.up_down_5m.settlement import (
     payout_per_share,
     settle_up_down_5m,
 )
+from app.research.prediction_markets.up_down_5m.signal import (
+    Action,
+    Position,
+    Signal,
+    SignalConfig,
+    SignalFeatures,
+    SignalResult,
+    compute_features,
+    ensure_research_only as ensure_signal_research_only,
+    evaluate,
+    exit_to_skip,
+    manage,
+)
 
 __all__ = [
     "BTC_USD_CEX_V3_FEED_ID",
@@ -82,6 +99,7 @@ __all__ = [
     "PAYOUT_PUSH",
     "REPORT_DECIMALS",
     "VENUE_CHAINLINK",
+    "Action",
     "ChainlinkFeedClient",
     "ChainlinkFeedError",
     "ChainlinkReport",
@@ -90,6 +108,7 @@ __all__ = [
     "LiveUpDown5mSnapshot",
     "MarketState",
     "NoLiveMarketError",
+    "Position",
     "PriceProvenance",
     "ReplayDecision",
     "ReplayFill",
@@ -97,15 +116,24 @@ __all__ = [
     "ResolutionInputs",
     "SettlementOutcome",
     "Side",
+    "Signal",
+    "SignalConfig",
+    "SignalFeatures",
+    "SignalResult",
     "UpDown5mMarket",
     "UpDown5mReplay",
     "attach_chainlink_resolution",
     "build_5m_candles",
     "build_auth_headers",
     "build_live_snapshot",
+    "compute_features",
     "decode_v3_report",
+    "ensure_signal_research_only",
+    "evaluate",
+    "exit_to_skip",
     "fetch_one_btc_5m_snapshot",
     "final_close",
+    "manage",
     "market_start_price",
     "payout_per_share",
     "render_snapshot",
