@@ -9,6 +9,9 @@ Canonical prediction-market path — NOT spot trading:
   data model + lifecycle (UPCOMING -> OPEN -> CLOSED -> SETTLED).
 * :mod:`app.research.prediction_markets.up_down_5m.replay` — research-only
   replay evaluating decisions against actual binary settlement.
+* :mod:`app.research.prediction_markets.up_down_5m.live_snapshot` — wire
+  one live BTC 5m market from SAPI data onto the model, with honest
+  Chainlink-vs-reference provenance (read-only, no trading).
 
 Supersedes the spot-proxy probability approach in
 ``app.research.prediction_markets.backtest`` (impulse -> repricing lag),
@@ -17,6 +20,17 @@ which is ignored for Up/Down edge evaluation.
 No live trading in this package (fail-closed).
 """
 
+from app.research.prediction_markets.up_down_5m.live_snapshot import (
+    FieldCoverage,
+    LiveUpDown5mSnapshot,
+    NoLiveMarketError,
+    PriceProvenance,
+    build_live_snapshot,
+    fetch_one_btc_5m_snapshot,
+    render_snapshot,
+    required_field_coverage,
+    settlement_preview,
+)
 from app.research.prediction_markets.up_down_5m.market import (
     FIVE_MIN_MS,
     MarketState,
@@ -39,7 +53,11 @@ from app.research.prediction_markets.up_down_5m.settlement import (
 __all__ = [
     "FIVE_MIN_MS",
     "PAYOUT_PUSH",
+    "FieldCoverage",
+    "LiveUpDown5mSnapshot",
     "MarketState",
+    "NoLiveMarketError",
+    "PriceProvenance",
     "ReplayDecision",
     "ReplayFill",
     "ReplaySummary",
@@ -47,6 +65,11 @@ __all__ = [
     "Side",
     "UpDown5mMarket",
     "UpDown5mReplay",
+    "build_live_snapshot",
+    "fetch_one_btc_5m_snapshot",
     "payout_per_share",
+    "render_snapshot",
+    "required_field_coverage",
+    "settlement_preview",
     "settle_up_down_5m",
 ]
