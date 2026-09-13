@@ -43,10 +43,12 @@ __all__ = [
     "LiveUpDown5mSnapshot",
     "NoLiveMarketError",
     "PriceProvenance",
+    "VENUE_CHAINLINK",
     "build_live_snapshot",
     "fetch_one_btc_5m_snapshot",
     "render_snapshot",
     "required_field_coverage",
+    "settle_from_chainlink",
     "settlement_preview",
 ]
 
@@ -56,9 +58,16 @@ class NoLiveMarketError(RuntimeError):
 
 
 class PriceProvenance(StrEnum):
+    #: Canonical provenance set by the Chainlink resolution feed.
+    CHAINLINK = "chainlink"
+    #: Legacy alias: Chainlink mid supplied directly by the caller.
     CHAINLINK_VENUE = "chainlink_venue"  # real Chainlink ToB mid supplied by caller
     SPOT_REFERENCE = "spot_reference"  # Binance spot bookTicker ToB mid; display only, NOT settlement
     UNAVAILABLE = "unavailable"  # venue does not expose; value is None
+
+
+#: Provenances whose values may settle a market. Spot reference is NEVER here.
+VENUE_CHAINLINK = frozenset({PriceProvenance.CHAINLINK, PriceProvenance.CHAINLINK_VENUE})
 
 
 class FieldCoverage(DomainModel):
@@ -194,14 +203,35 @@ def required_field_coverage(snapshot: LiveUpDown5mSnapshot) -> tuple[FieldCovera
         ),
         FieldCoverage(
             name="final_settlement_price_outcome",
-            present=m.start_price is not None and m.end_price is not None and snapshot.end_provenance == PriceProvenance.CHAINLINK_VENUE,
+            present=m.start_price is not None and m.end_price is not None and snapshot.end_provenance in VENUE_CHAINLINK,
             detail=(
-                f"end={m.end_price} outcome={snapshot.market.settle().settlement.value} [chainlink_venue]"
-                if m.start_price is not None and m.end_price is not None and snapshot.end_provenance == PriceProvenance.CHAINLINK_VENUE
+                f"end={m.end_price} outcome={snapshot.market.settle().settlement.value} [{snapshot.end_provenance.value}]"
+                if m.start_price is not None and m.end_price is not None and snapshot.end_provenance in VENUE_CHAINLINK
                 else f"withheld [{snapshot.end_provenance.value}: final Chainlink close not exposed by SAPI]"
             ),
         ),
     )
+
+
+def settle_from_chainlink(snapshot: LiveUpDown5mSnapshot) -> SettlementOutcome:
+    """Settle strictly from Chainlink provenance; spot reference raises.
+
+    This is the only sanctioned settlement path for wired snapshots:
+    Binance spot (or any ``SPOT_REFERENCE``/``UNAVAILABLE`` anchor) can
+    never substitute for the Chainlink resolution feed.
+    """
+    m = snapshot.market
+    if snapshot.start_provenance not in VENUE_CHAINLINK or snapshot.end_provenance not in VENUE_CHAINLINK:
+        raise ValueError(
+            f"refusing to settle: provenance start={snapshot.start_provenance.value} "
+            f"end={snapshot.end_provenance.value}; Chainlink anchors required, "
+            "spot reference must never settle"
+        )
+    if m.start_price is None or m.end_price is None:
+        raise ValueError("refusing to settle: Chainlink anchors missing")
+    settled = m.settle()
+    assert settled.settlement is not None
+    return settled.settlement
 
 
 def settlement_preview(snapshot: LiveUpDown5mSnapshot) -> tuple[SettlementOutcome | None, str]:
@@ -209,7 +239,7 @@ def settlement_preview(snapshot: LiveUpDown5mSnapshot) -> tuple[SettlementOutcom
     m = snapshot.market
     if m.start_price is None or m.end_price is None:
         return None, "settlement withheld: Chainlink start/end anchors unavailable (SAPI does not expose Chainlink feed)"
-    if snapshot.end_provenance != PriceProvenance.CHAINLINK_VENUE:
+    if snapshot.end_provenance not in VENUE_CHAINLINK:
         return None, f"settlement withheld: end anchor is {snapshot.end_provenance.value}, not venue Chainlink (spot reference must never settle)"
     try:
         settled = m.settle()
