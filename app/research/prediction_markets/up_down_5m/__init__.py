@@ -19,6 +19,10 @@ Canonical prediction-market path — NOT spot trading:
   UP/DOWN/HOLD entry signal from pre-decision data only (drift, momentum/
   acceleration, trade flow, book imbalance, time gating) + enter/exit
   policy (immediate entry, fast exit on reversal, hold to settlement).
+* :mod:`app.research.prediction_markets.up_down_5m.validation_dataset` —
+  valid research dataset: exact windows, full-window BTC series (public
+  klines backfill), in-window contract prices (venue timeseries), actual
+  venue-resolved outcomes; evaluates the frozen signal (never modifies it).
 
 Supersedes the spot-proxy probability approach in
 ``app.research.prediction_markets.backtest`` (impulse -> repricing lag),
@@ -78,6 +82,20 @@ from app.research.prediction_markets.up_down_5m.settlement import (
     payout_per_share,
     settle_up_down_5m,
 )
+from app.research.prediction_markets.up_down_5m.validation_dataset import (
+    BINANCE_KLINES_URL,
+    Kline,
+    ValidatedMarket,
+    ValidationResult,
+    build_signal_features,
+    contract_price_at,
+    fetch_klines,
+    parse_contract_series,
+    parse_klines,
+    parse_venue_outcome,
+    parse_window_from_slug,
+    run_validation,
+)
 from app.research.prediction_markets.up_down_5m.signal import (
     Action,
     Position,
@@ -93,6 +111,7 @@ from app.research.prediction_markets.up_down_5m.signal import (
 )
 
 __all__ = [
+    "BINANCE_KLINES_URL",
     "BTC_USD_CEX_V3_FEED_ID",
     "CHAINLINK_DATAENGINE_MAINNET",
     "FIVE_MIN_MS",
@@ -105,6 +124,7 @@ __all__ = [
     "ChainlinkReport",
     "FieldCoverage",
     "FiveMinuteCandle",
+    "Kline",
     "LiveUpDown5mSnapshot",
     "MarketState",
     "NoLiveMarketError",
@@ -122,24 +142,33 @@ __all__ = [
     "SignalResult",
     "UpDown5mMarket",
     "UpDown5mReplay",
+    "ValidatedMarket",
+    "ValidationResult",
     "attach_chainlink_resolution",
     "build_5m_candles",
     "build_auth_headers",
     "build_live_snapshot",
     "compute_features",
+    "contract_price_at",
     "decode_v3_report",
     "ensure_signal_research_only",
     "evaluate",
     "exit_to_skip",
+    "fetch_klines",
     "fetch_one_btc_5m_snapshot",
     "final_close",
     "manage",
     "market_start_price",
     "payout_per_share",
+    "parse_contract_series",
+    "parse_klines",
+    "parse_venue_outcome",
+    "parse_window_from_slug",
     "render_snapshot",
     "required_field_coverage",
     "resolve_chainlink_credentials",
     "resolve_market",
+    "run_validation",
     "settle_from_chainlink",
     "settlement_preview",
     "settle_up_down_5m",
